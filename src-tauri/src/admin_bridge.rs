@@ -228,7 +228,7 @@ fn status_text(code: u16) -> &'static str {
     }
 }
 
-fn handle_conn<R: Runtime>(mut stream: TcpStream, _app: &AppHandle<R>, token: &str, allow_scripts: bool) {
+fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &str, allow_scripts: bool) {
     let Some(req) = parse_request(&mut stream) else {
         return;
     };
@@ -276,6 +276,36 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, _app: &AppHandle<R>, token: &s
                 Ok(out) => serde_json::json!({ "ok": true, "output": out }),
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
             }
+        }
+        ("GET", "/api/registry/mirror/progress") => {
+            let cfg = load_cached();
+            let p = crate::mirror::load_progress(app, &cfg);
+            serde_json::json!({ "ok": true, "progress": p })
+        }
+        ("GET", "/api/registry/mirror/start") => {
+            let cfg = load_cached();
+            let registry = req
+                .query
+                .get("registry")
+                .cloned()
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| crate::config::mirror_registry(&cfg));
+            let token_env = req
+                .query
+                .get("tokenEnv")
+                .cloned()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| crate::config::mirror_token_env(&cfg));
+            match crate::mirror::start_mirror_upload(app, &cfg, &registry, &token_env) {
+                Ok(()) => serde_json::json!({ "ok": true, "message": "上传已开始" }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e }),
+            }
+        }
+        ("GET", "/api/registry/mirror/cancel") => {
+            // 本期不做真正的取消（任务较短）；返回当前状态
+            let cfg = load_cached();
+            let p = crate::mirror::load_progress(app, &cfg);
+            serde_json::json!({ "ok": true, "progress": p, "note": "cancel not implemented" })
         }
         _ => {
             send_json(&mut stream, 404, serde_json::json!({ "error": "not found" }));

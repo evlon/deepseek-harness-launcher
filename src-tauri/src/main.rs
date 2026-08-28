@@ -5,6 +5,7 @@ mod config;
 mod download;
 mod install;
 mod logging;
+mod mirror;
 mod notify;
 mod plugin;
 mod speedtest;
