@@ -282,21 +282,22 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
             let p = crate::mirror::load_progress(app, &cfg);
             serde_json::json!({ "ok": true, "progress": p })
         }
-        ("GET", "/api/registry/mirror/start") => {
+        ("POST", "/api/registry/mirror/start") => {
             let cfg = load_cached();
-            let registry = req
-                .query
+            // token 经 POST body 传递（不进 URL/日志）
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let registry = body
                 .get("registry")
-                .cloned()
+                .and_then(|v| v.as_str())
                 .filter(|r| !r.is_empty())
+                .map(|s| s.to_string())
                 .unwrap_or_else(|| crate::config::mirror_registry(&cfg));
-            let token_env = req
-                .query
-                .get("tokenEnv")
-                .cloned()
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| crate::config::mirror_token_env(&cfg));
-            match crate::mirror::start_mirror_upload(app, &cfg, &registry, &token_env) {
+            let token = body
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match crate::mirror::start_mirror_upload(app, &cfg, &registry, &token) {
                 Ok(()) => serde_json::json!({ "ok": true, "message": "上传已开始" }),
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
             }

@@ -209,12 +209,12 @@ fn extract_deps(meta: &serde_json::Value, version: &str) -> Vec<(String, String)
 /// 开始镜像上传（异步，立即返回；进度经 load_progress 查询）。
 ///
 /// 对依赖树每个包：npm pack（拉外网）→ npm publish（推内网）。
-/// 认证用环境变量 token（NODE_AUTH_TOKEN 或 token_env 指定）。
+/// `token` 是内网 registry 的发布凭证（由管理页经 bridge 传递，仅内存使用，不落盘）。
 pub fn start_mirror_upload<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
     registry: &str,
-    token_env: &str,
+    token: &str,
 ) -> Result<(), String> {
     // 已在运行 → 拒绝
     let p = load_progress(app, cfg);
@@ -225,7 +225,7 @@ pub fn start_mirror_upload<R: Runtime>(
     let h = app.clone();
     let cfg = cfg.clone();
     let registry = registry.to_string();
-    let token_env = token_env.to_string();
+    let token = token.to_string();
 
     // 应装清单来自服务端缓存的配置（SyncState.cached_config.plugins）
     let plugins: Vec<String> = crate::sync::load_state(&h, &cfg)
@@ -234,7 +234,7 @@ pub fn start_mirror_upload<R: Runtime>(
         .unwrap_or_default();
 
     tauri::async_runtime::spawn(async move {
-        let _ = run_mirror(&h, &cfg, &registry, &token_env, plugins).await;
+        let _ = run_mirror(&h, &cfg, &registry, &token, plugins).await;
     });
     Ok(())
 }
@@ -244,7 +244,7 @@ async fn run_mirror<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
     registry: &str,
-    token_env: &str,
+    token: &str,
     plugins: Vec<String>,
 ) -> Result<(), String> {
     if plugins.is_empty() {
@@ -305,7 +305,7 @@ async fn run_mirror<R: Runtime>(
         cur.current_pkg = format!("{name}@{version}");
         save_progress(app, cfg, &cur);
 
-        match upload_one_pkg(name, version, registry, token_env) {
+        match upload_one_pkg(name, version, registry, token) {
             Ok(()) => {
                 log::info!("上传成功 [{}/{}] {}@{}", i + 1, all_pkgs.len(), name, version);
             }
@@ -330,7 +330,8 @@ async fn run_mirror<R: Runtime>(
 }
 
 /// 上传单个包：npm pack（拉外网）→ npm publish（推内网）。
-fn upload_one_pkg(name: &str, version: &str, registry: &str, token_env: &str) -> Result<(), String> {
+/// `token` 为发布凭证（内存使用，作为 NODE_AUTH_TOKEN 传给 npm 子进程）。
+fn upload_one_pkg(name: &str, version: &str, registry: &str, token: &str) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!("dsh-mirror-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
@@ -338,11 +339,10 @@ fn upload_one_pkg(name: &str, version: &str, registry: &str, token_env: &str) ->
     let pack_out = run_npm(&tmp, &["pack", &format!("{name}@{version}"), "--pack-destination", &tmp.to_string_lossy()], &[])?;
     let tarball = find_tarball(&tmp)?;
 
-    // 2. npm publish（认证用环境变量）
-    let token_val = std::env::var(token_env).unwrap_or_default();
+    // 2. npm publish（认证：NODE_AUTH_TOKEN 环境变量，token 由管理页传递，不落盘）
     let mut envs: Vec<(String, String)> = Vec::new();
-    if !token_val.is_empty() {
-        envs.push(("NODE_AUTH_TOKEN".to_string(), token_val));
+    if !token.is_empty() {
+        envs.push(("NODE_AUTH_TOKEN".to_string(), token.to_string()));
     }
     let _ = pack_out;
     run_npm(

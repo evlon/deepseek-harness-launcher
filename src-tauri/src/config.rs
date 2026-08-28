@@ -73,9 +73,6 @@ pub struct MirrorSettings {
     /// 目标内网 registry（默认 registry.ict.cmcc）。
     #[serde(default)]
     pub registry: Option<String>,
-    /// 认证 token 所在环境变量名（管理员机配置，token 不落盘）。
-    #[serde(default)]
-    pub token_env: Option<String>,
 }
 
 /// 镜像目标 registry（缺省内网 registry.ict.cmcc）。
@@ -85,15 +82,6 @@ pub fn mirror_registry(cfg: &LauncherConfig) -> String {
         .and_then(|m| m.registry.clone())
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| "https://registry.ict.cmcc".to_string())
-}
-
-/// 镜像认证 token 环境变量名（缺省 NODE_AUTH_TOKEN）。
-pub fn mirror_token_env(cfg: &LauncherConfig) -> String {
-    cfg.mirror_settings
-        .as_ref()
-        .and_then(|m| m.token_env.clone())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "NODE_AUTH_TOKEN".to_string())
 }
 
 /// 是否启用「使用系统 node」（默认 false = 自包含）。

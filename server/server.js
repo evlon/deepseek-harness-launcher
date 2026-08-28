@@ -53,7 +53,7 @@ function defaultConfig() {
     plugins: [],
     managedMenu: { enabled: false, quickLinks: [] },
     clientDefaults: {},
-    mirrorSettings: { registry: "https://registry.ict.cmcc", tokenEnv: "NODE_AUTH_TOKEN" },
+    mirrorSettings: { registry: "https://registry.ict.cmcc", tokenValue: "" },
     updatedAt: new Date().toISOString(),
     baseUrl: "",
   };
@@ -77,7 +77,7 @@ function normalizeConfig(cfg) {
       cfg.clientDefaults = {};
     }
     if (typeof cfg.mirrorSettings !== "object" || cfg.mirrorSettings === null) {
-      cfg.mirrorSettings = { registry: "https://registry.ict.cmcc", tokenEnv: "NODE_AUTH_TOKEN" };
+      cfg.mirrorSettings = { registry: "https://registry.ict.cmcc", tokenValue: "" };
     }
     if (typeof cfg.plugins !== "object" || !Array.isArray(cfg.plugins)) cfg.plugins = [];
   }
@@ -354,7 +354,7 @@ async function route(req, res) {
       }
       cfg.clientDefaults = cleaned;
     }
-    // 镜像上传设置（mirrorSettings）：registry 合法 URL + tokenEnv 变量名
+    // 镜像上传设置（mirrorSettings）：registry 合法 URL + tokenValue（发布凭证，存服务端）
     if (body.mirrorSettings !== undefined) {
       const ms = body.mirrorSettings;
       if (typeof ms !== "object" || ms === null || Array.isArray(ms)) {
@@ -367,13 +367,14 @@ async function route(req, res) {
         }
         cleanedMs.registry = ms.registry.trim();
       }
-      if (ms.tokenEnv !== undefined) {
-        if (typeof ms.tokenEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(ms.tokenEnv.trim())) {
-          return send(res, 400, { error: "mirrorSettings.tokenEnv 必须是环境变量名" });
-        }
-        cleanedMs.tokenEnv = ms.tokenEnv.trim();
+      if (ms.tokenValue !== undefined) {
+        if (typeof ms.tokenValue !== "string") return send(res, 400, { error: "mirrorSettings.tokenValue 必须是字符串" });
+        cleanedMs.tokenValue = ms.tokenValue.trim();
       }
-      cfg.mirrorSettings = Object.assign({ registry: "https://registry.ict.cmcc", tokenEnv: "NODE_AUTH_TOKEN" }, cleanedMs);
+      cfg.mirrorSettings = Object.assign(
+        { registry: "https://registry.ict.cmcc", tokenValue: "" },
+        cleanedMs
+      );
     }
     if (typeof body.baseUrl === "string") cfg.baseUrl = body.baseUrl;
     if (typeof body.version === "number") cfg.version = body.version;
@@ -723,8 +724,9 @@ function adminPageHtml() {
       </div>
       <div class="row" style="margin-bottom:10px">
         <input class="input" id="mirrorRegistry" placeholder="内网 registry（如 https://registry.ict.cmcc）">
-        <input class="input" id="mirrorTokenEnv" placeholder="token 环境变量名（如 NODE_AUTH_TOKEN）" style="max-width:260px">
+        <input class="input" type="password" id="mirrorToken" placeholder="发布 token（NODE_AUTH_TOKEN 值，存服务端，调用时传递）" style="max-width:320px">
       </div>
+      <div style="margin-bottom:10px;font-size:12.5px;color:var(--muted)">token 存于服务端 config.json；点击「开始上传」时经管理能力临时传给管理员 launcher（内存使用，不落盘客户端）。</div>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
         <button class="btn primary" onclick="saveMirrorSettings()">保存镜像设置</button>
         <button class="btn" onclick="startMirrorUpload()" id="mirrorStartBtn">🚀 开始上传到内网 registry</button>
@@ -838,7 +840,7 @@ function renderClientDefaults(){
   document.getElementById("cdUseSystemNode").checked=!!cd.useSystemNode;
   const ms=current.mirrorSettings||{};
   document.getElementById("mirrorRegistry").value=ms.registry||"https://registry.ict.cmcc";
-  document.getElementById("mirrorTokenEnv").value=ms.tokenEnv||"NODE_AUTH_TOKEN";
+  document.getElementById("mirrorToken").value=ms.tokenValue||"";
 }
 async function saveClientDefaults(){
   try{
@@ -871,22 +873,27 @@ async function saveMirrorSettings(){
   try{
     const ms={
       registry:document.getElementById("mirrorRegistry").value.trim(),
-      tokenEnv:document.getElementById("mirrorTokenEnv").value.trim(),
+      tokenValue:document.getElementById("mirrorToken").value.trim(),
     };
     if(!/^https?:\/\/\S+$/.test(ms.registry)){ toast("registry 必须是 http(s) 地址","warn"); return; }
     const body={plugins:current.plugins,managedMenu:current.managedMenu,clientDefaults:current.clientDefaults||{},mirrorSettings:ms};
     const r=await fetch("/api/config",{method:"POST",headers:headers(true),body:JSON.stringify(body)});
     const j=await r.json();
     if(!r.ok) throw new Error((j&&j.error)||("HTTP "+r.status));
-    current=j; toast("镜像设置已保存","ok");
+    current=j; toast("镜像设置已保存（含 token）","ok");
   }catch(e){ toast("保存失败："+esc(e.message),"err"); }
 }
 async function startMirrorUpload(){
   if(!bridgePort){ toast("请先连接管理员本机管理能力（插件策略页顶部）","warn"); return; }
   const reg=document.getElementById("mirrorRegistry").value.trim()||"https://registry.ict.cmcc";
-  const tok=document.getElementById("mirrorTokenEnv").value.trim()||"NODE_AUTH_TOKEN";
+  const token=document.getElementById("mirrorToken").value.trim();
+  if(!token){ toast("请先配置发布 token（镜像设置）","warn"); return; }
   try{
-    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start?registry="+encodeURIComponent(reg)+"&tokenEnv="+encodeURIComponent(tok),{headers:headers(false)});
+    // token 经 POST body 传递（不进 URL/日志）
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start",{
+      method:"POST",headers:headers(true),
+      body:JSON.stringify({registry:reg,token:token})
+    });
     const j=await r.json();
     if(!j.ok){ toast("启动失败："+esc(j.error||""),"err"); return; }
     toast("上传已开始，请查看进度","ok");
