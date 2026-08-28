@@ -53,6 +53,7 @@ function defaultConfig() {
     plugins: [],
     managedMenu: { enabled: false, quickLinks: [] },
     clientDefaults: {},
+    mirrorSettings: { registry: "https://registry.ict.cmcc", tokenEnv: "NODE_AUTH_TOKEN" },
     updatedAt: new Date().toISOString(),
     baseUrl: "",
   };
@@ -66,7 +67,7 @@ function readConfig() {
   }
 }
 
-/** 归一化旧版 config：补 managedMenu / clientDefaults 默认值，保证旧数据平滑升级。 */
+/** 归一化旧版 config：补 managedMenu / clientDefaults / mirrorSettings 默认值，保证旧数据平滑升级。 */
 function normalizeConfig(cfg) {
   if (cfg && typeof cfg === "object") {
     if (typeof cfg.managedMenu !== "object" || cfg.managedMenu === null) {
@@ -74,6 +75,9 @@ function normalizeConfig(cfg) {
     }
     if (typeof cfg.clientDefaults !== "object" || cfg.clientDefaults === null) {
       cfg.clientDefaults = {};
+    }
+    if (typeof cfg.mirrorSettings !== "object" || cfg.mirrorSettings === null) {
+      cfg.mirrorSettings = { registry: "https://registry.ict.cmcc", tokenEnv: "NODE_AUTH_TOKEN" };
     }
     if (typeof cfg.plugins !== "object" || !Array.isArray(cfg.plugins)) cfg.plugins = [];
   }
@@ -349,6 +353,27 @@ async function route(req, res) {
         cleaned.useSystemNode = cd.useSystemNode;
       }
       cfg.clientDefaults = cleaned;
+    }
+    // 镜像上传设置（mirrorSettings）：registry 合法 URL + tokenEnv 变量名
+    if (body.mirrorSettings !== undefined) {
+      const ms = body.mirrorSettings;
+      if (typeof ms !== "object" || ms === null || Array.isArray(ms)) {
+        return send(res, 400, { error: "mirrorSettings 必须是对象" });
+      }
+      const cleanedMs = {};
+      if (ms.registry !== undefined) {
+        if (typeof ms.registry !== "string" || !/^https?:\/\/\S+$/.test(ms.registry.trim())) {
+          return send(res, 400, { error: "mirrorSettings.registry 必须是 http(s) 地址" });
+        }
+        cleanedMs.registry = ms.registry.trim();
+      }
+      if (ms.tokenEnv !== undefined) {
+        if (typeof ms.tokenEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(ms.tokenEnv.trim())) {
+          return send(res, 400, { error: "mirrorSettings.tokenEnv 必须是环境变量名" });
+        }
+        cleanedMs.tokenEnv = ms.tokenEnv.trim();
+      }
+      cfg.mirrorSettings = Object.assign({ registry: "https://registry.ict.cmcc", tokenEnv: "NODE_AUTH_TOKEN" }, cleanedMs);
     }
     if (typeof body.baseUrl === "string") cfg.baseUrl = body.baseUrl;
     if (typeof body.version === "number") cfg.version = body.version;
@@ -691,6 +716,22 @@ function adminPageHtml() {
       </div>
       <div style="margin-top:12px"><button class="btn primary" onclick="saveClientDefaults()">保存客户端默认配置</button></div>
     </div>
+    <div class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">镜像上传（同步到内网 registry）</h2>
+        <div class="card-desc">管理员 launcher 把「应装插件 + 全部依赖」上传到内网 registry（需连接管理能力，管理员机配 NODE_AUTH_TOKEN）</div></div>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <input class="input" id="mirrorRegistry" placeholder="内网 registry（如 https://registry.ict.cmcc）">
+        <input class="input" id="mirrorTokenEnv" placeholder="token 环境变量名（如 NODE_AUTH_TOKEN）" style="max-width:260px">
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+        <button class="btn primary" onclick="saveMirrorSettings()">保存镜像设置</button>
+        <button class="btn" onclick="startMirrorUpload()" id="mirrorStartBtn">🚀 开始上传到内网 registry</button>
+        <span class="sync-hint" id="mirrorState"></span>
+      </div>
+      <div id="mirrorProgress" style="margin-top:12px;font-size:13px"></div>
+    </div>
   </section>
 
   <!-- 菜单策略 -->
@@ -795,6 +836,9 @@ function renderClientDefaults(){
   document.getElementById("cdSyncSecs").value=cd.syncIntervalSecs||"";
   document.getElementById("cdProfile").value=cd.profile||"";
   document.getElementById("cdUseSystemNode").checked=!!cd.useSystemNode;
+  const ms=current.mirrorSettings||{};
+  document.getElementById("mirrorRegistry").value=ms.registry||"https://registry.ict.cmcc";
+  document.getElementById("mirrorTokenEnv").value=ms.tokenEnv||"NODE_AUTH_TOKEN";
 }
 async function saveClientDefaults(){
   try{
@@ -820,6 +864,68 @@ async function saveClientDefaults(){
     current=j; current.clientDefaults=current.clientDefaults||{};
     renderClientDefaults(); toast("客户端默认配置已保存","ok");
   }catch(e){ toast("保存失败："+esc(e.message),"err"); }
+}
+
+// ── 镜像上传 ──
+async function saveMirrorSettings(){
+  try{
+    const ms={
+      registry:document.getElementById("mirrorRegistry").value.trim(),
+      tokenEnv:document.getElementById("mirrorTokenEnv").value.trim(),
+    };
+    if(!/^https?:\/\/\S+$/.test(ms.registry)){ toast("registry 必须是 http(s) 地址","warn"); return; }
+    const body={plugins:current.plugins,managedMenu:current.managedMenu,clientDefaults:current.clientDefaults||{},mirrorSettings:ms};
+    const r=await fetch("/api/config",{method:"POST",headers:headers(true),body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok) throw new Error((j&&j.error)||("HTTP "+r.status));
+    current=j; toast("镜像设置已保存","ok");
+  }catch(e){ toast("保存失败："+esc(e.message),"err"); }
+}
+async function startMirrorUpload(){
+  if(!bridgePort){ toast("请先连接管理员本机管理能力（插件策略页顶部）","warn"); return; }
+  const reg=document.getElementById("mirrorRegistry").value.trim()||"https://registry.ict.cmcc";
+  const tok=document.getElementById("mirrorTokenEnv").value.trim()||"NODE_AUTH_TOKEN";
+  try{
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start?registry="+encodeURIComponent(reg)+"&tokenEnv="+encodeURIComponent(tok),{headers:headers(false)});
+    const j=await r.json();
+    if(!j.ok){ toast("启动失败："+esc(j.error||""),"err"); return; }
+    toast("上传已开始，请查看进度","ok");
+    pollMirrorProgress();
+  }catch(e){ toast("无法连接管理员管理能力："+esc(e.message),"err"); }
+}
+let mirrorPollTimer=null;
+async function pollMirrorProgress(){
+  if(!bridgePort) return;
+  try{
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/progress",{headers:headers(false)});
+    const j=await r.json();
+    if(!j.ok) return;
+    const p=j.progress||{};
+    const el=document.getElementById("mirrorProgress");
+    const st=document.getElementById("mirrorState");
+    if(p.state==="running"){
+      el.innerHTML='<div style="background:#eef4ff;border:1px solid #cfe0ff;border-radius:8px;padding:10px 14px">'+
+        '⏳ 上传中：<b>'+esc(p.current_pkg||"…")+'</b><br>'+
+        '进度：'+p.done_pkgs+'/'+p.total_pkgs+' 个包（应装 '+p.total_plugins+' 个插件）'+
+        '</div>';
+      st.innerHTML='<span style="color:var(--amber)">进行中…</span>';
+      document.getElementById("mirrorStartBtn").disabled=true;
+      if(mirrorPollTimer) clearTimeout(mirrorPollTimer);
+      mirrorPollTimer=setTimeout(pollMirrorProgress,3000);
+    } else if(p.state==="done"){
+      el.innerHTML='<div style="background:#e8f7ee;border:1px solid #b7e3c8;border-radius:8px;padding:10px 14px">'+
+        '✅ 上传完成：'+p.done_pkgs+'/'+p.total_pkgs+' 个包已同步到 '+esc(p.registry||"")+
+        '</div>';
+      st.innerHTML='<span style="color:var(--green)">已完成</span>';
+      document.getElementById("mirrorStartBtn").disabled=false;
+    } else if(p.state==="error"){
+      el.innerHTML='<div style="background:#fdeaea;border:1px solid #f5c6c6;border-radius:8px;padding:10px 14px">'+
+        '❌ 上传出错：'+esc((p.error||"").slice(0,300))+
+        '</div>';
+      st.innerHTML='<span style="color:var(--red)">出错</span>';
+      document.getElementById("mirrorStartBtn").disabled=false;
+    }
+  }catch(e){ /* 连接断开忽略 */ }
 }
 async function loadStatus(){
   try{
