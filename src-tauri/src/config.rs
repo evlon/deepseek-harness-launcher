@@ -19,14 +19,14 @@ pub enum Region {
 }
 
 /// 可配置网址菜单项
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuickLink {
     pub label: String,
     pub url: String,
 }
 
 /// 启动器配置（JSON，全字段可选）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LauncherConfig {
     /// Harness 服务端口（缺省 3180，避开桌面端 3080）
@@ -53,10 +53,50 @@ pub struct LauncherConfig {
     /// 管理能力（外网代理网关）：管理员 launcher 在本机 127.0.0.1 起本地 API，
     /// 供服务端管理页中转查包信息（服务端不直接出外网）。
     pub admin_bridge: Option<AdminBridgeConfig>,
+    /// IP 地域检测（用 ipinfo.io / ip.sb 等获取设备所在地域，替代 locale/时区判断）
+    pub geo_detection: Option<GeoDetectionConfig>,
+}
+
+/// IP 地域检测配置。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeoDetectionConfig {
+    /// 是否启用（默认 true；关闭则用系统 locale/时区判断）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 检测服务 URL（默认 https://ipinfo.io/json，可换 https://api.ip.sb/geoip 或自定义）
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// IP 地域检测默认服务。
+pub const DEFAULT_GEO_PROVIDER: &str = "https://ipinfo.io/json";
+/// 备用检测服务（默认 provider 不可用时尝试）。
+pub const FALLBACK_GEO_PROVIDER: &str = "https://api.ip.sb/geoip";
+
+/// 解析 IP 检测服务 URL（配置优先，缺省 ipinfo.io）。
+pub fn geo_provider(cfg: &LauncherConfig) -> String {
+    cfg.geo_detection
+        .as_ref()
+        .and_then(|g| g.provider.clone())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| DEFAULT_GEO_PROVIDER.to_string())
+}
+
+/// IP 地域检测是否启用。
+pub fn geo_detection_enabled(cfg: &LauncherConfig) -> bool {
+    cfg.geo_detection
+        .as_ref()
+        .map(|g| g.enabled)
+        .unwrap_or(true)
 }
 
 /// 管理能力（外网代理网关）配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminBridgeConfig {
     /// 是否开启（托盘「管理能力」可切换）
@@ -262,9 +302,17 @@ pub fn set_bridge_enabled<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Resu
 /// Windows 读取系统默认区域（`GetUserDefaultLocaleName`）与动态时区
 /// （`GetDynamicTimeZoneInformation`，返回 `China Standard Time`），
 /// 任一击中大陆即走镜像；Unix 读 `LC_ALL/LC_MESSAGES/LANG` 与 `/etc/localtime`。
+///
+/// 启动时 `detect_region_async` 会用 IP 地理定位（ipinfo.io/ip.sb）覆盖该缓存；
+/// 此处是同步 fallback（locale/时区），供 IP 检测未完成或失败时使用。
 pub fn detect_region() -> Region {
-    static REGION: once_cell::sync::OnceCell<Region> = once_cell::sync::OnceCell::new();
-    *REGION.get_or_init(|| {
+    *region_cache().lock().unwrap()
+}
+
+/// 地域缓存（初始 = locale/时区判断；IP 检测成功后覆盖）。
+fn region_cache() -> &'static std::sync::Mutex<Region> {
+    static REGION: once_cell::sync::OnceCell<std::sync::Mutex<Region>> = once_cell::sync::OnceCell::new();
+    REGION.get_or_init(|| {
         let locale = current_locale();
         let locale_zh = locale_is_china(&locale);
         let tz_china = is_china_timezone();
@@ -273,8 +321,85 @@ pub fn detect_region() -> Region {
             "Download region detected: {:?} (locale={locale:?}, china_timezone={tz_china})",
             region
         );
-        region
+        std::sync::Mutex::new(region)
     })
+}
+
+/// 用 IP 地理定位结果覆盖地域缓存（async 检测成功后调用）。
+pub fn set_detected_region(region: Region, provider: &str, country: &str) {
+    *region_cache().lock().unwrap() = region;
+    log::info!(
+        "Download region updated by IP geo: {:?} (country={country:?}, provider={provider:?})",
+        region
+    );
+}
+
+/// 异步 IP 地域检测：查配置的 provider（缺省 ipinfo.io），失败尝试备用 ip.sb，
+/// 再失败保留 locale fallback。返回最终 Region（可能未变化）。
+///
+/// 绝不 panic：任何网络错误都回退 locale 判断。
+pub async fn detect_region_async(cfg: &LauncherConfig) -> Region {
+    if !geo_detection_enabled(cfg) {
+        log::info!("IP 地域检测已关闭，使用 locale/时区判断");
+        return detect_region();
+    }
+    let primary = geo_provider(cfg);
+    let providers: Vec<&str> = if primary == DEFAULT_GEO_PROVIDER {
+        vec![DEFAULT_GEO_PROVIDER, FALLBACK_GEO_PROVIDER]
+    } else {
+        vec![primary.as_str()]
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("deepseek-harness-launcher-geo")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    for provider in providers {
+        match query_country(&client, provider).await {
+            Ok(Some(country)) => {
+                let region = region_from_country(&country);
+                set_detected_region(region, provider, &country);
+                return region;
+            }
+            Ok(None) => log::warn!("IP 地域检测 {provider} 未返回有效 country，尝试下一个"),
+            Err(e) => log::warn!("IP 地域检测 {provider} 失败：{e}，尝试下一个"),
+        }
+    }
+    log::warn!("IP 地域检测全部失败，回退 locale/时区判断");
+    detect_region()
+}
+
+/// 查询单个 IP 地理定位服务，返回 country 字符串。
+async fn query_country(client: &reqwest::Client, provider: &str) -> Result<Option<String>, String> {
+    let res = client
+        .get(provider)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status()));
+    }
+    let json: serde_json::Value = res.json().await.map_err(|e| format!("parse failed: {e}"))?;
+    // ipinfo.io: { "country": "CN" }；ip.sb: { "country_code": "CN", "country": "China" }
+    let country = json
+        .get("country")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| json.get("country_code").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    Ok(country)
+}
+
+/// 由 country 判定地域：CN / China / 中国 = Domestic，其他 = Overseas。
+fn region_from_country(country: &str) -> Region {
+    let c = country.trim().to_ascii_lowercase();
+    if c == "cn" || c == "china" || c == "中国" || c.contains("zh-cn") {
+        Region::Domestic
+    } else {
+        Region::Overseas
+    }
 }
 
 /// 组合判定：简体中文界面语言或中国时区任一命中，即视为国内用户。
@@ -449,22 +574,100 @@ fn cache(cfg: LauncherConfig) {
     *cell.lock().unwrap() = cfg;
 }
 
-/// 启动时加载配置（文件缺失/解析失败按默认处理，不阻断启动）。
+/// 编译内置的默认配置（随二进制分发，缺省值兜底）。
+fn builtin_default_config() -> LauncherConfig {
+    // include_str! 在编译时嵌入 default-config.json
+    serde_json::from_str(include_str!("../default-config.json"))
+        .unwrap_or_else(|e| {
+            log::warn!("内置默认配置解析失败（不应发生）：{e}");
+            LauncherConfig::default()
+        })
+}
+
+/// 启动时加载配置：内置默认 ⊕ 用户文件（内置兜底，用户覆盖）。
 pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> LauncherConfig {
     let path = config_path(app);
-    let cfg = match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            log::warn!("launcher-config.json 解析失败，回退默认：{e}");
-            LauncherConfig::default()
-        }),
-        Err(_) => LauncherConfig::default(),
-    };
+    let mut cfg = builtin_default_config();
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            match serde_json::from_str::<LauncherConfig>(&s) {
+                Ok(user_cfg) => merge_user_into_builtin(&mut cfg, user_cfg),
+                Err(e) => log::warn!("launcher-config.json 解析失败，使用内置默认：{e}"),
+            }
+        }
+        Err(_) => log::info!("launcher-config.json 不存在，使用内置默认配置"),
+    }
     log::info!(
-        "Launcher config loaded: port={:?}, npm_registry={:?}, gh_prefix={:?}, dsh_home={:?}",
-        cfg.port, cfg.npm_registry, cfg.gh_mirror_prefix, cfg.dsh_home
+        "Launcher config loaded: port={:?}, npm_registry={:?}, gh_prefix={:?}, dsh_home={:?}, profile={:?}",
+        cfg.port, cfg.npm_registry, cfg.gh_mirror_prefix, cfg.dsh_home, cfg.profile
     );
     cache(cfg.clone());
     cfg
+}
+
+/// 用户配置覆盖内置默认：用户显式设置的字段（Option=Some）覆盖内置值。
+fn merge_user_into_builtin(builtin: &mut LauncherConfig, user: LauncherConfig) {
+    if user.port.is_some() { builtin.port = user.port; }
+    if user.npm_registry.is_some() { builtin.npm_registry = user.npm_registry; }
+    if user.gh_mirror_prefix.is_some() { builtin.gh_mirror_prefix = user.gh_mirror_prefix; }
+    if user.auto_start.is_some() { builtin.auto_start = user.auto_start; }
+    if user.dsh_home.is_some() { builtin.dsh_home = user.dsh_home; }
+    if user.quick_links.is_some() { builtin.quick_links = user.quick_links; }
+    if user.server_url.is_some() { builtin.server_url = user.server_url; }
+    if user.sync_interval_secs.is_some() { builtin.sync_interval_secs = user.sync_interval_secs; }
+    if user.admin_token.is_some() { builtin.admin_token = user.admin_token; }
+    if user.profile.is_some() { builtin.profile = user.profile; }
+    if user.admin_bridge.is_some() { builtin.admin_bridge = user.admin_bridge; }
+    if user.geo_detection.is_some() { builtin.geo_detection = user.geo_detection; }
+}
+
+/// 服务器配置覆盖本地（遵循「用户显式设置过的不被覆盖」）：
+/// `user_set` 记录用户 launcher-config.json 里显式写过的字段名。
+/// 返回合并后的配置。
+pub fn apply_server_overrides(
+    local: &mut LauncherConfig,
+    server: &serde_json::Value,
+    user_set: &[&str],
+) {
+    let get = |k: &str| server.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    // 仅当用户未显式设置该字段时，才用服务器值覆盖
+    if !user_set.contains(&"npmRegistry") {
+        if let Some(v) = get("npmRegistry") { local.npm_registry = Some(v); }
+    }
+    if !user_set.contains(&"ghMirrorPrefix") {
+        if let Some(v) = get("ghMirrorPrefix") { local.gh_mirror_prefix = Some(v); }
+    }
+    if !user_set.contains(&"port") {
+        if let Some(v) = server.get("port").and_then(|v| v.as_u64()) {
+            if v >= 1 && v <= 65535 { local.port = Some(v as u16); }
+        }
+    }
+    if !user_set.contains(&"syncIntervalSecs") {
+        if let Some(v) = server.get("syncIntervalSecs").and_then(|v| v.as_u64()) {
+            if v >= 30 { local.sync_interval_secs = Some(v); }
+        }
+    }
+    if !user_set.contains(&"profile") {
+        if let Some(v) = get("profile") {
+            if !v.is_empty() && !v.contains('/') && !v.contains('\\') {
+                local.profile = Some(v);
+            }
+        }
+    }
+}
+
+/// 记录用户 launcher-config.json 里显式设置的字段名（用于服务器合并时跳过）。
+pub fn user_set_fields<R: Runtime>(app: &AppHandle<R>) -> Vec<String> {
+    let path = config_path(app);
+    let Ok(s) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return Vec::new();
+    };
+    json.as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// 写回配置并刷新缓存。
@@ -625,5 +828,73 @@ mod tests {
     fn ensure_trailing_slash_normalizes() {
         assert_eq!(ensure_trailing_slash("https://x.com"), "https://x.com/");
         assert_eq!(ensure_trailing_slash("https://x.com/"), "https://x.com/");
+    }
+
+    #[test]
+    fn country_parsing_detects_region() {
+        assert_eq!(region_from_country("CN"), Region::Domestic);
+        assert_eq!(region_from_country("cn"), Region::Domestic);
+        assert_eq!(region_from_country("China"), Region::Domestic);
+        assert_eq!(region_from_country("中国"), Region::Domestic);
+        assert_eq!(region_from_country("US"), Region::Overseas);
+        assert_eq!(region_from_country("SG"), Region::Overseas);
+        assert_eq!(region_from_country(""), Region::Overseas);
+    }
+
+    #[test]
+    fn builtin_default_config_has_sane_values() {
+        let cfg = builtin_default_config();
+        assert_eq!(cfg.port, Some(3180), "默认端口应避开 3080");
+        assert_eq!(cfg.profile.as_deref(), Some("web"));
+        assert!(cfg.geo_detection.as_ref().map(|g| g.enabled).unwrap_or(false), "IP 检测默认开启");
+        assert_eq!(geo_provider(&cfg), DEFAULT_GEO_PROVIDER);
+    }
+
+    #[test]
+    fn user_overrides_builtin() {
+        let mut builtin = builtin_default_config();
+        let user = LauncherConfig {
+            port: Some(4080),
+            server_url: Some("http://server.internal".to_string()),
+            ..Default::default()
+        };
+        merge_user_into_builtin(&mut builtin, user);
+        assert_eq!(builtin.port, Some(4080));
+        assert_eq!(builtin.server_url.as_deref(), Some("http://server.internal"));
+        // 未显式设置的字段保留内置默认
+        assert_eq!(builtin.profile.as_deref(), Some("web"));
+        assert_eq!(builtin.sync_interval_secs, Some(300));
+    }
+
+    #[test]
+    fn server_overrides_respect_user_explicit_fields() {
+        let mut local = builtin_default_config();
+        let server = serde_json::json!({
+            "npmRegistry": "https://registry.npmmirror.com/",
+            "ghMirrorPrefix": "https://ghfast.top/",
+            "port": 5000,
+            "profile": "matrix",
+        });
+        // 用户显式设置了 port → 服务器不覆盖 port；其他字段可覆盖
+        let user_set = ["port"];
+        apply_server_overrides(&mut local, &server, &user_set);
+        assert_eq!(local.port, Some(3180), "用户显式设置的 port 不被服务器覆盖");
+        assert_eq!(local.npm_registry.as_deref(), Some("https://registry.npmmirror.com/"));
+        assert_eq!(local.gh_mirror_prefix.as_deref(), Some("https://ghfast.top/"));
+        assert_eq!(local.profile.as_deref(), Some("matrix"));
+    }
+
+    #[test]
+    fn server_overrides_invalid_values_ignored() {
+        let mut local = builtin_default_config();
+        let server = serde_json::json!({
+            "port": 99999,
+            "syncIntervalSecs": 5,
+            "profile": "../evil",
+        });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert_eq!(local.port, Some(3180), "非法端口被忽略");
+        assert_eq!(local.sync_interval_secs, Some(300), "过小同步间隔被忽略");
+        assert_eq!(local.profile.as_deref(), Some("web"), "非法 profile 被忽略");
     }
 }

@@ -51,6 +51,16 @@ fn main() {
                 });
             }
 
+            // IP 地域检测（异步，启动即触发；结果缓存后供加速源解析）
+            {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let cfg = config::load_cached();
+                    let _ = config::detect_region_async(&cfg).await;
+                    let _ = h;
+                });
+            }
+
             // 企业中心服务端同步：配置了 serverUrl 才启用。
             // 离线容错：循环永不退出，失败仅日志，恢复后自动补拉。
             if !config::resolve_server_url(&cfg).is_empty() {

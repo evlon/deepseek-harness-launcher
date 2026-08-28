@@ -43,6 +43,9 @@ pub struct ServerConfig {
     /// 托盘菜单策略（服务端统一下发）。
     #[serde(default, rename = "managedMenu")]
     pub managed_menu: Option<ManagedMenu>,
+    /// 客户端默认配置覆盖（服务端下发的 npmRegistry/ghMirrorPrefix/port 等）。
+    #[serde(default, rename = "clientDefaults")]
+    pub client_defaults: Option<serde_json::Value>,
 }
 
 /// 客户端已装插件详情（跨所有 profile，上报给服务端）。
@@ -418,6 +421,8 @@ pub async fn sync_once<R: Runtime>(
     let outcome = match fetch_config(&server_url, &token).await {
         Ok(config) => {
             let pending = pending_plugins(&config.plugins, &installed);
+            // 服务器配置覆盖本地（遵循「用户显式设置过的不被覆盖」）
+            apply_server_defaults(app, &config);
             // 缓存菜单策略（托盘渲染据此展示；用户配置永不被覆盖）
             state.cached_managed_menu = config.managed_menu.clone();
             state.cached_config = Some(config.clone());
@@ -494,6 +499,29 @@ pub async fn sync_once<R: Runtime>(
     outcome
 }
 
+/// 应用服务器下发的客户端默认配置（clientDefaults），遵循「用户显式设置过的不覆盖」。
+/// 合并后写回 launcher-config.json 并刷新缓存。
+fn apply_server_defaults<R: Runtime>(app: &AppHandle<R>, server: &ServerConfig) {
+    let Some(defaults) = &server.client_defaults else {
+        return;
+    };
+    if !defaults.is_object() || defaults.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return;
+    }
+    let user_set = crate::config::user_set_fields(app);
+    let user_set: Vec<&str> = user_set.iter().map(|s| s.as_str()).collect();
+
+    let mut local = load_cached();
+    let before = local.clone();
+    crate::config::apply_server_overrides(&mut local, defaults, &user_set);
+
+    // 有变化才写回 + 缓存
+    if local != before {
+        log::info!("应用服务器默认配置：{:?}", defaults);
+        let _ = crate::config::save_config(app, &local);
+    }
+}
+
 /// 当前实际展示的托盘菜单（策略启用→策略项；否则用户项）。
 pub fn current_menu<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Vec<QuickLink> {
     let state = load_state(app, cfg);
@@ -509,8 +537,7 @@ pub fn current_menu<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Vec
 pub fn menu_strategy_enabled<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> bool {
     load_state(app, cfg)
         .cached_managed_menu
-        .as_ref()
-        .map(|m| m.enabled)
+        .as_ref()        .map(|m| m.enabled)
         .unwrap_or(false)
 }
 

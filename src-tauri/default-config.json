@@ -1,0 +1,9 @@
+{
+  "port": 3180,
+  "profile": "web",
+  "syncIntervalSecs": 300,
+  "geoDetection": {
+    "enabled": true,
+    "provider": "https://ipinfo.io/json"
+  }
+}

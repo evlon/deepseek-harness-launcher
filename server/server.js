@@ -52,6 +52,7 @@ function defaultConfig() {
     version: 2,
     plugins: [],
     managedMenu: { enabled: false, quickLinks: [] },
+    clientDefaults: {},
     updatedAt: new Date().toISOString(),
     baseUrl: "",
   };
@@ -65,11 +66,14 @@ function readConfig() {
   }
 }
 
-/** 归一化旧版 config：补 managedMenu 默认值，保证旧数据平滑升级。 */
+/** 归一化旧版 config：补 managedMenu / clientDefaults 默认值，保证旧数据平滑升级。 */
 function normalizeConfig(cfg) {
   if (cfg && typeof cfg === "object") {
     if (typeof cfg.managedMenu !== "object" || cfg.managedMenu === null) {
       cfg.managedMenu = { enabled: false, quickLinks: [] };
+    }
+    if (typeof cfg.clientDefaults !== "object" || cfg.clientDefaults === null) {
+      cfg.clientDefaults = {};
     }
     if (typeof cfg.plugins !== "object" || !Array.isArray(cfg.plugins)) cfg.plugins = [];
   }
@@ -299,6 +303,37 @@ async function route(req, res) {
           url: q.url.trim(),
         })),
       };
+    }
+    // 客户端默认配置覆盖（clientDefaults）：校验合法字段
+    if (body.clientDefaults !== undefined) {
+      const cd = body.clientDefaults;
+      if (typeof cd !== "object" || cd === null || Array.isArray(cd)) {
+        return send(res, 400, { error: "clientDefaults 必须是对象" });
+      }
+      const cleaned = {};
+      if (cd.npmRegistry !== undefined) {
+        if (typeof cd.npmRegistry !== "string" || !cd.npmRegistry.trim()) return send(res, 400, { error: "clientDefaults.npmRegistry 必须是字符串" });
+        cleaned.npmRegistry = cd.npmRegistry.trim();
+      }
+      if (cd.ghMirrorPrefix !== undefined) {
+        if (typeof cd.ghMirrorPrefix !== "string") return send(res, 400, { error: "clientDefaults.ghMirrorPrefix 必须是字符串" });
+        cleaned.ghMirrorPrefix = cd.ghMirrorPrefix.trim();
+      }
+      if (cd.port !== undefined) {
+        const p = Number(cd.port);
+        if (!Number.isInteger(p) || p < 1 || p > 65535) return send(res, 400, { error: "clientDefaults.port 必须在 1-65535" });
+        cleaned.port = p;
+      }
+      if (cd.syncIntervalSecs !== undefined) {
+        const s = Number(cd.syncIntervalSecs);
+        if (!Number.isInteger(s) || s < 30) return send(res, 400, { error: "clientDefaults.syncIntervalSecs 必须 >= 30" });
+        cleaned.syncIntervalSecs = s;
+      }
+      if (cd.profile !== undefined) {
+        if (typeof cd.profile !== "string" || !/^[a-zA-Z0-9_-]+$/.test(cd.profile)) return send(res, 400, { error: "clientDefaults.profile 非法" });
+        cleaned.profile = cd.profile;
+      }
+      cfg.clientDefaults = cleaned;
     }
     if (typeof body.baseUrl === "string") cfg.baseUrl = body.baseUrl;
     if (typeof body.version === "number") cfg.version = body.version;
@@ -618,6 +653,26 @@ function adminPageHtml() {
         <span style="font-size:12.5px;color:var(--muted)">修改后需保存，客户端下次轮询（默认 5 分钟）生效</span>
       </div>
     </div>
+    <div class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">客户端默认配置</h2>
+        <div class="card-desc">下发给客户端的配置默认值（客户端本地显式设置过的不被覆盖）</div></div>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <input class="input" id="cdNpmRegistry" placeholder="npm registry（如 https://registry.npmmirror.com/，空=不覆盖）">
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <input class="input" id="cdGhMirror" placeholder="GitHub 中转前缀（如 https://ghfast.top/，空=不覆盖）">
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <input class="input" id="cdPort" placeholder="端口（空=不覆盖）" style="max-width:200px">
+        <input class="input" id="cdSyncSecs" placeholder="同步间隔秒（>=30，空=不覆盖）" style="max-width:220px">
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <input class="input" id="cdProfile" placeholder="profile（如 web / matrix，空=不覆盖）" style="max-width:220px">
+      </div>
+      <div style="margin-top:12px"><button class="btn primary" onclick="saveClientDefaults()">保存客户端默认配置</button></div>
+    </div>
   </section>
 
   <!-- 菜单策略 -->
@@ -710,8 +765,38 @@ async function loadConfig(){
     const r=await fetch("/api/config"); const j=await r.json();
     if(!r.ok){ throw new Error((j&&j.error)||("HTTP "+r.status)); }
     current=j; current.managedMenu=current.managedMenu||{enabled:false,quickLinks:[]};
-    renderPlugins(); renderMenuPolicy();
+    current.clientDefaults=current.clientDefaults||{};
+    renderPlugins(); renderMenuPolicy(); renderClientDefaults();
   }catch(e){ toast("加载配置失败："+esc(e.message),"err"); }
+}
+function renderClientDefaults(){
+  const cd=current.clientDefaults||{};
+  document.getElementById("cdNpmRegistry").value=cd.npmRegistry||"";
+  document.getElementById("cdGhMirror").value=cd.ghMirrorPrefix||"";
+  document.getElementById("cdPort").value=cd.port||"";
+  document.getElementById("cdSyncSecs").value=cd.syncIntervalSecs||"";
+  document.getElementById("cdProfile").value=cd.profile||"";
+}
+async function saveClientDefaults(){
+  try{
+    const cd={};
+    const npm=document.getElementById("cdNpmRegistry").value.trim();
+    const gh=document.getElementById("cdGhMirror").value.trim();
+    const port=document.getElementById("cdPort").value.trim();
+    const sync=document.getElementById("cdSyncSecs").value.trim();
+    const prof=document.getElementById("cdProfile").value.trim();
+    if(npm) cd.npmRegistry=npm;
+    if(gh) cd.ghMirrorPrefix=gh;
+    if(port){ const p=parseInt(port,10); if(p<1||p>65535){ toast("端口无效","warn"); return; } cd.port=p; }
+    if(sync){ const s=parseInt(sync,10); if(s<30){ toast("同步间隔需 >=30","warn"); return; } cd.syncIntervalSecs=s; }
+    if(prof) cd.profile=prof;
+    const body={plugins:current.plugins,managedMenu:current.managedMenu,clientDefaults:cd};
+    const r=await fetch("/api/config",{method:"POST",headers:headers(true),body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok) throw new Error((j&&j.error)||("HTTP "+r.status));
+    current=j; current.clientDefaults=current.clientDefaults||{};
+    renderClientDefaults(); toast("客户端默认配置已保存","ok");
+  }catch(e){ toast("保存失败："+esc(e.message),"err"); }
 }
 async function loadStatus(){
   try{

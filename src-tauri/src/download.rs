@@ -137,6 +137,10 @@ fn node_installed_ok<R: Runtime>(app: &AppHandle<R>) -> bool {
 }
 
 /// 按顺序尝试多个下载源，带 Range 续传重试。
+///
+/// 加速策略：**第一个源（通常是官方直连）快速失败**——只重试 `FAST_FAIL_ATTEMPTS` 次
+/// 就切换到镜像源，避免国内环境在直连 GitHub/npmjs 上浪费大量时间（此前 5 次重试
+/// 需 ~100 秒才切镜像）。镜像源是兜底，保留标准重试次数。
 pub async fn download_bytes(urls: &[String]) -> Result<Vec<u8>, String> {
     if urls.is_empty() {
         return Err("DOWNLOAD_URL_EMPTY: 没有提供下载源".to_string());
@@ -146,7 +150,8 @@ pub async fn download_bytes(urls: &[String]) -> Result<Vec<u8>, String> {
         if index > 0 {
             log::warn!("主下载源失败，切换镜像源重试：{url}");
         }
-        match download_with_retry(url).await {
+        let attempts = if index == 0 { FAST_FAIL_ATTEMPTS } else { MAX_ATTEMPTS };
+        match download_with_retry(url, attempts).await {
             Ok(buf) => return Ok(buf),
             Err(e) => last_err = e,
         }
@@ -158,9 +163,13 @@ pub async fn download_bytes(urls: &[String]) -> Result<Vec<u8>, String> {
     })
 }
 
+/// 镜像源（最后一个兜底）的标准重试次数。
 const MAX_ATTEMPTS: usize = 5;
+/// 首个源（官方直连）的快速失败次数：国内环境直连 GitHub/npmjs 大概率不通，
+/// 快速切换到镜像源提升体验。
+const FAST_FAIL_ATTEMPTS: usize = 2;
 
-async fn download_with_retry(url: &str) -> Result<Vec<u8>, String> {
+async fn download_with_retry(url: &str, attempts: usize) -> Result<Vec<u8>, String> {
     validate_url(url)?;
     let client = reqwest::Client::builder()
         .user_agent("deepseek-harness-launcher")
@@ -169,13 +178,13 @@ async fn download_with_retry(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
 
     let mut buffer: Vec<u8> = Vec::new();
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=attempts {
         if attempt > 1 {
             let delay_secs = (1u64 << (attempt - 1)).min(8);
             log::warn!(
                 "下载尝试 {}/{} 失败，{}s 后重试（已从 {} 字节续传）",
                 attempt - 1,
-                MAX_ATTEMPTS,
+                attempts,
                 delay_secs,
                 buffer.len()
             );
@@ -186,12 +195,11 @@ async fn download_with_retry(url: &str) -> Result<Vec<u8>, String> {
                 log::info!("下载完成：{} 字节", buffer.len());
                 return Ok(buffer);
             }
-            Err(e) => log::warn!("下载尝试 {}/{} 失败：{e}", attempt, MAX_ATTEMPTS),
+            Err(e) => log::warn!("下载尝试 {}/{} 失败：{e}", attempt, attempts),
         }
     }
     Err(format!(
-        "DOWNLOAD_INTERRUPTED: 下载中断，已自动重试 {} 次仍失败，已下载约 {:.1} MB",
-        MAX_ATTEMPTS,
+        "DOWNLOAD_INTERRUPTED: 下载中断，已自动重试 {attempts} 次仍失败，已下载约 {:.1} MB",
         buffer.len() as f64 / 1_000_000.0
     ))
 }
