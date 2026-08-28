@@ -11,13 +11,15 @@
   "port": 3180,
 
   // npm 源：显式指定后不再按地域自动选择。
-  // 可用值：""=自动（国内 npmmirror / 海外官方）、"https://registry.npmjs.org/"、
-  //        "https://registry.npmmirror.com/"，或内网私有源地址。
+  // 可用值：""=自动（国内 npmmirror / 海外官方）、单个字符串，或字符串数组（多源按序尝试）。
+  // 注意：npm 环境变量/.npmrc 只认第一个；下载层会用全部按序尝试。
+  // "npmRegistry": ["https://registry.npmmirror.com/", "https://registry.npmjs.org/"],
   "npmRegistry": "",
 
   // GitHub 中转前缀：给 GitHub 资产下载加镜像加速。
   // 可用值：""=自动（国内 ghfast.top / 海外直连）、"none"=直连、
-  //        "https://ghfast.top/" 等镜像前缀。
+  //        单个字符串，或字符串数组（多个镜像按序尝试，一个挂了下个顶上）。
+  // "ghMirrorPrefix": ["https://ghfast.top/", "https://ghproxy.net/"],
   "ghMirrorPrefix": "",
 
   // 开机自启动

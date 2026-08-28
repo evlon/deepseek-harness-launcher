@@ -311,13 +311,24 @@ async function route(req, res) {
         return send(res, 400, { error: "clientDefaults 必须是对象" });
       }
       const cleaned = {};
+      // npmRegistry / ghMirrorPrefix 支持字符串或字符串数组（多源）
+      const normList = (v) => {
+        if (typeof v === "string") return v.trim() ? [v.trim()] : null;
+        if (Array.isArray(v)) {
+          const out = v.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim());
+          return out.length ? out : null;
+        }
+        return undefined; // 非法类型
+      };
       if (cd.npmRegistry !== undefined) {
-        if (typeof cd.npmRegistry !== "string" || !cd.npmRegistry.trim()) return send(res, 400, { error: "clientDefaults.npmRegistry 必须是字符串" });
-        cleaned.npmRegistry = cd.npmRegistry.trim();
+        const n = normList(cd.npmRegistry);
+        if (n === undefined) return send(res, 400, { error: "clientDefaults.npmRegistry 必须是字符串或字符串数组" });
+        if (n !== null) cleaned.npmRegistry = n;
       }
       if (cd.ghMirrorPrefix !== undefined) {
-        if (typeof cd.ghMirrorPrefix !== "string") return send(res, 400, { error: "clientDefaults.ghMirrorPrefix 必须是字符串" });
-        cleaned.ghMirrorPrefix = cd.ghMirrorPrefix.trim();
+        const g = normList(cd.ghMirrorPrefix);
+        if (g === undefined) return send(res, 400, { error: "clientDefaults.ghMirrorPrefix 必须是字符串或字符串数组" });
+        if (g !== null) cleaned.ghMirrorPrefix = g;
       }
       if (cd.port !== undefined) {
         const p = Number(cd.port);
@@ -663,10 +674,10 @@ function adminPageHtml() {
         <div class="card-desc">下发给客户端的配置默认值（客户端本地显式设置过的不被覆盖）</div></div>
       </div>
       <div class="row" style="margin-bottom:10px">
-        <input class="input" id="cdNpmRegistry" placeholder="npm registry（如 https://registry.npmmirror.com/，空=不覆盖）">
+        <input class="input" id="cdNpmRegistry" placeholder="npm registry，多个用逗号分隔（如 https://registry.npmmirror.com/, https://registry.npmjs.org/，空=不覆盖）">
       </div>
       <div class="row" style="margin-bottom:10px">
-        <input class="input" id="cdGhMirror" placeholder="GitHub 中转前缀（如 https://ghfast.top/，空=不覆盖）">
+        <input class="input" id="cdGhMirror" placeholder="GitHub 中转前缀，多个用逗号分隔（如 https://ghfast.top/, https://ghproxy.net/，空=不覆盖）">
       </div>
       <div class="row" style="margin-bottom:10px">
         <input class="input" id="cdPort" placeholder="端口（空=不覆盖）" style="max-width:200px">
@@ -778,8 +789,8 @@ async function loadConfig(){
 }
 function renderClientDefaults(){
   const cd=current.clientDefaults||{};
-  document.getElementById("cdNpmRegistry").value=cd.npmRegistry||"";
-  document.getElementById("cdGhMirror").value=cd.ghMirrorPrefix||"";
+  document.getElementById("cdNpmRegistry").value=(cd.npmRegistry||[]).join(", ");
+  document.getElementById("cdGhMirror").value=(cd.ghMirrorPrefix||[]).join(", ");
   document.getElementById("cdPort").value=cd.port||"";
   document.getElementById("cdSyncSecs").value=cd.syncIntervalSecs||"";
   document.getElementById("cdProfile").value=cd.profile||"";
@@ -788,13 +799,16 @@ function renderClientDefaults(){
 async function saveClientDefaults(){
   try{
     const cd={};
+    // 逗号分隔输入 → 数组（多源）
+    const toList=(s)=>s.split(",").map(x=>x.trim()).filter(Boolean);
     const npm=document.getElementById("cdNpmRegistry").value.trim();
     const gh=document.getElementById("cdGhMirror").value.trim();
     const port=document.getElementById("cdPort").value.trim();
     const sync=document.getElementById("cdSyncSecs").value.trim();
     const prof=document.getElementById("cdProfile").value.trim();
-    if(npm) cd.npmRegistry=npm;
-    if(gh) cd.ghMirrorPrefix=gh;
+    const npmList=toList(npm), ghList=toList(gh);
+    if(npmList.length) cd.npmRegistry=npmList;
+    if(ghList.length) cd.ghMirrorPrefix=ghList;
     if(port){ const p=parseInt(port,10); if(p<1||p>65535){ toast("端口无效","warn"); return; } cd.port=p; }
     if(sync){ const s=parseInt(sync,10); if(s<30){ toast("同步间隔需 >=30","warn"); return; } cd.syncIntervalSecs=s; }
     if(prof) cd.profile=prof;

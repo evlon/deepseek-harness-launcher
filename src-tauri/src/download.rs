@@ -83,10 +83,9 @@ impl Component {
                 let release = fetch_latest_dsh().await?;
                 log::info!("最新 Harness 发行版：{}", release.tag);
                 let cfg = load_cached();
-                let urls = vec![
-                    release.asset_url.clone(),
-                    mirror_url(&release.asset_url, &cfg),
-                ];
+                // 官方直连 + 全部镜像前缀（多源按序尝试）
+                let mut urls = vec![release.asset_url.clone()];
+                urls.extend(mirror_urls(&release.asset_url, &cfg));
                 let buf = download_bytes(&urls).await?;
                 if let Some(digest) = &release.digest {
                     verify_sha256(&buf, digest)?;

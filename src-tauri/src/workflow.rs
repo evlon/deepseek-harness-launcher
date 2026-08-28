@@ -96,12 +96,13 @@ pub fn child_env<R: Runtime>(
     // npm registry：仅当用户**显式配置** npmRegistry 时才注入环境变量（显式配置优先）。
     // 未配置时交由 profile 的 `.npmrc`（ensure_profile_npmrc 已按地域写入）生效，
     // 避免这里按地域解析出的值覆盖掉用户 profile 里手工设的 registry。
-    if let Some(reg) = cfg.npm_registry.as_deref() {
-        let reg = reg.trim();
-        if !reg.is_empty() {
-            env.push(("npm_config_registry".to_string(), reg.to_string()));
+    // 多源时用第一个（npm 环境变量只认一个 registry）。
+    if let Some(list) = &cfg.npm_registry {
+        if let Some(first) = list.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
+            env.push(("npm_config_registry".to_string(), first.to_string()));
         }
     }
+    // GitHub 中转：多源时 git 的 url.insteadOf 只认一个，取第一个
     if let Some(prefix) = resolve_gh_prefix(cfg) {
         env.push(("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
         env.push(("GIT_CONFIG_KEY_0".to_string(), format!("url.{prefix}insteadOf")));

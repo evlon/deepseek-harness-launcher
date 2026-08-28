@@ -31,11 +31,14 @@ pub struct QuickLink {
 pub struct LauncherConfig {
     /// Harness 服务端口（缺省 3180，避开桌面端 3080）
     pub port: Option<u16>,
-    /// npm registry 显式地址（空=按地域自动）。可在托盘「加速」预设中写入，
-    /// 或直接手编本文件（自定义内网 Verdaccio）。
-    pub npm_registry: Option<String>,
-    /// GitHub 中转前缀（空=按地域自动；none 用空串表示直连）。
-    pub gh_mirror_prefix: Option<String>,
+    /// npm registry 列表（按序尝试；第一个写入 .npmrc/托盘显示）。
+    /// 兼容旧格式单个字符串；空 = 按地域自动。
+    #[serde(default, deserialize_with = "de_string_or_vec")]
+    pub npm_registry: Option<Vec<String>>,
+    /// GitHub 中转前缀列表（按序尝试生成镜像 URL）。
+    /// 兼容旧格式单个字符串；"none"/空 = 直连。
+    #[serde(default, deserialize_with = "de_string_or_vec")]
+    pub gh_mirror_prefix: Option<Vec<String>>,
     /// 开机自启动
     pub auto_start: Option<bool>,
     /// 自定义 `$DSH_HOME`（Harness 用户数据目录）；空= `~/.dsh-launcher`
@@ -64,6 +67,44 @@ pub struct LauncherConfig {
 /// 是否启用「使用系统 node」（默认 false = 自包含）。
 pub fn use_system_node(cfg: &LauncherConfig) -> bool {
     cfg.use_system_node.unwrap_or(false)
+}
+
+/// 反序列化：兼容「单个字符串」与「字符串数组」两种格式。
+/// `"https://a/"` → `["https://a/"]`；`["https://a/", "https://b/"]` → 原样。
+fn de_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(vec![trimmed.to_string()]))
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::new();
+            for v in arr {
+                if let serde_json::Value::String(s) = v {
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        out.push(t.to_string());
+                    }
+                }
+            }
+            if out.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(out))
+            }
+        }
+        serde_json::Value::Null => Ok(None),
+        _ => Err(D::Error::custom("expected string or array of strings")),
+    }
 }
 
 /// IP 地域检测配置。
@@ -598,42 +639,73 @@ fn ensure_trailing_slash(s: &str) -> String {
     }
 }
 
-/// 解析实际生效的 npm registry（末尾带 `/`）。
-pub fn resolve_npm_registry(cfg: &LauncherConfig) -> String {
-    if let Some(reg) = &cfg.npm_registry {
-        let reg = reg.trim();
-        if !reg.is_empty() {
-            return ensure_trailing_slash(reg);
+/// 解析实际生效的 npm registry 列表（按序尝试；空 = 按地域自动）。
+pub fn resolve_npm_registries(cfg: &LauncherConfig) -> Vec<String> {
+    if let Some(list) = &cfg.npm_registry {
+        let cleaned: Vec<String> = list.iter().map(|r| ensure_trailing_slash(r.trim())).collect();
+        if !cleaned.is_empty() {
+            return cleaned;
         }
     }
     match detect_region() {
-        Region::Domestic => NPM_MIRROR_REGISTRY.to_string(),
-        Region::Overseas => OFFICIAL_NPM_REGISTRY.to_string(),
+        Region::Domestic => vec![NPM_MIRROR_REGISTRY.to_string()],
+        Region::Overseas => vec![OFFICIAL_NPM_REGISTRY.to_string()],
     }
 }
 
-/// 解析实际生效的 GitHub 中转前缀；直连返回 `None`。
+/// 解析实际生效的 npm registry（第一个，末尾带 `/`；供 .npmrc/托盘显示）。
+pub fn resolve_npm_registry(cfg: &LauncherConfig) -> String {
+    resolve_npm_registries(cfg)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| OFFICIAL_NPM_REGISTRY.to_string())
+}
+
+/// 解析实际生效的 GitHub 中转前缀列表（按序尝试）；直连返回空 Vec。
+///
+/// 每项 `"none"`（不区分大小写）按配置文档语义视为「直连」。
+pub fn resolve_gh_prefixes(cfg: &LauncherConfig) -> Vec<String> {
+    if let Some(list) = &cfg.gh_mirror_prefix {
+        let cleaned: Vec<String> = list
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("none"))
+            .map(ensure_trailing_slash)
+            .collect();
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+        return Vec::new(); // 显式直连（none/空）
+    }
+    match detect_region() {
+        Region::Domestic => vec![DSH_MIRROR_PREFIX.to_string()],
+        Region::Overseas => Vec::new(),
+    }
+}
+
+/// 解析实际生效的 GitHub 中转前缀（第一个）；直连返回 `None`。
 ///
 /// `"none"`（不区分大小写）按配置文档语义视为「直连」，
 /// 防止手编配置文件写入 `"ghMirrorPrefix": "none"` 时被当成字面前缀。
 pub fn resolve_gh_prefix(cfg: &LauncherConfig) -> Option<String> {
-    if let Some(prefix) = &cfg.gh_mirror_prefix {
-        let prefix = prefix.trim();
-        if prefix.is_empty() || prefix.eq_ignore_ascii_case("none") {
-            return None;
-        }
-        return Some(ensure_trailing_slash(prefix));
-    }
-    match detect_region() {
-        Region::Domestic => Some(DSH_MIRROR_PREFIX.to_string()),
-        Region::Overseas => None,
-    }
+    resolve_gh_prefixes(cfg).into_iter().next()
 }
 
-/// 为任意 GitHub 资产 URL 生成中转兜底地址（透传原 URL，内容一致）。
+/// 为任意 GitHub 资产 URL 生成中转兜底地址列表（每个镜像前缀一个）。
+/// 顺序 = 配置顺序；直连时返回空（调用方应只用官方 URL）。
+pub fn mirror_urls(asset_url: &str, cfg: &LauncherConfig) -> Vec<String> {
+    let prefixes = resolve_gh_prefixes(cfg);
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+    prefixes.iter().map(|p| format!("{p}{asset_url}")).collect()
+}
+
+/// 为任意 GitHub 资产 URL 生成中转兜底地址（第一个镜像前缀；直连时返回官方原样）。
 pub fn mirror_url(asset_url: &str, cfg: &LauncherConfig) -> String {
-    let prefix = resolve_gh_prefix(cfg).unwrap_or_else(|| DSH_MIRROR_PREFIX.to_string());
-    format!("{prefix}{asset_url}")
+    resolve_gh_prefix(cfg)
+        .map(|p| format!("{p}{asset_url}"))
+        .unwrap_or_else(|| asset_url.to_string())
 }
 
 // ---------- 配置读写 ----------
@@ -710,12 +782,31 @@ pub fn apply_server_overrides(
     user_set: &[&str],
 ) {
     let get = |k: &str| server.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let get_list = |k: &str| -> Option<Vec<String>> {
+        let v = server.get(k)?;
+        match v {
+            serde_json::Value::String(s) => {
+                let t = s.trim();
+                if t.is_empty() { None } else { Some(vec![t.to_string()]) }
+            }
+            serde_json::Value::Array(arr) => {
+                let out: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if out.is_empty() { None } else { Some(out) }
+            }
+            _ => None,
+        }
+    };
     // 仅当用户未显式设置该字段时，才用服务器值覆盖
     if !user_set.contains(&"npmRegistry") {
-        if let Some(v) = get("npmRegistry") { local.npm_registry = Some(v); }
+        if let Some(v) = get_list("npmRegistry") { local.npm_registry = Some(v); }
     }
     if !user_set.contains(&"ghMirrorPrefix") {
-        if let Some(v) = get("ghMirrorPrefix") { local.gh_mirror_prefix = Some(v); }
+        if let Some(v) = get_list("ghMirrorPrefix") { local.gh_mirror_prefix = Some(v); }
     }
     if !user_set.contains(&"port") {
         if let Some(v) = server.get("port").and_then(|v| v.as_u64()) {
@@ -768,22 +859,33 @@ pub fn save_config<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Resu
     Ok(())
 }
 
-/// 设置 npm 源预设（空串=auto），写回配置。
+/// 设置 npm 源预设（空串=auto），写回配置。支持逗号分隔多源。
 pub fn set_npm_registry<R: Runtime>(app: &AppHandle<R>, registry: &str) -> Result<(), String> {
     let mut cfg = load_cached();
-    cfg.npm_registry = if registry.is_empty() {
+    cfg.npm_registry = if registry.trim().is_empty() {
         None
     } else {
-        Some(registry.to_string())
+        Some(
+            registry
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
     };
     save_config(app, &cfg)
 }
 
-/// 设置 GitHub 中转预设（None=auto/直连），写回配置。
+/// 设置 GitHub 中转预设（None=auto/直连），写回配置。支持逗号分隔多源。
 pub fn set_gh_prefix<R: Runtime>(app: &AppHandle<R>, prefix: Option<&str>) -> Result<(), String> {
     let mut cfg = load_cached();
     cfg.gh_mirror_prefix = match prefix {
-        Some(p) if !p.is_empty() => Some(p.to_string()),
+        Some(p) if !p.trim().is_empty() => Some(
+            p.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        ),
         _ => None,
     };
     save_config(app, &cfg)
@@ -848,16 +950,16 @@ mod tests {
     #[test]
     fn npm_registry_explicit_overrides_region() {
         let cfg = LauncherConfig {
-            npm_registry: Some("https://registry.example.com".to_string()),
+            npm_registry: Some(vec!["https://registry.example.com".to_string()]),
             ..Default::default()
         };
         assert_eq!(
             resolve_npm_registry(&cfg),
             "https://registry.example.com/"
         );
-        // 空串视为 auto
+        // 空列表视为 auto
         let auto = LauncherConfig {
-            npm_registry: Some(String::new()),
+            npm_registry: Some(Vec::new()),
             ..Default::default()
         };
         let _ = resolve_npm_registry(&auto); // 不 panic 即可
@@ -867,24 +969,24 @@ mod tests {
     fn gh_prefix_none_means_direct() {
         // 手编配置写 "none"（任意大小写）= 直连
         let cfg = LauncherConfig {
-            gh_mirror_prefix: Some("none".to_string()),
+            gh_mirror_prefix: Some(vec!["none".to_string()]),
             ..Default::default()
         };
         assert_eq!(resolve_gh_prefix(&cfg), None);
         let cfg = LauncherConfig {
-            gh_mirror_prefix: Some("NONE".to_string()),
+            gh_mirror_prefix: Some(vec!["NONE".to_string()]),
             ..Default::default()
         };
         assert_eq!(resolve_gh_prefix(&cfg), None);
-        // 空串 = 直连（不启用中转）
+        // 空列表 = 直连（不启用中转）
         let cfg2 = LauncherConfig {
-            gh_mirror_prefix: Some(String::new()),
+            gh_mirror_prefix: Some(Vec::new()),
             ..Default::default()
         };
         assert_eq!(resolve_gh_prefix(&cfg2), None);
         // 真实前缀照常生效并补尾斜杠
         let cfg3 = LauncherConfig {
-            gh_mirror_prefix: Some("https://ghfast.top".to_string()),
+            gh_mirror_prefix: Some(vec!["https://ghfast.top".to_string()]),
             ..Default::default()
         };
         assert_eq!(
@@ -894,19 +996,52 @@ mod tests {
     }
 
     #[test]
-    fn mirror_url_prepends_prefix() {
+    fn mirror_urls_prepends_prefixes() {
         let cfg = LauncherConfig {
-            gh_mirror_prefix: Some("https://ghfast.top/".to_string()),
+            gh_mirror_prefix: Some(vec![
+                "https://ghfast.top/".to_string(),
+                "https://ghproxy.net/".to_string(),
+            ]),
             ..Default::default()
         };
+        let urls = mirror_urls("https://github.com/a/b.zip", &cfg);
         assert_eq!(
-            mirror_url("https://github.com/a/b.zip", &cfg),
-            "https://ghfast.top/https://github.com/a/b.zip"
+            urls,
+            vec![
+                "https://ghfast.top/https://github.com/a/b.zip".to_string(),
+                "https://ghproxy.net/https://github.com/a/b.zip".to_string(),
+            ]
         );
-        // 无配置时兜底 ghfast.top
+        // 无配置时按地域（本机 Domestic → ghfast.top 兜底）
         let auto = LauncherConfig::default();
-        let out = mirror_url("https://github.com/a/b.zip", &auto);
-        assert!(out.starts_with("https://ghfast.top/"), "got {out}");
+        let urls2 = mirror_urls("https://github.com/a/b.zip", &auto);
+        if urls2.is_empty() {
+            assert!(resolve_gh_prefix(&auto).is_none(), "Overseas 直连无镜像");
+        } else {
+            assert!(urls2[0].starts_with("https://ghfast.top/"), "got {:?}", urls2[0]);
+        }
+    }
+
+    #[test]
+    fn string_or_vec_deserializes_both() {
+        // 旧格式：单个字符串
+        let cfg: LauncherConfig = serde_json::from_str(r#"{"npmRegistry":"https://registry.npmmirror.com/"}"#).unwrap();
+        assert_eq!(
+            cfg.npm_registry,
+            Some(vec!["https://registry.npmmirror.com/".to_string()])
+        );
+        // 新格式：数组
+        let cfg2: LauncherConfig = serde_json::from_str(
+            r#"{"ghMirrorPrefix":["https://ghfast.top/","https://ghproxy.net/"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg2.gh_mirror_prefix, Some(vec![
+            "https://ghfast.top/".to_string(),
+            "https://ghproxy.net/".to_string(),
+        ]));
+        // 空字符串 → None
+        let cfg3: LauncherConfig = serde_json::from_str(r#"{"npmRegistry":""}"#).unwrap();
+        assert_eq!(cfg3.npm_registry, None);
     }
 
     #[test]
@@ -964,8 +1099,14 @@ mod tests {
         let user_set = ["port"];
         apply_server_overrides(&mut local, &server, &user_set);
         assert_eq!(local.port, Some(3180), "用户显式设置的 port 不被服务器覆盖");
-        assert_eq!(local.npm_registry.as_deref(), Some("https://registry.npmmirror.com/"));
-        assert_eq!(local.gh_mirror_prefix.as_deref(), Some("https://ghfast.top/"));
+        assert_eq!(
+            local.npm_registry,
+            Some(vec!["https://registry.npmmirror.com/".to_string()])
+        );
+        assert_eq!(
+            local.gh_mirror_prefix,
+            Some(vec!["https://ghfast.top/".to_string()])
+        );
         assert_eq!(local.profile.as_deref(), Some("matrix"));
     }
 
