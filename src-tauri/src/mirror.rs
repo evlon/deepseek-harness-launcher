@@ -210,11 +210,13 @@ fn extract_deps(meta: &serde_json::Value, version: &str) -> Vec<(String, String)
 ///
 /// 对依赖树每个包：npm pack（拉外网）→ npm publish（推内网）。
 /// `token` 是内网 registry 的发布凭证（由管理页经 bridge 传递，仅内存使用，不落盘）。
+/// `only`: Some(pkg) 只同步该插件（含其依赖）；None 同步全部应装清单。
 pub fn start_mirror_upload<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
     registry: &str,
     token: &str,
+    only: Option<String>,
 ) -> Result<(), String> {
     // 已在运行 → 拒绝
     let p = load_progress(app, cfg);
@@ -228,10 +230,14 @@ pub fn start_mirror_upload<R: Runtime>(
     let token = token.to_string();
 
     // 应装清单来自服务端缓存的配置（SyncState.cached_config.plugins）
-    let plugins: Vec<String> = crate::sync::load_state(&h, &cfg)
+    let mut plugins: Vec<String> = crate::sync::load_state(&h, &cfg)
         .cached_config
         .map(|c| c.plugins)
         .unwrap_or_default();
+    // 单包模式：只同步指定插件
+    if let Some(only) = &only {
+        plugins = vec![only.clone()];
+    }
 
     tauri::async_runtime::spawn(async move {
         let _ = run_mirror(&h, &cfg, &registry, &token, plugins).await;

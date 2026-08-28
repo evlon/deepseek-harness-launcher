@@ -588,6 +588,13 @@ function adminPageHtml() {
   .pcard.loading{opacity:.6}
   .pcard .src{background:#eef6ee;color:#1a7f37;border-radius:10px;padding:0 6px;font-size:10.5px}
   .pcard .missing{color:var(--amber);font-size:12px}
+  /* 同步状态徽章 */
+  .sync-badge{display:inline-flex;align-items:center;gap:4px;border-radius:12px;padding:2px 10px;font-size:11.5px;font-weight:600;white-space:nowrap}
+  .sync-badge.synced{background:var(--green-bg);color:var(--green)}
+  .sync-badge.unsynced{background:var(--amber-bg);color:var(--amber)}
+  .sync-badge.checking{background:#eef0f6;color:var(--muted)}
+  .pcard .sync-btn{margin-left:auto}
+  .sync-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 
   /* ── 状态点 ── */
   .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
@@ -688,6 +695,13 @@ function adminPageHtml() {
         <input class="input" id="newPlugin" placeholder="输入 npm 包名，如 dsh-nested-followups 或 @scope/pkg" onkeydown="if(event.key==='Enter')addPlugin()">
         <button class="btn primary" onclick="addPlugin()">＋ 添加</button>
       </div>
+      <div class="row" style="margin-bottom:14px;flex-wrap:wrap;gap:8px">
+        <input class="input" id="syncRegistry" placeholder="同步目标 registry（如 https://registry.ict.cmcc）" style="max-width:300px">
+        <button class="btn" onclick="checkAllSyncStatus()">⟳ 刷新同步状态</button>
+        <button class="btn primary" id="syncAllBtn" onclick="syncAllPlugins()">🚀 同步全部未同步</button>
+        <span class="sync-hint" id="syncState"></span>
+      </div>
+      <div id="syncProgress" style="margin-bottom:12px"></div>
       <div class="plugin-cards" id="pluginList"></div>
       <div style="margin-top:16px;display:flex;gap:8px;align-items:center">
         <button class="btn primary" onclick="saveConfig()">保存插件策略</button>
@@ -841,6 +855,7 @@ function renderClientDefaults(){
   const ms=current.mirrorSettings||{};
   document.getElementById("mirrorRegistry").value=ms.registry||"https://registry.ict.cmcc";
   document.getElementById("mirrorToken").value=ms.tokenValue||"";
+  document.getElementById("syncRegistry").value=ms.registry||"https://registry.ict.cmcc";
 }
 async function saveClientDefaults(){
   try{
@@ -910,6 +925,9 @@ async function pollMirrorProgress(){
     const p=j.progress||{};
     const el=document.getElementById("mirrorProgress");
     const st=document.getElementById("mirrorState");
+    // 同步工具栏进度显示
+    const spEl=document.getElementById("syncProgress");
+    const ssEl=document.getElementById("syncState");
     if(p.state==="running"){
       el.innerHTML='<div style="background:#eef4ff;border:1px solid #cfe0ff;border-radius:8px;padding:10px 14px">'+
         '⏳ 上传中：<b>'+esc(p.current_pkg||"…")+'</b><br>'+
@@ -917,6 +935,10 @@ async function pollMirrorProgress(){
         '</div>';
       st.innerHTML='<span style="color:var(--amber)">进行中…</span>';
       document.getElementById("mirrorStartBtn").disabled=true;
+      document.getElementById("syncAllBtn").disabled=true;
+      if(spEl) spEl.innerHTML='<div style="background:#eef4ff;border:1px solid #cfe0ff;border-radius:8px;padding:8px 12px;font-size:13px">'+
+        '⏳ 同步中：'+p.done_pkgs+'/'+p.total_pkgs+' 个包 · 当前 '+esc(p.current_pkg||"…")+'</div>';
+      if(ssEl) ssEl.innerHTML='<span style="color:var(--amber)">同步中…</span>';
       if(mirrorPollTimer) clearTimeout(mirrorPollTimer);
       mirrorPollTimer=setTimeout(pollMirrorProgress,3000);
     } else if(p.state==="done"){
@@ -925,12 +947,22 @@ async function pollMirrorProgress(){
         '</div>';
       st.innerHTML='<span style="color:var(--green)">已完成</span>';
       document.getElementById("mirrorStartBtn").disabled=false;
+      document.getElementById("syncAllBtn").disabled=false;
+      if(spEl) spEl.innerHTML='<div style="background:#e8f7ee;border:1px solid #b7e3c8;border-radius:8px;padding:8px 12px;font-size:13px">'+
+        '✅ 同步完成：'+p.done_pkgs+'/'+p.total_pkgs+' 个包已同步</div>';
+      if(ssEl) ssEl.innerHTML='<span style="color:var(--green)">已完成</span>';
+      // 完成后刷新插件同步状态徽章
+      renderPlugins();
     } else if(p.state==="error"){
       el.innerHTML='<div style="background:#fdeaea;border:1px solid #f5c6c6;border-radius:8px;padding:10px 14px">'+
         '❌ 上传出错：'+esc((p.error||"").slice(0,300))+
         '</div>';
       st.innerHTML='<span style="color:var(--red)">出错</span>';
       document.getElementById("mirrorStartBtn").disabled=false;
+      document.getElementById("syncAllBtn").disabled=false;
+      if(spEl) spEl.innerHTML='<div style="background:#fdeaea;border:1px solid #f5c6c6;border-radius:8px;padding:8px 12px;font-size:13px">'+
+        '❌ 同步出错：'+esc((p.error||"").slice(0,200))+'</div>';
+      if(ssEl) ssEl.innerHTML='<span style="color:var(--red)">出错</span>';
     }
   }catch(e){ /* 连接断开忽略 */ }
 }
@@ -1009,34 +1041,102 @@ async function renderPlugins(){
   const el=document.getElementById("pluginList");
   const names=current.plugins||[];
   if(!names.length){ el.innerHTML='<div class="empty">暂无应装插件 —— 所有客户端视为插件齐全</div>'; return; }
-  // 先渲染占位（loading），再填充元信息
+  // 先渲染占位（loading），再填充元信息 + 同步状态
   el.innerHTML=names.map((p,i)=>'<div class="pcard loading" id="pcard-'+i+'">'
     +'<div class="phead"><span class="pname">'+esc(p)+'</span><span class="pver">…</span></div>'
-    +'<div class="pdesc">正在查询 npm registry…</div>'
+    +'<div class="pdesc">正在查询…</div>'
     +'<div class="pfoot"><button class="btn sm danger" onclick="removePlugin('+i+')">移除</button></div>'
     +'</div>').join("");
   const metas=await fetchPluginMetas(names);
+  // 查询内网 registry 同步状态（浏览器直查，registry CORS *）
+  const syncStates=await checkRegistryStatus(names);
   names.forEach((p,i)=>{
     const card=document.getElementById("pcard-"+i);
     if(!card) return;
     const m=metas.find(x=>x.name===p);
-    if(m){
-      const ver=m.latest?'<span class="pver">v'+esc(m.latest)+'</span>':'<span class="pver">?</span>';
-      const src=m.registry?'<span class="src">'+esc(m.registry)+'</span>':'';
-      const desc=m.description?esc(m.description):'<span class="missing">（registry 无描述）</span>';
-      const home=m.homepage?'<a href="'+esc(m.homepage)+'" target="_blank" rel="noopener">主页 ↗</a>':'';
-      card.className="pcard";
-      card.innerHTML='<div class="phead"><span class="pname">'+esc(p)+'</span>'+ver+'</div>'
-        +'<div class="pdesc">'+desc+'</div>'
-        +'<div class="pmeta">'+src+(home||'')+'</div>'
-        +'<div class="pfoot"><button class="btn sm danger" onclick="removePlugin('+i+')">移除</button></div>';
-    } else {
-      card.className="pcard";
-      card.innerHTML='<div class="phead"><span class="pname">'+esc(p)+'</span><span class="pver">?</span></div>'
-        +'<div class="pdesc missing">（无法从 registry 获取信息，请检查包名）</div>'
-        +'<div class="pfoot"><button class="btn sm danger" onclick="removePlugin('+i+')">移除</button></div>';
-    }
+    const ss=syncStates[p]||{state:"checking"};
+    const ver=m&&m.latest?'<span class="pver">v'+esc(m.latest)+'</span>':'<span class="pver">?</span>';
+    const src=m&&m.registry?'<span class="src">'+esc(m.registry)+'</span>':'';
+    const desc=m&&m.description?esc(m.description):'<span class="missing">（无描述）</span>';
+    const home=m&&m.homepage?'<a href="'+esc(m.homepage)+'" target="_blank" rel="noopener">主页 ↗</a>':'';
+    // 同步状态徽章
+    let badge='';
+    if(ss.state==="synced") badge='<span class="sync-badge synced">✓ 已同步 v'+esc(ss.version)+'</span>';
+    else if(ss.state==="unsynced") badge='<span class="sync-badge unsynced">⚠ 未同步</span>';
+    else badge='<span class="sync-badge checking">查询中…</span>';
+    // 同步按钮（未同步或已同步都可点，重新同步）
+    const syncBtn='<button class="btn sm primary sync-btn" onclick="syncOnePlugin('+i+')">同步此插件</button>';
+    card.className="pcard";
+    card.innerHTML='<div class="phead"><span class="pname">'+esc(p)+'</span>'+ver+'</div>'
+      +'<div class="pdesc">'+desc+'</div>'
+      +'<div class="pmeta">'+src+(home||'')+'</div>'
+      +'<div class="pfoot">'+badge+syncBtn+'<button class="btn sm danger" onclick="removePlugin('+i+')">移除</button></div>';
   });
+}
+
+// ── 同步状态查询（管理页浏览器直查内网 registry） ──
+let syncRegistryCache="";
+function syncRegistryUrl(){
+  const v=document.getElementById("syncRegistry").value.trim();
+  return v||"https://registry.ict.cmcc";
+}
+async function checkRegistryStatus(names){
+  const reg=syncRegistryUrl().replace(/\/+$/,"");
+  const out={};
+  await Promise.all(names.map(async (p)=>{
+    out[p]={state:"checking"};
+    try{
+      const r=await fetch(reg+"/"+encodeURIComponent(p),{headers:headers(false)});
+      if(r.ok){
+        const j=await r.json();
+        out[p]={state:"synced",version:(j["dist-tags"]&&j["dist-tags"].latest)||"?"};
+      } else if(r.status===404){
+        out[p]={state:"unsynced"};
+      } else {
+        out[p]={state:"checking"};
+      }
+    }catch(e){ out[p]={state:"checking"}; }
+  }));
+  return out;
+}
+async function checkAllSyncStatus(){
+  const names=current.plugins||[];
+  if(!names.length){ toast("无应装插件","warn"); return; }
+  toast("正在检查同步状态…","ok");
+  renderPlugins();
+}
+async function syncOnePlugin(i){
+  if(!bridgePort){ toast("请先连接管理员本机管理能力","warn"); return; }
+  const name=(current.plugins||[])[i];
+  const token=document.getElementById("mirrorToken").value.trim();
+  if(!token){ toast("请先配置发布 token（下方镜像设置）","warn"); return; }
+  const reg=syncRegistryUrl();
+  try{
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start",{
+      method:"POST",headers:headers(true),
+      body:JSON.stringify({registry:reg,token:token,only:name})
+    });
+    const j=await r.json();
+    if(!j.ok){ toast("启动失败："+esc(j.error||""),"err"); return; }
+    toast("正在同步 "+esc(name)+"（含依赖）…","ok");
+    pollMirrorProgress();
+  }catch(e){ toast("无法连接管理能力："+esc(e.message),"err"); }
+}
+async function syncAllPlugins(){
+  if(!bridgePort){ toast("请先连接管理员本机管理能力","warn"); return; }
+  const token=document.getElementById("mirrorToken").value.trim();
+  if(!token){ toast("请先配置发布 token（下方镜像设置）","warn"); return; }
+  const reg=syncRegistryUrl();
+  try{
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start",{
+      method:"POST",headers:headers(true),
+      body:JSON.stringify({registry:reg,token:token})
+    });
+    const j=await r.json();
+    if(!j.ok){ toast("启动失败："+esc(j.error||""),"err"); return; }
+    toast("已开始同步全部未同步插件","ok");
+    pollMirrorProgress();
+  }catch(e){ toast("无法连接管理能力："+esc(e.message),"err"); }
 }
 function addPlugin(){
   const v=document.getElementById("newPlugin").value.trim();

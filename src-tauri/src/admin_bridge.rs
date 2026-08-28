@@ -297,7 +297,12 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            match crate::mirror::start_mirror_upload(app, &cfg, &registry, &token) {
+            let only = body
+                .get("only")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            match crate::mirror::start_mirror_upload(app, &cfg, &registry, &token, only) {
                 Ok(()) => serde_json::json!({ "ok": true, "message": "上传已开始" }),
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
             }
