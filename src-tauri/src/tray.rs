@@ -103,7 +103,15 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &MenuItem::with_id(app, "gh-ghfast", "ghfast.top 中转", true, None::<&str>)?,
         ],
     )?;
-    let accel_submenu = Submenu::with_id_and_items(app, "accel", "加速设置", true, &[&npm_submenu, &gh_submenu])?;
+    // 加速 ▸ npm 源 / GitHub 中转 / 测速
+    let speedtest_item = MenuItem::with_id(app, "accel-speedtest", "测速（探测各源延迟）", true, None::<&str>)?;
+    let accel_submenu = Submenu::with_id_and_items(
+        app,
+        "accel",
+        "加速设置",
+        true,
+        &[&npm_submenu, &gh_submenu, &speedtest_item],
+    )?;
 
     // 同步 / 推荐插件 子菜单（动态）
     let sync_submenu = build_sync_submenu(app)?;
@@ -390,6 +398,31 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
         "gh-auto" => apply_accel(app, "gh", ""),
         "gh-none" => apply_accel(app, "gh", "none"),
         "gh-ghfast" => apply_accel(app, "gh", "https://ghfast.top/"),
+        "accel-speedtest" => {
+            notify(app, "测速", "正在探测各加速源延迟，请稍候…");
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let cfg = load_cached();
+                let npm = crate::speedtest::speedtest_npm(&h, &cfg).await;
+                let gh = crate::speedtest::speedtest_gh(&h, &cfg).await;
+
+                let mut lines: Vec<String> = Vec::new();
+                lines.push("── npm 源 ──".to_string());
+                for r in &npm {
+                    let mark = if r.ok { "✓" } else { "✗" };
+                    lines.push(format!("{mark} {} {}ms", r.name, r.latency_ms));
+                }
+                lines.push("── GitHub 中转 ──".to_string());
+                for r in &gh {
+                    let mark = if r.ok { "✓" } else { "✗" };
+                    lines.push(format!("{mark} {} {}ms", r.name, r.latency_ms));
+                }
+                let msg = lines.join("\n");
+                // 结果可能较长，截断到通知上限
+                let msg = if msg.len() > 900 { format!("{}…", &msg[..900]) } else { msg };
+                notify(&h, "加速源测速结果", &msg);
+            });
+        }
         "log" => {
             let path = log_file(app);
             let _ = app.opener().open_path(path.to_string_lossy().to_string(), None::<&str>);

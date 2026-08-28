@@ -7,6 +7,7 @@ mod install;
 mod logging;
 mod notify;
 mod plugin;
+mod speedtest;
 mod sync;
 mod tray;
 mod workflow;

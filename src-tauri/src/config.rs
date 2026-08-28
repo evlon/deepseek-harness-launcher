@@ -701,13 +701,6 @@ pub fn mirror_urls(asset_url: &str, cfg: &LauncherConfig) -> Vec<String> {
     prefixes.iter().map(|p| format!("{p}{asset_url}")).collect()
 }
 
-/// 为任意 GitHub 资产 URL 生成中转兜底地址（第一个镜像前缀；直连时返回官方原样）。
-pub fn mirror_url(asset_url: &str, cfg: &LauncherConfig) -> String {
-    resolve_gh_prefix(cfg)
-        .map(|p| format!("{p}{asset_url}"))
-        .unwrap_or_else(|| asset_url.to_string())
-}
-
 // ---------- 配置读写 ----------
 
 static CACHED: once_cell::sync::OnceCell<std::sync::Mutex<LauncherConfig>> = once_cell::sync::OnceCell::new();
