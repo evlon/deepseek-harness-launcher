@@ -143,7 +143,7 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
     let cfg = load_cached();
     let port = find_available_port(resolve_port(&cfg))?;
 
-    let node = node_binary_path(app);
+    let node = effective_node_path(app, &cfg);
     if !node.exists() {
         return Err("NODE_NOT_FOUND: 尚未安装 Node.js 运行时，请先「安装 / 修复」".to_string());
     }

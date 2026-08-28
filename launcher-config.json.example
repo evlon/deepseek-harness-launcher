@@ -79,5 +79,10 @@
   "geoDetection": {
     "enabled": true,                          // 是否启用 IP 检测（false = 用系统 locale/时区）
     "provider": "https://ipinfo.io/json"      // 检测服务；可换 https://api.ip.sb/geoip 或自定义
-  }
+  },
+
+  // 是否优先使用系统 node（PATH 上主版本 >= 22 则跳过下载自带 node）。
+  // 默认 false = 自包含（launcher 装自己的 node，同事机器一致性）；
+  // 开发者/已装新 node 的机器可设 true 省下载与磁盘空间。
+  "useSystemNode": false
 }

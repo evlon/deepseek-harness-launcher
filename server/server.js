@@ -333,6 +333,10 @@ async function route(req, res) {
         if (typeof cd.profile !== "string" || !/^[a-zA-Z0-9_-]+$/.test(cd.profile)) return send(res, 400, { error: "clientDefaults.profile 非法" });
         cleaned.profile = cd.profile;
       }
+      if (cd.useSystemNode !== undefined) {
+        if (typeof cd.useSystemNode !== "boolean") return send(res, 400, { error: "clientDefaults.useSystemNode 必须是布尔值" });
+        cleaned.useSystemNode = cd.useSystemNode;
+      }
       cfg.clientDefaults = cleaned;
     }
     if (typeof body.baseUrl === "string") cfg.baseUrl = body.baseUrl;
@@ -671,6 +675,9 @@ function adminPageHtml() {
       <div class="row" style="margin-bottom:10px">
         <input class="input" id="cdProfile" placeholder="profile（如 web / matrix，空=不覆盖）" style="max-width:220px">
       </div>
+      <div style="margin-bottom:10px;font-size:13px">
+        <label><input type="checkbox" id="cdUseSystemNode" style="width:auto"> 客户端优先使用系统 node（主版本≥22 则跳过下载自带 node）</label>
+      </div>
       <div style="margin-top:12px"><button class="btn primary" onclick="saveClientDefaults()">保存客户端默认配置</button></div>
     </div>
   </section>
@@ -776,6 +783,7 @@ function renderClientDefaults(){
   document.getElementById("cdPort").value=cd.port||"";
   document.getElementById("cdSyncSecs").value=cd.syncIntervalSecs||"";
   document.getElementById("cdProfile").value=cd.profile||"";
+  document.getElementById("cdUseSystemNode").checked=!!cd.useSystemNode;
 }
 async function saveClientDefaults(){
   try{
@@ -790,6 +798,7 @@ async function saveClientDefaults(){
     if(port){ const p=parseInt(port,10); if(p<1||p>65535){ toast("端口无效","warn"); return; } cd.port=p; }
     if(sync){ const s=parseInt(sync,10); if(s<30){ toast("同步间隔需 >=30","warn"); return; } cd.syncIntervalSecs=s; }
     if(prof) cd.profile=prof;
+    cd.useSystemNode=document.getElementById("cdUseSystemNode").checked;
     const body={plugins:current.plugins,managedMenu:current.managedMenu,clientDefaults:cd};
     const r=await fetch("/api/config",{method:"POST",headers:headers(true),body:JSON.stringify(body)});
     const j=await r.json();

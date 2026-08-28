@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, Runtime};
 
 /// 下载地域
@@ -55,6 +55,15 @@ pub struct LauncherConfig {
     pub admin_bridge: Option<AdminBridgeConfig>,
     /// IP 地域检测（用 ipinfo.io / ip.sb 等获取设备所在地域，替代 locale/时区判断）
     pub geo_detection: Option<GeoDetectionConfig>,
+    /// 是否优先使用系统 node（PATH 上版本匹配则跳过下载自带 node）。
+    /// 默认 false = 自包含（launcher 装自己的 node，同事机器一致性）；
+    /// 开发者可设 true 省下载/省空间。
+    pub use_system_node: Option<bool>,
+}
+
+/// 是否启用「使用系统 node」（默认 false = 自包含）。
+pub fn use_system_node(cfg: &LauncherConfig) -> bool {
+    cfg.use_system_node.unwrap_or(false)
 }
 
 /// IP 地域检测配置。
@@ -192,6 +201,76 @@ pub fn node_binary_path<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     } else {
         runtime.join("bin").join("node")
     }
+}
+
+/// 实际生效的 node 路径：
+/// - `useSystemNode=true` 且 PATH 上系统 node 版本匹配 → 系统 node
+/// - 否则 → launcher 自带的 node
+pub fn effective_node_path<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> PathBuf {
+    if use_system_node(cfg) {
+        if let Some(system) = system_node_on_path() {
+            if node_version_matches(&system) {
+                log::info!("启动使用系统 node：{}", system.display());
+                return system;
+            }
+        }
+    }
+    node_binary_path(app)
+}
+
+/// PATH 上的系统 node 路径（Windows: node.exe；Unix: node）。
+fn system_node_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| {
+            if cfg!(windows) {
+                dir.join("node.exe")
+            } else {
+                dir.join("node")
+            }
+        })
+        .find(|p| p.is_file())
+}
+
+/// 执行 node --version 并比对版本：主版本 >= NODE_MIN_MAJOR 即视为可用。
+///
+/// 版本匹配放宽为「主版本 >= 期望」，而非精确相等——node 22+ 向后兼容，
+/// 系统装了更新的 node（如 v24）应直接复用，避免无谓下载。
+fn node_version_matches(bin: &Path) -> bool {
+    if !bin.exists() {
+        return false;
+    }
+    let Ok(output) = std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    node_version_compatible(&version)
+}
+
+/// 版本兼容性判断：`v22.22.0` → 主版本 22 >= 期望主版本（22）→ true。
+/// 期望版本取 `NODE_VERSION` 常量（形如 "v22.22.0"）。
+fn node_version_compatible(version: &str) -> bool {
+    let min_major = NODE_VERSION
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(22);
+    let ver_major = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    ver_major >= min_major
 }
 
 pub fn dsh_binary_path<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
@@ -619,6 +698,7 @@ fn merge_user_into_builtin(builtin: &mut LauncherConfig, user: LauncherConfig) {
     if user.profile.is_some() { builtin.profile = user.profile; }
     if user.admin_bridge.is_some() { builtin.admin_bridge = user.admin_bridge; }
     if user.geo_detection.is_some() { builtin.geo_detection = user.geo_detection; }
+    if user.use_system_node.is_some() { builtin.use_system_node = user.use_system_node; }
 }
 
 /// 服务器配置覆盖本地（遵循「用户显式设置过的不被覆盖」）：
@@ -652,6 +732,11 @@ pub fn apply_server_overrides(
             if !v.is_empty() && !v.contains('/') && !v.contains('\\') {
                 local.profile = Some(v);
             }
+        }
+    }
+    if !user_set.contains(&"useSystemNode") {
+        if let Some(v) = server.get("useSystemNode").and_then(|v| v.as_bool()) {
+            local.use_system_node = Some(v);
         }
     }
 }
@@ -896,5 +981,20 @@ mod tests {
         assert_eq!(local.port, Some(3180), "非法端口被忽略");
         assert_eq!(local.sync_interval_secs, Some(300), "过小同步间隔被忽略");
         assert_eq!(local.profile.as_deref(), Some("web"), "非法 profile 被忽略");
+    }
+
+    #[test]
+    fn node_version_compatible_relaxes_to_major() {
+        // 期望 v22：主版本 >= 22 即可（系统更新的 node 直接复用）
+        assert!(node_version_compatible("v22.22.0"));
+        assert!(node_version_compatible("v24.19.0"), "系统 v24 应视为可用");
+        assert!(node_version_compatible("v23.0.0"));
+        assert!(node_version_compatible("v22.0.0"));
+        // 低于期望主版本 → 不可用（需下载自带）
+        assert!(!node_version_compatible("v20.11.0"));
+        assert!(!node_version_compatible("v18.0.0"));
+        // 非法输入 → 不可用
+        assert!(!node_version_compatible(""));
+        assert!(!node_version_compatible("not-a-version"));
     }
 }

@@ -598,7 +598,7 @@ pub async fn spawn_sync_loop<R: Runtime>(app: &AppHandle<R>) {
 /// 安装一个插件（供托盘菜单调用）：`node <dsh>/lib/bin.js plugin --profile web add <name>`。
 pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Result<(), String> {
     let cfg = load_cached();
-    let node = node_binary_path(app);
+    let node = effective_node_path(app, &cfg);
     let dsh_bin = dsh_binary_path(app);
     if !node.exists() || !dsh_bin.exists() {
         return Err("NODE_OR_DSH_NOT_FOUND: 请先「安装 / 修复」".to_string());

@@ -115,12 +115,45 @@ impl Component {
 ///
 /// 半成品安装（解压中断 / 版本不符）返回 `false`，触发重装，避免后续 `launch`
 /// 用残缺的 Node 启动失败。版本探询失败视为未安装（重装更稳妥）。
+///
+/// 配置 `useSystemNode=true` 时，优先探测 PATH 上的系统 node（版本匹配即视为已安装，
+/// 跳过下载自带 node）；默认自包含（只用 launcher 自己的 runtime）。
 fn node_installed_ok<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let cfg = load_cached();
+    if use_system_node(&cfg) {
+        if let Some(system) = system_node_path() {
+            if node_version_matches(&system) {
+                log::info!("使用系统 node（已装且版本匹配）：{}", system.display());
+                return true;
+            }
+            log::info!("系统 node 主版本低于期望 {}，使用自带 node", NODE_VERSION);
+        } else {
+            log::info!("PATH 上无系统 node，使用自带 node");
+        }
+    }
     let bin = node_binary_path(app);
+    node_version_matches(&bin)
+}
+
+/// 系统 PATH 上的 node 路径（Windows: node.exe；Unix: node）。
+fn system_node_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| {
+            if cfg!(windows) {
+                dir.join("node.exe")
+            } else {
+                dir.join("node")
+            }
+        })
+        .find(|p| p.is_file())
+}
+
+/// 执行 node --version 并比对版本（主版本 >= 期望即视为可用，兼容更新的 node）。
+fn node_version_matches(bin: &Path) -> bool {
     if !bin.exists() {
         return false;
     }
-    let Ok(output) = std::process::Command::new(&bin)
+    let Ok(output) = std::process::Command::new(bin)
         .arg("--version")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -132,8 +165,21 @@ fn node_installed_ok<R: Runtime>(app: &AppHandle<R>) -> bool {
         return false;
     }
     let version = String::from_utf8_lossy(&output.stdout);
-    // node --version 输出形如 "v22.22.0\n"；NODE_VERSION 常量形如 "v22.22.0"
-    version.trim() == NODE_VERSION
+    // node --version 输出形如 "v22.22.0\n"；主版本 >= NODE_VERSION 主版本即可
+    let min_major = NODE_VERSION
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(22);
+    let ver_major = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    ver_major >= min_major
 }
 
 /// 按顺序尝试多个下载源，带 Range 续传重试。

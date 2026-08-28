@@ -134,7 +134,7 @@ pub async fn preset_profile<R: Runtime>(
     profile: &str,
     packages: &[String],
 ) -> Result<(), String> {
-    let node = node_binary_path(app);
+    let node = effective_node_path(app, cfg);
     let dsh_bin = dsh_binary_path(app);
     if !node.exists() || !dsh_bin.exists() {
         log::warn!("Node 或 dsh 核心未就绪，跳过插件预置");
