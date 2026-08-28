@@ -2,6 +2,9 @@
 /target
 **/target
 
+# Tauri 构建生成的 schema（编辑器提示用，构建自动重建）
+src-tauri/gen/
+
 # Node
 node_modules
 dist
