@@ -875,7 +875,7 @@ async function saveMirrorSettings(){
       registry:document.getElementById("mirrorRegistry").value.trim(),
       tokenValue:document.getElementById("mirrorToken").value.trim(),
     };
-    if(!/^https?:\/\/\S+$/.test(ms.registry)){ toast("registry 必须是 http(s) 地址","warn"); return; }
+    if(!/^https?:\\/\\/\\S+$/.test(ms.registry)){ toast("registry 必须是 http(s) 地址","warn"); return; }
     const body={plugins:current.plugins,managedMenu:current.managedMenu,clientDefaults:current.clientDefaults||{},mirrorSettings:ms};
     const r=await fetch("/api/config",{method:"POST",headers:headers(true),body:JSON.stringify(body)});
     const j=await r.json();
