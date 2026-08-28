@@ -61,7 +61,7 @@ node server.js --port 8080 --token 你的管理口令
 ```bash
 cd src-tauri
 cargo build          # 调试版
-cargo build --release  # 发布版（本机内存受限时参见下方说明）
+cargo build --release  # 发布版
 ./target/debug/deepseek-harness-launcher.exe
 ```
 
@@ -72,14 +72,6 @@ cd src-tauri
 cargo test
 ```
 
-## 本机构建注意（内存受限）
-
-本机可用内存有限，`windows`/`webview2-com-sys`/`tao` 等巨型 crate 从零编译会内存耗尽
-（`STATUS_STACK_BUFFER_OVERRUN`）。缓解措施已固化在仓库内：
-
-- `.cargo/config.toml`：`target-dir` 指向 `deepseek-harness-desktop` 的 target 目录，复用指纹匹配的缓存产物。
-- `src-tauri/Cargo.toml`：**不写 `[profile]` 段**——桌面端 `deepseek-harness-desktop` 同样没有 profile 配置，
-  保持两边 dev profile 指纹完全一致（`incremental` 参与 profile 哈希，缺失才会导致 `windows` 重编）。
-- 从零冷编译时用 `cargo build -j 1` 串行构建，降低峰值内存。
-
-若换到内存充足的机器，删除 `.cargo/config.toml` 即可使用独立 target 目录。
+> 编译产物在**本项目的** `src-tauri/target/` 目录，与桌面端 `deepseek-harness-desktop` 完全隔离。
+> 从零冷编译 `windows`/`webview2-com-sys`/`tao` 等巨型 crate 较占内存，内存不足时可
+> 用 `cargo build -j 1` 串行构建降低峰值。
