@@ -1,0 +1,71 @@
+{
+  // ============================================================
+  // DeepSeek Harness Launcher 配置示例
+  // 实际生效文件：<AppData>/io.github.hairyf.deepseek-harness-launcher/launcher-config.json
+  // （Windows 即 %APPDATA%\io.github.hairyf.deepseek-harness-launcher\launcher-config.json）
+  // 所有字段均可选，删除字段 = 使用默认/自动值。程序启动时读取，改完重启生效。
+  // 注意：JSON 标准不支持注释，以下注释仅作说明，实际文件请删除。
+  // ============================================================
+
+  // Harness 服务端口（缺省 3180，刻意避开桌面端常用的 3080；占用时自动顺延）
+  "port": 3180,
+
+  // npm 源：显式指定后不再按地域自动选择。
+  // 可用值：""=自动（国内 npmmirror / 海外官方）、"https://registry.npmjs.org/"、
+  //        "https://registry.npmmirror.com/"，或内网私有源地址。
+  "npmRegistry": "",
+
+  // GitHub 中转前缀：给 GitHub 资产下载加镜像加速。
+  // 可用值：""=自动（国内 ghfast.top / 海外直连）、"none"=直连、
+  //        "https://ghfast.top/" 等镜像前缀。
+  "ghMirrorPrefix": "",
+
+  // 开机自启动
+  "autoStart": false,
+
+  // 自定义 $DSH_HOME（Harness 用户数据目录）。缺省 ~/.dsh-launcher，
+  // 与桌面端（~/.dsh）隔离，互不影响。
+  "dshHome": "",
+
+  // 托盘「常用网址」子菜单（点击直接用系统浏览器打开）。
+  // 注意：若服务端下发了「托盘菜单策略」且启用，则托盘展示的是策略项（不覆盖本配置，
+  // 仅展示层切换）；管理员关闭策略后自动回退到这里的本地项。
+  "quickLinks": [
+    { "label": "DeepSeek 官网", "url": "https://www.deepseek.com/" },
+    { "label": "Harness 文档", "url": "https://github.com/dsh-tauri-desk/deepseek-harness-pkg" }
+  ],
+
+  // ============================================================
+  // 企业中心服务端同步（可选）
+  // 服务端部署见 server/README.md；配置后 launcher 定期拉取推荐插件、
+  // 弹通知提示安装，并上报本机同步状态供管理员查看。
+  // ============================================================
+
+  // 中心服务端地址（如 http://10.0.0.5:8080）。空 = 不启用同步。
+  "serverUrl": "",
+
+  // 同步轮询间隔（秒，缺省 300，最小 30）。
+  // 离线时自动重试，网络恢复后补拉，不影响本机 dsh web 使用。
+  "syncIntervalSecs": 300,
+
+  // 管理 token（可选）。服务端设置了 --token 时，上报/拉取随请求头携带；
+  // 服务端未设 token 时留空即可。
+  "adminToken": "",
+
+  // 启动的 Harness profile（缺省 web）。
+  // 预置会创建：web（常规）+ matrix（数字分身，dsh-matrix-agent）。
+  // 也可在托盘「切换 Profile」菜单里切换。
+  "profile": "web",
+
+  // ============================================================
+  // 管理能力（外网代理网关，可选）
+  // 管理员本机开启后，在 127.0.0.1 起本地 API，服务端管理页（内网服务器
+  // 不能访问外网）经此中转查询 npm registry 包信息。也可在托盘「管理能力」菜单切换。
+  // ============================================================
+  "adminBridge": {
+    "enabled": false,      // 是否开启（托盘可切换）
+    "port": 3410,          // 本地监听端口（占用自动顺延）
+    "token": "",           // 本地 API token（管理页连接时带；空 = 不校验）
+    "allowScripts": false  // 是否允许执行服务端下发的脚本（默认关闭，安全）
+  }
+}

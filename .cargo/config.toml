@@ -1,0 +1,6 @@
+# 本机内存受限（约 7GB 可用），`windows`/`syn` 等巨型 crate 冷编译会内存耗尽。
+# 复用现有桌面端 `deepseek-harness-desktop` 的 target 目录，其已包含这些 crate
+# 的编译产物（相同版本 + 相同 features + 默认 profile 时指纹匹配，cargo 直接复用）。
+# 若在其它机器上构建，删除本配置即可使用独立 target 目录。
+[build]
+target-dir = "E:/ai-works/deepseek-harness-desktop/src-tauri/target"

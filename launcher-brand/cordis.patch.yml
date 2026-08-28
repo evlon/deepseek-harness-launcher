@@ -1,0 +1,16 @@
+# launcher-brand bundle layer: 覆盖 web UI 的品牌名称（sidebar / conversation hero）。
+#
+# 该 bundle 本身不注入任何 host 行；真正的覆盖在 client.js（浏览器端）：
+# 通过 slots.register 以同名覆盖官方 `ui-brand-official` 注册的 brand.name slot。
+#
+# 名称可在 profile 的 cordis.patch.yml 中通过 `config.brandName` 覆盖：
+#   - id: launcher-brand
+#     name: launcher-brand
+#     config:
+#       brandName: '数字分身'
+# 未配置时回退到默认名称。
+- insert:
+    - id: launcher-brand
+      name: launcher-brand
+      config:
+        brandName: 'Harness'

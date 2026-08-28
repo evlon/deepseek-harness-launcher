@@ -1,0 +1,14 @@
+{
+  "name": "deepseek-harness-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tray-resident launcher for installing/launching DeepSeek Harness (headless, no webview).",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

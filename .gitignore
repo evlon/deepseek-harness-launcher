@@ -1,0 +1,16 @@
+# Rust
+/target
+**/target
+
+# Node
+node_modules
+dist
+
+# Logs / runtime
+*.log
+
+# dsh-matrix-agent 运行状态（含聊天记录/状态，绝不提交）
+.dsh-matrix/
+
+# 服务端运行时数据（客户端记录、策略配置——含敏感信息）
+server/data/
