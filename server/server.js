@@ -1081,7 +1081,7 @@ function syncRegistryUrl(){
   return v||"https://registry.ict.cmcc";
 }
 async function checkRegistryStatus(names){
-  const reg=syncRegistryUrl().replace(/\/+$/,"");
+  const reg=syncRegistryUrl().replace(/\\/+$/,"");
   const out={};
   await Promise.all(names.map(async (p)=>{
     out[p]={state:"checking"};
