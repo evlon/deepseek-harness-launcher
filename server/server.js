@@ -698,11 +698,11 @@ function adminPageHtml() {
         <div class="card-desc">客户端任一个 profile 装了即满足；未装的客户端会弹通知，点击托盘「安装」即可补齐</div></div>
       </div>
       <div class="bridge-bar" style="background:#f2f5fc;border:1px solid #dbe3f5;border-radius:9px;padding:8px 12px;margin-bottom:14px;font-size:12.5px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <span>🛰 包信息查询：</span>
-        <span id="bridgeState" style="color:var(--muted)">检测管理能力…</span>
+        <span>🛰 本机管理能力：</span>
+        <span id="bridgeState" style="color:var(--muted)">检测中…</span>
         <input class="input" id="bridgePortInput" placeholder="本机端口" style="width:90px;padding:4px 8px" value="">
         <button class="btn sm" onclick="setBridgePort()">连接</button>
-        <span style="color:var(--faint)">（管理员本机 launcher「管理能力」开启后自动探测；服务端不直连外网）</span>
+        <span style="color:var(--faint)">（仅连管理页所在电脑的 launcher；同步/上传需要管理员在本机托盘「管理能力」开启）</span>
       </div>
       <div class="row" style="margin-bottom:12px">
         <input class="input" id="newPlugin" placeholder="输入 npm 包名，如 dsh-nested-followups 或 @scope/pkg" onkeydown="if(event.key==='Enter')addPlugin()">

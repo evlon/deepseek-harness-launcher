@@ -183,23 +183,39 @@ async function loadStatus(){
     document.getElementById("syncHint").innerHTML="<b>"+latestClients.length+"</b> 台客户端 · "+t;
   }catch(e){ toast("加载客户端失败："+esc(e.message),"err"); }
 }
-// 管理能力自动探测：从客户端上报的 bridgeStatus 找本机（hostname 匹配）或任一开启的
+// 管理能力：只探测「本机」（管理页所在电脑）的 launcher，不猜其他客户端。
+// 主动 fetch /api/health 确认真的可用，连不上就明确显示未连接。
 async function autoDetectBridge(){
   if(bridgePort) return; // 已手动/自动设置
   const st=document.getElementById("bridgeState");
-  const self=latestClients.find(c=>c.bridgeStatus&&c.bridgeStatus.enabled);
-  if(self&&self.bridgeStatus.port){
-    bridgePort=self.bridgeStatus.port;
-    document.getElementById("bridgePortInput").value=bridgePort;
-    st.innerHTML='<span style="color:var(--green)">已连接 '+esc(self.hostname||"管理员机")+'（端口 '+bridgePort+'）</span>';
-  } else {
-    st.innerHTML='<span style="color:var(--muted)">未检测到开启的管理能力——请管理员在 launcher 托盘开启，或手动输入端口</span>';
+  // 尝试常用端口（可配置），确认本机管理能力真的开启
+  const candidates=[parseInt(localStorage.getItem("bridgePort")||"0",10)||3410, 3410];
+  for(const port of candidates){
+    try{
+      const r=await fetch("http://127.0.0.1:"+port+"/api/health",{headers:headers(false)});
+      if(r.ok){
+        const j=await r.json();
+        if(j&&j.ok){
+          bridgePort=port;
+          document.getElementById("bridgePortInput").value=port;
+          st.innerHTML='<span style="color:var(--green)">✓ 已连接本机管理能力（端口 '+port+'）</span>';
+          return;
+        }
+      }
+    }catch(e){ /* 该端口无服务，继续 */ }
   }
+  st.innerHTML='<span style="color:var(--muted)">本机管理能力未连接——同步/上传需管理员在本机 launcher 托盘「管理能力」开启</span>';
 }
-function setBridgePort(){
+async function setBridgePort(){
   const v=document.getElementById("bridgePortInput").value.trim();
   const p=parseInt(v,10);
   if(!p||p<1||p>65535){ toast("端口无效","warn"); return; }
+  // 验证该端口确实是本机管理能力
+  try{
+    const r=await fetch("http://127.0.0.1:"+p+"/api/health",{headers:headers(false)});
+    const j=await r.json();
+    if(!r.ok||!j||!j.ok){ toast("该端口不是有效的管理能力服务","warn"); return; }
+  }catch(e){ toast("无法连接该端口（本机管理能力未开启？）","warn"); return; }
   bridgePort=p;
   localStorage.setItem("bridgePort",String(p));
   // 清缓存强制刷新插件信息
