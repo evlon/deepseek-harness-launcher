@@ -19,9 +19,11 @@ use tauri::{AppHandle, Runtime};
 
 use crate::config::*;
 
-/// 运行状态：端口 + 停止标志。
+/// 运行状态：端口 + token + 停止标志。
 pub struct Bridge {
     port: u16,
+    /// 实际生效的 token（配置的或随机生成的；空 = 不校验）。
+    token: String,
     shutdown: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -38,13 +40,33 @@ pub fn port() -> Option<u16> {
     CURRENT.lock().unwrap().as_ref().map(|b| b.port)
 }
 
+/// 当前实际生效的 token（配置的或随机生成的）。
+pub fn current_token() -> String {
+    CURRENT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|b| b.token.clone())
+        .unwrap_or_default()
+}
+
 /// 启动管理能力本地 API（绑定 127.0.0.1，端口冲突自动顺延）。
 pub fn start<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
     stop(); // 先停旧的
 
     let cfg = load_cached();
     let base = bridge_port(&cfg);
-    let token = bridge_token(&cfg);
+    // token：配置了就用配置的；否则生成随机 token 并持久化（重启不变），
+    // 安全默认：防任意网页调用本机 API。
+    let configured_token = bridge_token(&cfg);
+    let token = if configured_token.is_empty() {
+        let t = random_token(16);
+        let _ = crate::config::set_bridge_token(app, &t);
+        log::warn!("管理能力未配置 token，已生成并保存随机 token：{t}（管理页连接时使用）");
+        t
+    } else {
+        configured_token
+    };
     let allow_scripts = cfg
         .admin_bridge
         .as_ref()
@@ -68,6 +90,7 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
+    let bridge_token_for_state = token.clone(); // 供 Bridge 状态记录
     let thread = std::thread::spawn(move || {
         log::info!("管理能力本地 API 已启动：http://127.0.0.1:{port}");
         for stream in listener.incoming() {
@@ -88,6 +111,7 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
 
     *CURRENT.lock().unwrap() = Some(Bridge {
         port,
+        token: bridge_token_for_state,
         shutdown,
         thread: Some(thread),
     });
@@ -114,6 +138,7 @@ struct Request {
     method: String,
     path: String,
     query: std::collections::HashMap<String, String>,
+    headers: std::collections::HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -148,15 +173,19 @@ fn parse_request(stream: &mut TcpStream) -> Option<Request> {
         }
     }
 
-    // 读取 body（Content-Length）
+    // 读取 body（Content-Length）+ headers
     let mut body = Vec::new();
     let mut clen = 0;
+    let mut headers = std::collections::HashMap::new();
     for line in &mut lines {
         if line.is_empty() {
             break;
         }
         if let Some(v) = line.strip_prefix("Content-Length:") {
             clen = v.trim().parse().unwrap_or(0);
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
     if clen > 0 && clen <= 1 << 20 {
@@ -172,7 +201,7 @@ fn parse_request(stream: &mut TcpStream) -> Option<Request> {
         }
     }
 
-    Some(Request { method, path, query, body })
+    Some(Request { method, path, query, headers, body })
 }
 
 fn percent_decode(s: &str) -> String {
@@ -202,13 +231,27 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// 允许的管理页 Origin（服务端管理页域名；浏览器同源请求无 Origin 头时放行）。
+/// 默认放行 ai-conf.ict.cmcc；可经环境变量 ADMIN_ORIGIN 覆盖（测试/内网别名）。
+fn origin_allowed(origin: &str) -> bool {
+    if let Ok(extra) = std::env::var("ADMIN_ORIGIN") {
+        for e in extra.split(',') {
+            let e = e.trim();
+            if !e.is_empty() && origin == e {
+                return true;
+            }
+        }
+    }
+    origin == "http://ai-conf.ict.cmcc" || origin == "https://ai-conf.ict.cmcc"
+}
+
 fn send_json(stream: &mut TcpStream, code: u16, obj: serde_json::Value) {
     let body = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string());
     let resp = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: application/json; charset=utf-8\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Origin: http://ai-conf.ict.cmcc\r\n\
          Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type, X-Bridge-Token\r\n\
+         Access-Control-Allow-Headers: Content-Type, X-Bridge-Token, X-Admin-Token\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         status_text(code),
         body.len(),
@@ -233,22 +276,40 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
         return;
     };
 
+    // 安全：仅允许受信任的管理页 Origin 访问（服务端域名），
+    // 防止任意网页（DNS rebinding / CSRF）调用本机 API。
+    // 无 Origin 头的请求（curl / 同源脚本）放行；有 Origin 但非白名单 → 拒绝。
+    let origin = req.headers.get("origin").cloned().unwrap_or_default();
+    if !origin.is_empty() && !origin_allowed(&origin) {
+        send_json(&mut stream, 403, serde_json::json!({ "error": "origin not allowed" }));
+        return;
+    }
+
     // CORS preflight
     if req.method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\n\
-                    Access-Control-Allow-Origin: *\r\n\
-                    Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                    Access-Control-Allow-Headers: Content-Type, X-Bridge-Token\r\n\
-                    Connection: close\r\n\r\n";
+        let origin_hdr = if origin_allowed(&origin) {
+            format!("Access-Control-Allow-Origin: {origin}\r\n")
+        } else {
+            String::new()
+        };
+        let resp = format!(
+            "HTTP/1.1 204 No Content\r\n{origin_hdr}\
+             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+             Access-Control-Allow-Headers: Content-Type, X-Bridge-Token, X-Admin-Token\r\n\
+             Connection: close\r\n\r\n"
+        );
         let _ = stream.write_all(resp.as_bytes());
         return;
     }
 
-    // token 校验
-    let auth_ok = token.is_empty() || req_has_token(&req, token);
-    if !auth_ok {
-        send_json(&mut stream, 403, serde_json::json!({ "error": "invalid bridge token" }));
-        return;
+    // token 校验（health 免 token——纯探测，无副作用；其余路由需 token）
+    let is_health = req.method == "GET" && req.path == "/api/health";
+    if !is_health {
+        let auth_ok = token.is_empty() || req_has_token(&req, token);
+        if !auth_ok {
+            send_json(&mut stream, 403, serde_json::json!({ "error": "invalid bridge token" }));
+            return;
+        }
     }
 
     // 路由分发
@@ -327,6 +388,25 @@ fn req_has_token(req: &Request, token: &str) -> bool {
 }
 
 // ---------- registry 查询（外网中转） ----------
+
+/// 生成随机 token（URL 安全字符）。
+fn random_token(len: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // 简化伪随机（安全足够：token 仅本机 API 门控，非密码学强度）
+    let mut state = seed;
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let idx = ((state >> 33) % CHARS.len() as u128) as usize;
+        out.push(CHARS[idx] as char);
+    }
+    out
+}
 
 /// 查询 npm registry 元信息（npmjs → npmmirror → 内网 REGISTRY_OVERRIDE）。
 /// 用阻塞 reqwest（在线程池里跑，可接受）。

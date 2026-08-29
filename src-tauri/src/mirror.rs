@@ -56,10 +56,15 @@ fn progress_path<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> PathBu
 /// 进度进程内缓存（load/save 共享同一个）。
 static PROGRESS: Mutex<Option<UploadProgress>> = Mutex::new(None);
 
+/// 加锁（容忍 poison：panic 后锁被污染不阻断后续）。
+fn lock_progress() -> std::sync::MutexGuard<'static, Option<UploadProgress>> {
+    PROGRESS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 读取当前进度（进程内缓存优先，文件兜底）。
 pub fn load_progress<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> UploadProgress {
     {
-        let guard = PROGRESS.lock().unwrap();
+        let guard = lock_progress();
         if let Some(p) = guard.as_ref() {
             return p.clone();
         }
@@ -70,12 +75,12 @@ pub fn load_progress<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Up
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    *PROGRESS.lock().unwrap() = Some(p.clone());
+    *lock_progress() = Some(p.clone());
     p
 }
 
 fn save_progress<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig, p: &UploadProgress) {
-    *PROGRESS.lock().unwrap() = Some(p.clone());
+    *lock_progress() = Some(p.clone());
     let path = progress_path(app, cfg);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -156,23 +161,37 @@ fn resolve_version(meta: &serde_json::Value, spec: &str) -> Result<String, Strin
             return Ok(v.to_string());
         }
     }
-    // semver 范围：取满足的最高版本（简化：取版本号最大的）
-    let mut best: Option<&String> = None;
+    // semver 范围：取满足范围/标签的最高版本
+    let mut best: Option<(semver::Version, String)> = None;
+    let parse = |v: &str| semver::Version::parse(v.trim_start_matches('v')).ok();
     for v in versions.keys() {
-        if spec == "*" || spec == "latest" || spec.is_empty() {
-            best = Some(v);
-        } else if let Some(b) = best {
-            if version_greater(v, b) {
-                best = Some(v);
-            }
+        let matches = if spec == "*" || spec == "latest" || spec.is_empty() {
+            true
+        } else if let Ok(req) = semver::VersionReq::parse(spec) {
+            // 兼容无 v 前缀的版本
+            req.matches(&semver::Version::parse(v.trim_start_matches('v')).unwrap_or(semver::Version::new(0, 0, 0)))
         } else {
-            best = Some(v);
+            // 非 semver 范围（如 git URL / tag）→ 当作精确匹配候选
+            v == spec
+        };
+        if !matches {
+            continue;
+        }
+        if let Some(pv) = parse(v) {
+            let better = match &best {
+                Some((bv, _)) => pv > *bv,
+                None => true,
+            };
+            if better {
+                best = Some((pv, v.clone()));
+            }
         }
     }
-    best.cloned().ok_or_else(|| format!("no version for {spec}"))
+    best.map(|(_, v)| v).ok_or_else(|| format!("no version for {spec}"))
 }
 
-/// 简单版本比较（忽略 semver 语义，仅数字比较；够用）。
+/// 简单版本比较（忽略 semver 语义，仅数字比较；仅测试用）。
+#[cfg(test)]
 fn version_greater(a: &str, b: &str) -> bool {
     let na: Vec<u64> = a
         .trim_start_matches('v')
@@ -361,10 +380,14 @@ fn upload_one_pkg(name: &str, version: &str, registry: &str, token: &str) -> Res
     Ok(())
 }
 
-/// 执行 npm 命令（工作目录 + 环境变量）。
+/// npm 单次命令超时（秒）：pack / publish 网络慢或卡死时防止永久挂起。
+const NPM_TIMEOUT_SECS: u64 = 120;
+
+/// 执行 npm 命令（工作目录 + 环境变量），带超时。
 ///
 /// Windows 上 `Command::new("npm")` 在 spawn 时用**当前进程** PATH 解析 npm，
 /// env 里的 PATH 覆盖不生效——所以这里显式解析 npm 可执行文件路径。
+/// 超时后 kill 子进程树并报错，避免上传永久挂起。
 fn run_npm(cwd: &PathBuf, args: &[&str], envs: &[(String, String)]) -> Result<String, String> {
     let npm_exe = resolve_npm_path();
     let mut cmd = Command::new(npm_exe);
@@ -384,16 +407,63 @@ fn run_npm(cwd: &PathBuf, args: &[&str], envs: &[(String, String)]) -> Result<St
             cmd.env("PATH", joined);
         }
     }
-    let output = cmd.output().map_err(|e| format!("npm spawn: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // 已存在同版本 → 视为已同步（幂等）
-        if stderr.contains("EPUBLISHCONFLICT") || stderr.contains("cannot publish over") {
-            return Ok("already-published".to_string());
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // 子线程跑 output()，主线程带超时等待
+    let child = cmd.spawn().map_err(|e| format!("npm spawn: {e}"))?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let child_thread = std::thread::spawn(move || {
+        let out = child.wait_with_output();
+        let _ = tx.send(out);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(NPM_TIMEOUT_SECS)) {
+        Ok(output) => {
+            let output = output.map_err(|e| format!("npm wait: {e}"))?;
+            let _ = child_thread.join();
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // 已存在同版本 → 视为已同步（幂等）
+                if stderr.contains("EPUBLISHCONFLICT") || stderr.contains("cannot publish over") {
+                    return Ok("already-published".to_string());
+                }
+                return Err(format!("npm {} 失败: {}", args[0], stderr.trim()));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
-        return Err(format!("npm {} 失败: {}", args[0], stderr.trim()));
+        Err(_) => {
+            // 超时：kill 进程树（Windows taskkill /T /F；Unix kill）
+            let _ = child_thread.join();
+            kill_process_tree(pid);
+            Err(format!(
+                "npm {} 超时（{}s），已终止：可能网络慢或 registry 无响应",
+                args[0],
+                NPM_TIMEOUT_SECS
+            ))
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// 终止进程树（Windows: taskkill /T /F；Unix: kill）。
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// 解析 npm 可执行文件路径：先看 node 同目录（npm.cmd/npm），再 PATH 兜底。
@@ -454,6 +524,24 @@ mod tests {
         assert_eq!(resolve_version(&meta, "0.1.0").unwrap(), "0.1.0");
         assert_eq!(resolve_version(&meta, "latest").unwrap(), "0.2.2");
         assert_eq!(resolve_version(&meta, "*").unwrap(), "0.2.2");
+    }
+
+    #[test]
+    fn resolve_version_respects_semver_range() {
+        // ^4.0.0 应选满足范围的最高版本，不选 5.x
+        let meta = serde_json::json!({
+            "dist-tags": { "latest": "5.0.0" },
+            "versions": { "4.0.0": {}, "4.4.3": {}, "5.0.0": {} }
+        });
+        assert_eq!(resolve_version(&meta, "^4.0.0").unwrap(), "4.4.3");
+        // ~1.2.0 选 1.2.x 最高
+        let meta2 = serde_json::json!({
+            "dist-tags": { "latest": "1.3.0" },
+            "versions": { "1.2.0": {}, "1.2.9": {}, "1.3.0": {} }
+        });
+        assert_eq!(resolve_version(&meta2, "~1.2.0").unwrap(), "1.2.9");
+        // 精确版本优先
+        assert_eq!(resolve_version(&meta, "4.0.0").unwrap(), "4.0.0");
     }
 
     #[test]

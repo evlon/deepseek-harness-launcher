@@ -40,6 +40,9 @@ fn main() {
             // 托盘
             tray::build_tray(&handle)?;
 
+            // 恢复上次操作状态（重启后托盘/窗口可见上次结果）
+            ops::load_from_disk(&handle);
+
             // 自动启动 Harness（若配置开启且已安装）
             if cfg.auto_start.unwrap_or(false) && config::dsh_binary_path(&handle).exists() {
                 let h = handle.clone();

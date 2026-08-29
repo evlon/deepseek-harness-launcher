@@ -411,8 +411,14 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 match crate::admin_bridge::start(&h) {
                     Ok(port) => {
                         let _ = set_bridge_enabled(&h, true);
-                        crate::ops::finish_op(&h, &format!("本地 API：http://127.0.0.1:{port}"));
-                        notify(&h, "管理能力已开启", &format!("本地 API：http://127.0.0.1:{port}"));
+                        let tok = crate::admin_bridge::current_token();
+                        let detail = if tok.is_empty() {
+                            format!("本地 API：http://127.0.0.1:{port}")
+                        } else {
+                            format!("本地 API：http://127.0.0.1:{port}\n连接 token：{tok}")
+                        };
+                        crate::ops::finish_op(&h, &detail);
+                        notify(&h, "管理能力已开启", &detail);
                         refresh_sync_menu(&h);
                     }
                     Err(e) => {
@@ -503,10 +509,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 crate::ops::mark_step_running(&h, 0);
                 crate::ops::update_step(&h, "探测 npm 源…");
                 let cfg = load_cached();
-                let npm = crate::speedtest::speedtest_npm(&h, &cfg).await;
+                let npm = crate::speedtest::speedtest_npm(&cfg).await;
                 crate::ops::mark_step_running(&h, 1);
                 crate::ops::update_step(&h, "探测 GitHub 中转…");
-                let gh = crate::speedtest::speedtest_gh(&h, &cfg).await;
+                let gh = crate::speedtest::speedtest_gh(&cfg).await;
 
                 let mut lines: Vec<String> = Vec::new();
                 lines.push("── npm 源 ──".to_string());

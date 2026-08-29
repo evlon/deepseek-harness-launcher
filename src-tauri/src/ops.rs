@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// 操作状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OpState {
     /// 无操作
@@ -22,7 +22,7 @@ pub enum OpState {
 }
 
 /// 单个步骤状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StepState {
     Pending,
@@ -32,14 +32,14 @@ pub enum StepState {
 }
 
 /// 操作中的一个步骤。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     pub label: String,
     pub state: StepState,
 }
 
 /// 当前操作。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Operation {
     pub id: String,
     pub label: String,
@@ -91,6 +91,7 @@ pub fn start_op<R: Runtime>(app: &AppHandle<R>, id: &str, label: &str, steps: &[
     };
     *lock_current() = Some(op);
     log::info!("操作开始：{label}");
+    persist(app);
     emit_update(app);
 }
 
@@ -160,6 +161,7 @@ pub fn finish_op<R: Runtime>(app: &AppHandle<R>, result: &str) {
         op.log.push(format!("[完成] {result}"));
     }
     log::info!("操作完成：{result}");
+    persist(app);
     emit_update(app);
 }
 
@@ -182,6 +184,7 @@ pub fn fail_op<R: Runtime>(app: &AppHandle<R>, error: &str) {
         op.log.push(format!("[失败] {error}"));
     }
     log::error!("操作失败：{error}");
+    persist(app);
     emit_update(app);
 }
 
@@ -196,6 +199,38 @@ pub fn has_running() -> bool {
         .as_ref()
         .map(|op| op.state == OpState::Running)
         .unwrap_or(false)
+}
+
+/// 状态落盘路径（`<dsh_home>/ops-state.json`）。
+fn state_path<R: Runtime>(app: &AppHandle<R>) -> std::path::PathBuf {
+    crate::config::dsh_home(app, &crate::config::load_cached()).join("ops-state.json")
+}
+
+/// 落盘当前操作状态（start/finish/fail 时调用，重启后可见上次结果）。
+fn persist<R: Runtime>(app: &AppHandle<R>) {
+    let Some(op) = current() else { return };
+    let path = state_path(app);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&op) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// 启动时从磁盘恢复上次操作状态（供托盘/窗口显示上次结果）。
+pub fn load_from_disk<R: Runtime>(app: &AppHandle<R>) {
+    let path = state_path(app);
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    if let Ok(op) = serde_json::from_str::<Operation>(&text) {
+        // 上次 Running 的操作（进程被强杀）视为失败，避免误导
+        let op = if op.state == OpState::Running {
+            Operation { state: OpState::Failed, current_step: "上次未完成（进程中断）".to_string(), result: "进程中断，操作未完成".to_string(), ..op }
+        } else {
+            op
+        };
+        *lock_current() = Some(op);
+    }
 }
 
 /// 向窗口前端推送更新事件。

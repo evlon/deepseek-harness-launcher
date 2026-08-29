@@ -198,6 +198,9 @@ async function autoDetectBridge(){
         if(j&&j.ok){
           bridgePort=port;
           document.getElementById("bridgePortInput").value=port;
+          // 恢复已保存的 token
+          const saved=localStorage.getItem("bridgeToken")||"";
+          if(saved) document.getElementById("bridgeTokenInput").value=saved;
           st.innerHTML='<span style="color:var(--green)">✓ 已连接本机管理能力（端口 '+port+'）</span>';
           return;
         }
@@ -218,6 +221,9 @@ async function setBridgePort(){
   }catch(e){ toast("无法连接该端口（本机管理能力未开启？）","warn"); return; }
   bridgePort=p;
   localStorage.setItem("bridgePort",String(p));
+  // 保存连接 token（管理能力鉴权用）
+  const tok=document.getElementById("bridgeTokenInput").value.trim();
+  if(tok) localStorage.setItem("bridgeToken",tok);
   // 清缓存强制刷新插件信息
   Object.keys(pluginMetaCache).forEach(k=>delete pluginMetaCache[k]);
   renderPlugins();

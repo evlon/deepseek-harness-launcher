@@ -150,8 +150,6 @@ fn console_html() -> String {
 
   // 监听更新
   window.__TAURI__ && window.__TAURI__.event.listen("op-update", (e)=>{ render(e.payload); });
-  // 初始状态由 Rust 侧在创建后 push 一次
-  window.__TAURI__ && window.__TAURI__.event.listen("op-console-closed", ()=>{ /* 窗口关闭事件 */ });
 })();
 </script>
 </body>

@@ -436,6 +436,15 @@ pub fn set_bridge_enabled<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Resu
     save_config(app, &cfg)
 }
 
+/// 写回管理能力 token（随机生成的 token 持久化，重启不变）。
+pub fn set_bridge_token<R: Runtime>(app: &AppHandle<R>, token: &str) -> Result<(), String> {
+    let mut cfg = load_cached();
+    let mut bridge = cfg.admin_bridge.clone().unwrap_or_default();
+    bridge.token = Some(token.to_string());
+    cfg.admin_bridge = Some(bridge);
+    save_config(app, &cfg)
+}
+
 // ---------- 地域检测（移植自 deepseek-harness-desktop 的 config/region.rs） ----------
 
 /// 判定当前下载地域（带缓存，进程生命周期内恒定）。

@@ -9,7 +9,6 @@
 //! - GitHub 镜像：`<prefix>https://github.com/`（镜像前缀 + 目标 URL）
 
 use std::time::Duration;
-use tauri::{AppHandle, Runtime};
 
 use crate::config::*;
 
@@ -45,7 +44,7 @@ const GH_CANDIDATES: &[(&str, &str)] = &[
 ];
 
 /// 对 npm registry 源测速：当前配置（显式）∪ 常用候选，去重。
-pub async fn speedtest_npm<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Vec<SpeedResult> {
+pub async fn speedtest_npm(cfg: &LauncherConfig) -> Vec<SpeedResult> {
     let configured = resolve_npm_registries(cfg);
     let mut urls: Vec<(String, String)> = configured
         .iter()
@@ -57,12 +56,11 @@ pub async fn speedtest_npm<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig)
             urls.push((name.to_string(), url));
         }
     }
-    let _ = app;
     run_speedtests(urls).await
 }
 
 /// 对 GitHub 中转源测速：当前配置（显式）∪ 常用候选，去重。
-pub async fn speedtest_gh<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Vec<SpeedResult> {
+pub async fn speedtest_gh(cfg: &LauncherConfig) -> Vec<SpeedResult> {
     let configured = resolve_gh_prefixes(cfg);
     let target = "https://github.com/";
     let mut urls: Vec<(String, String)> = configured
@@ -79,7 +77,6 @@ pub async fn speedtest_gh<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) 
             urls.push((name.to_string(), url));
         }
     }
-    let _ = app;
     run_speedtests(urls).await
 }
 
