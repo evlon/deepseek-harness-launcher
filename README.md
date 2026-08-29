@@ -79,7 +79,10 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Release 产物（zip）：主程序 exe + `server/`（中心服务端）+ `launcher-brand/`（品牌插件）+ 配置示例。
+Release 产物拆为两个包：
+
+- **客户端包** `deepseek-harness-launcher-client-windows-x64.zip`：主程序 exe + `launcher-brand/` + 配置示例 + 使用说明（面向同事，见 `client-README.md`）
+- **服务端包** `deepseek-harness-launcher-server.zip`：中心服务端（`server.js` + `admin.js`）+ 部署文档（面向管理员，见 `server/README.md`）
 
 运行单元测试：
 

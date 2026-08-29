@@ -18,7 +18,8 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: deepseek-harness-launcher-windows-x64.zip
+            client_artifact: deepseek-harness-launcher-client-windows-x64.zip
+            server_artifact: deepseek-harness-launcher-server.zip
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -53,26 +54,33 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
-      # 组装发布产物：主程序 exe + 服务端 + 品牌插件
+      # 组装发布产物：拆分为客户端包 + 服务端包（各放所需文件）
       - name: Package artifacts
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist/launcher/server, dist/launcher/launcher-brand | Out-Null
-          Copy-Item src-tauri/target/release/deepseek-harness-launcher.exe dist/launcher/
-          # 服务端（零依赖 node 脚本 + 管理页 JS + 文档）
-          Copy-Item server/server.js, server/admin.js, server/package.json, server/README.md, server/INTEGRATION-CADDY.md dist/launcher/server/
-          # 品牌插件
-          Copy-Item launcher-brand/* dist/launcher/launcher-brand/ -Recurse -Force
-          # 配置示例
-          Copy-Item launcher-config.json.example dist/launcher/
-          # 压缩（PowerShell 内置 Compress-Archive，无需 7z）
-          Compress-Archive -Path dist/launcher -DestinationPath ${{ matrix.artifact }} -Force
-          Get-Item ${{ matrix.artifact }} | Select-Object Name, Length
+          # ── 客户端包：主程序 + 品牌插件 + 配置示例 + 使用说明 ──
+          New-Item -ItemType Directory -Force -Path dist/client/launcher-brand | Out-Null
+          Copy-Item src-tauri/target/release/deepseek-harness-launcher.exe dist/client/
+          Copy-Item launcher-brand/* dist/client/launcher-brand/ -Recurse -Force
+          Copy-Item launcher-config.json.example dist/client/
+          Copy-Item client-README.md dist/client/README.md
+          Compress-Archive -Path dist/client -DestinationPath ${{ matrix.client_artifact }} -Force
 
-      # 发布 GitHub Release（含 tag 版本号）
+          # ── 服务端包：中心服务端 + 管理页 JS + 部署文档 ──
+          New-Item -ItemType Directory -Force -Path dist/server | Out-Null
+          Copy-Item server/server.js, server/admin.js, server/package.json dist/server/
+          Copy-Item server/README.md dist/server/README.md
+          Copy-Item server/INTEGRATION-CADDY.md dist/server/
+          Compress-Archive -Path dist/server -DestinationPath ${{ matrix.server_artifact }} -Force
+
+          Get-Item ${{ matrix.client_artifact }}, ${{ matrix.server_artifact }} | Select-Object Name, Length
+
+      # 发布 GitHub Release（客户端包 + 服务端包）
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact }}
+          files: |
+            ${{ matrix.client_artifact }}
+            ${{ matrix.server_artifact }}
           generate_release_notes: true
           name: DeepSeek Harness Launcher ${{ github.ref_name }}
