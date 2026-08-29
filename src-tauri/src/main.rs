@@ -100,8 +100,14 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error building launcher")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                workflow::stop();
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                // 托盘「退出」菜单设置了标志 → 真退出（停 Harness + 退出）；
+                // 否则（关闭进度窗口等）阻止退出，应用常驻托盘。
+                if crate::tray::is_quit_requested() {
+                    workflow::stop();
+                } else {
+                    api.prevent_exit();
+                }
                 let _ = app;
             }
         });

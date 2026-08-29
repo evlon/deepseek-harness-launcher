@@ -10,6 +10,15 @@ use crate::notify::notify;
 
 const TRAY_ID: &str = "main-tray";
 
+/// 退出标志：托盘「退出」设置后，ExitRequested 才真正退出。
+/// 关闭进度窗口等触发的 ExitRequested 会被阻止（应用常驻托盘）。
+static QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 是否用户主动点了「退出」。
+pub fn is_quit_requested() -> bool {
+    QUIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 构建托盘图标与菜单并挂载事件。
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // 直接内嵌 PNG（无窗口应用没有默认窗口图标，避免 unwrap 恐慌）。
@@ -596,6 +605,7 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             }
         }
         "quit" => {
+            QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
             crate::workflow::stop();
             app.exit(0);
         }

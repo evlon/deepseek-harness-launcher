@@ -30,11 +30,36 @@ pub fn open_console<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         let _ = event;
     });
 
-    // 推送当前状态（若窗口刚建好时已有操作）
-    if let Some(op) = crate::ops::current() {
-        let _ = app.emit("op-update", op);
+    // 推送当前状态（若窗口刚建好时已有操作）；无操作则显示日志文件尾部
+    match crate::ops::current() {
+        Some(op) => {
+            let _ = app.emit("op-update", op);
+        }
+        None => {
+            // 无进行中操作：显示日志文件尾部（让窗口有内容）
+            let tail = read_log_tail(app, 200);
+            let op = crate::ops::Operation {
+                id: "log-view".to_string(),
+                label: "运行日志".to_string(),
+                state: crate::ops::OpState::Idle,
+                current_step: "（无进行中操作）".to_string(),
+                steps: Vec::new(),
+                log: tail,
+                result: String::new(),
+            };
+            let _ = app.emit("op-update", op);
+        }
     }
     Ok(())
+}
+
+/// 读取日志文件尾部（最近 n 行）。
+fn read_log_tail<R: Runtime>(app: &AppHandle<R>, n: usize) -> Vec<String> {
+    let path = crate::config::log_file(app);
+    let Ok(text) = std::fs::read_to_string(&path) else { return vec!["（日志文件尚未创建）".to_string()] };
+    let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].to_vec()
 }
 
 /// 操作窗口的内嵌 HTML（由 main.rs 注册的 `console://` 协议返回）。
@@ -122,6 +147,7 @@ pub fn console_html() -> String {
     // 状态
     statusEl.textContent = op.state==="done" ? ("✓ 完成："+(op.result||""))
       : op.state==="failed" ? ("✗ 失败："+(op.result||""))
+      : op.state==="idle" ? ("运行日志（无进行中操作）")
       : "进行中…";
     statusEl.style.color = op.state==="failed" ? "var(--red)" : (op.state==="done" ? "var(--green)" : "var(--muted)");
   }
