@@ -61,12 +61,6 @@ fn normalize_url(url: &str) -> String {
 /// 测速超时（单个源）。
 const SPEED_TIMEOUT_MS: u64 = 6000;
 
-/// npm 常用源（测速候选）。
-const NPM_CANDIDATES: &[(&str, &str)] = &[
-    ("npmjs 官方", "https://registry.npmjs.org"),
-    ("npmmirror 镜像", "https://registry.npmmirror.com"),
-];
-
 /// GitHub 常用中转（测速候选）。
 const GH_CANDIDATES: &[(&str, &str)] = &[
     ("GitHub 直连", ""),
@@ -74,17 +68,22 @@ const GH_CANDIDATES: &[(&str, &str)] = &[
     ("ghproxy.net", "https://ghproxy.net/"),
 ];
 
-/// 对 npm registry 源测速：当前配置（显式）∪ 常用候选，去重。
+/// 对 npm registry 源测速：托盘菜单的全部预设源（NPM_REGISTRY_PRESETS）
+/// + 当前配置（显式），去重。保证菜单里每个源都有速度。
 pub async fn speedtest_npm(cfg: &LauncherConfig) -> Vec<SpeedResult> {
     let configured = resolve_npm_registries(cfg);
     let mut urls: Vec<(String, String)> = configured
         .iter()
         .map(|r| (r.clone(), r.clone()))
         .collect();
-    for (name, base) in NPM_CANDIDATES {
+    // 全部预设源（含自动项——自动项无固定 URL 跳过）
+    for (label, base) in NPM_REGISTRY_PRESETS {
+        if base.is_empty() {
+            continue; // 自动（按地域）无固定 URL，跳过测速
+        }
         let url = format!("{base}/dsh-nested-followups");
         if !urls.iter().any(|(_, u)| *u == url) {
-            urls.push((name.to_string(), url));
+            urls.push((label.to_string(), url));
         }
     }
     run_speedtests(urls).await

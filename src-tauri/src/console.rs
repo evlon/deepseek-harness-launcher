@@ -154,6 +154,10 @@ pub fn console_html() -> String {
 
   // 监听更新
   window.__TAURI__ && window.__TAURI__.event.listen("op-update", (e)=>{ render(e.payload); });
+  // 加载完成后拉取当前状态（避免事件在 JS 就绪前发出而丢失）
+  window.addEventListener("load", ()=>{
+    fetch("console://localhost/state").then(r=>r.json()).then(op=>render(op)).catch(()=>{});
+  });
 })();
 </script>
 </body>

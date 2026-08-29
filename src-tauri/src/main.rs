@@ -27,8 +27,19 @@ fn main() {
         }))
         // 操作进度窗口的内嵌 HTML 协议（console://localhost/index.html）
         // data: URL 在 Tauri 2 External 里被安全策略拦截，改用自定义协议。
-        .register_uri_scheme_protocol("console", |_ctx, _request| {
+        .register_uri_scheme_protocol("console", |_ctx, request| {
             use tauri::http::Response;
+            // /state → 当前操作状态 JSON（窗口加载后拉取）
+            let path = request.uri().path().to_string();
+            if path == "/state" {
+                let op = ops::current();
+                let body = serde_json::to_string(&op).unwrap_or_else(|_| "null".to_string());
+                return Response::builder()
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .body(body.into_bytes())
+                    .unwrap_or_default();
+            }
+            // 其他 → 内嵌 HTML
             let html = console::console_html();
             Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
