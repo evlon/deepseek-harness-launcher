@@ -91,7 +91,7 @@ async function saveMirrorSettings(){
       registry:document.getElementById("mirrorRegistry").value.trim(),
       tokenValue:document.getElementById("mirrorToken").value.trim(),
     };
-    if(!/^https?:\/\/\\S+$/.test(ms.registry)){ toast("registry 必须是 http(s) 地址","warn"); return; }
+    if(!/^https?:\/\/\S+$/.test(ms.registry)){ toast("registry 必须是 http(s) 地址","warn"); return; }
     const body={plugins:current.plugins,managedMenu:current.managedMenu,clientDefaults:current.clientDefaults||{},mirrorSettings:ms};
     const r=await fetch("/api/config",{method:"POST",headers:headers(true),body:JSON.stringify(body)});
     const j=await r.json();
@@ -443,7 +443,7 @@ function renderMenuPolicy(){
 function addMenuItem(){
   const label=document.getElementById("newMenuLabel").value.trim();
   const url=document.getElementById("newMenuUrl").value.trim();
-  if(!label||!/^https?:\/\/\\S+$/i.test(url)){ toast("菜单名非空、地址需 http/https","warn"); return; }
+  if(!label||!/^https?:\/\/\S+$/i.test(url)){ toast("菜单名非空、地址需 http/https","warn"); return; }
   current.managedMenu.quickLinks=current.managedMenu.quickLinks||[];
   current.managedMenu.quickLinks.push({label,url});
   document.getElementById("newMenuLabel").value=""; document.getElementById("newMenuUrl").value="";
