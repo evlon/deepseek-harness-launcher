@@ -249,6 +249,14 @@ fn build_bridge_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu
             true,
             None::<&str>,
         )?);
+        // 复制连接 token（管理页「连接」时需要输入）
+        rows.push(MenuItem::with_id(
+            app,
+            "bridge-copy-token",
+            "📋 复制连接 token".to_string(),
+            true,
+            None::<&str>,
+        )?);
     } else {
         rows.push(MenuItem::with_id(
             app,
@@ -449,6 +457,21 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 }
             }
         }
+        "bridge-copy-token" => {
+            let tok = crate::admin_bridge::current_token();
+            if tok.is_empty() {
+                notify(app, "复制 token", "管理能力未开启或未配置 token");
+            } else {
+                match copy_to_clipboard(&tok) {
+                    Ok(()) => {
+                        notify(app, "复制成功", "连接 token 已复制到剪贴板");
+                        crate::ops::start_op(app, "bridge-copy", "复制 token", &[]);
+                        crate::ops::finish_op(app, "连接 token 已复制到剪贴板");
+                    }
+                    Err(e) => notify(app, "复制失败", &e),
+                }
+            }
+        }
         "bridge-start" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -460,7 +483,7 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                         let detail = if tok.is_empty() {
                             format!("本地 API：http://127.0.0.1:{port}")
                         } else {
-                            format!("本地 API：http://127.0.0.1:{port}\n连接 token：{tok}")
+                            format!("本地 API：http://127.0.0.1:{port}\n连接 token：{tok}\n（管理页连接时需输入；可在「管理能力」菜单复制 token）")
                         };
                         crate::ops::finish_op(&h, &detail);
                         notify(&h, "管理能力已开启", &detail);
@@ -637,4 +660,12 @@ fn apply_accel<R: Runtime>(app: &AppHandle<R>, kind: &str, value: &str) {
         }
         Err(e) => notify(app, "加速设置失败", &e),
     }
+}
+
+/// 复制文本到系统剪贴板（arboard，轻量跨平台）。
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("剪贴板不可用：{e}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|e| format!("写入剪贴板失败：{e}"))
 }
