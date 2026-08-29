@@ -2,11 +2,13 @@
 
 mod admin_bridge;
 mod config;
+mod console;
 mod download;
 mod install;
 mod logging;
 mod mirror;
 mod notify;
+mod ops;
 mod plugin;
 mod speedtest;
 mod sync;

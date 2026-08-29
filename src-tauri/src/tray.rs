@@ -120,23 +120,44 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // 管理能力子菜单（动态）
     let bridge_submenu = build_bridge_submenu(app)?;
 
-    let menu = Menu::with_items(
-        app,
-        &[
-            &MenuItem::with_id(app, "install", "安装 / 修复", true, None::<&str>)?,
-            &MenuItem::with_id(app, "launch", "启动 Harness", true, None::<&str>)?,
-            &MenuItem::with_id(app, "open-page", "打开 Harness 页面", true, None::<&str>)?,
-            &MenuItem::with_id(app, "stop", "停止 Harness", true, None::<&str>)?,
-            &profile_submenu,
-            &bridge_submenu,
-            &accel_submenu,
-            &sync_submenu,
-            &url_submenu,
-            &MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?,
-            &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
-        ],
-    )?;
+    // 操作状态区（动态）：有进行中/最近操作时显示在菜单顶部
+    // 先创建所有 owned 菜单项，再收集引用（避免临时值借用问题）
+    let mut owned: Vec<MenuItem<R>> = Vec::new();
+    if let Some(op) = crate::ops::current() {
+        if op.state != crate::ops::OpState::Idle {
+            // 状态行（禁用项，展示当前步骤/结果）
+            let status_text = match op.state {
+                crate::ops::OpState::Running => format!("⏳ {}：{}", op.label, op.current_step),
+                crate::ops::OpState::Done => format!("✓ {} 完成", op.label),
+                crate::ops::OpState::Failed => format!("✗ {} 失败", op.label),
+                crate::ops::OpState::Idle => String::new(),
+            };
+            if !status_text.is_empty() {
+                owned.push(MenuItem::with_id(app, "op-status", status_text, false, None::<&str>)?);
+            }
+            // 查看进度（运行中或完成/失败都可看日志）
+            owned.push(MenuItem::with_id(app, "op-view", "📋 查看进度 / 日志", true, None::<&str>)?);
+        }
+    }
+    owned.push(MenuItem::with_id(app, "install", "安装 / 修复", true, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "launch", "启动 Harness", true, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "open-page", "打开 Harness 页面", true, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "stop", "停止 Harness", true, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?);
 
+    // 固定子菜单（引用）
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<R>> = owned
+        .iter()
+        .map(|m| m as &dyn tauri::menu::IsMenuItem<R>)
+        .collect();
+    items.push(&profile_submenu);
+    items.push(&bridge_submenu);
+    items.push(&accel_submenu);
+    items.push(&sync_submenu);
+    items.push(&url_submenu);
+
+    let menu = Menu::with_items(app, &items)?;
     Ok(menu)
 }
 
@@ -272,26 +293,33 @@ fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<Str
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
         "install" => {
-            notify(app, "安装 / 修复", "正在安装 DeepSeek Harness 及依赖，详情见日志");
+            // 防重复安装：已有进行中的长操作则拒绝
+            if crate::ops::has_running() {
+                notify(app, "安装 / 修复", "已有操作进行中，请稍候");
+                return;
+            }
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
-                match crate::install::install_all(&h).await {
-                    Ok(()) => {
-                        notify(&h, "安装完成", "DeepSeek Harness 及依赖已就绪");
-                        refresh_sync_menu(&h);
-                    }
-                    Err(e) => notify(&h, "安装失败", &e),
-                }
+                // install_all 内部：登记操作 + 弹窗 + 分步通知 + 完成/失败 ops
+                let _ = crate::install::install_all(&h).await;
+                refresh_sync_menu(&h);
             });
         }
         "launch" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "launch", "启动 Harness", &[]);
                 match crate::workflow::launch(&h) {
                     Ok(port) => {
+                        crate::ops::finish_op(&h, &format!("已启动，访问 http://127.0.0.1:{port}"));
                         notify(&h, "Harness 已启动", &format!("访问 http://127.0.0.1:{port}"));
+                        refresh_sync_menu(&h);
                     }
-                    Err(e) => notify(&h, "启动失败", &e),
+                    Err(e) => {
+                        crate::ops::fail_op(&h, &e);
+                        notify(&h, "启动失败", &e);
+                        refresh_sync_menu(&h);
+                    }
                 }
             });
         }
@@ -303,7 +331,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
         }
         "stop" => {
             crate::workflow::stop();
+            crate::ops::start_op(app, "stop", "停止 Harness", &[]);
+            crate::ops::finish_op(app, "Harness 已停止");
             notify(app, "Harness 已停止", "");
+            refresh_sync_menu(app);
         }
         id if id.starts_with("profile-") => {
             // 切换 Profile：切到目标 profile 并启动
@@ -318,34 +349,53 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     let h = app.clone();
                     tauri::async_runtime::spawn(async move {
                         // 记录默认 profile 并切换启动
+                        crate::ops::start_op(&h, "profile", "切换 Profile", &[]);
                         let _ = set_profile(&h, &name);
                         match crate::workflow::launch_with_profile(&h, &name) {
                             Ok(port) => {
+                                crate::ops::finish_op(&h, &format!("{name}：http://127.0.0.1:{port}"));
                                 notify(&h, "Profile 已切换", &format!("{name}：http://127.0.0.1:{port}"));
                                 refresh_sync_menu(&h);
                             }
-                            Err(e) => notify(&h, "Profile 切换失败", &e),
+                            Err(e) => {
+                                crate::ops::fail_op(&h, &e);
+                                notify(&h, "Profile 切换失败", &e);
+                                refresh_sync_menu(&h);
+                            }
                         }
                     });
                 }
             }
         }
+        "op-view" => {
+            if let Err(e) = crate::console::open_console(app) {
+                notify(app, "无法打开进度窗口", &e);
+            }
+        }
         "bridge-start" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "bridge", "开启管理能力", &[]);
                 match crate::admin_bridge::start(&h) {
                     Ok(port) => {
                         let _ = set_bridge_enabled(&h, true);
+                        crate::ops::finish_op(&h, &format!("本地 API：http://127.0.0.1:{port}"));
                         notify(&h, "管理能力已开启", &format!("本地 API：http://127.0.0.1:{port}"));
                         refresh_sync_menu(&h);
                     }
-                    Err(e) => notify(&h, "管理能力开启失败", &e),
+                    Err(e) => {
+                        crate::ops::fail_op(&h, &e);
+                        notify(&h, "管理能力开启失败", &e);
+                        refresh_sync_menu(&h);
+                    }
                 }
             });
         }
         "bridge-stop" => {
             crate::admin_bridge::stop();
             let _ = set_bridge_enabled(app, false);
+            crate::ops::start_op(app, "bridge", "关闭管理能力", &[]);
+            crate::ops::finish_op(app, "管理能力已关闭");
             notify(app, "管理能力已关闭", "");
             refresh_sync_menu(app);
         }
@@ -353,8 +403,13 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             notify(app, "同步", "正在与中心服务端同步…");
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "sync", "同步", &["拉取服务端配置", "执行策略"]);
+                crate::ops::mark_step_running(&h, 0);
+                crate::ops::update_step(&h, "正在拉取服务端配置…");
                 let cfg = load_cached();
                 let outcome = crate::sync::sync_once(&h, &cfg, None).await;
+                crate::ops::mark_step_running(&h, 1);
+                crate::ops::update_step(&h, "执行策略…");
                 refresh_sync_menu(&h);
                 if let Some(config) = &outcome.config {
                     let msg = if outcome.pending.is_empty() {
@@ -362,9 +417,11 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     } else {
                         format!("待安装推荐：{}", outcome.pending.join(", "))
                     };
+                    crate::ops::finish_op(&h, &msg);
                     notify(&h, "同步完成", &msg);
                     let _ = config;
                 } else {
+                    crate::ops::fail_op(&h, "无法连接中心服务端（已使用本地缓存）");
                     notify(&h, "同步失败", "无法连接中心服务端（已使用本地缓存）");
                 }
             });
@@ -378,15 +435,23 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     let h = app.clone();
                     let name_clone = name.clone();
                     tauri::async_runtime::spawn(async move {
+                        crate::ops::start_op(&h, "plugin-install", "安装插件", &["安装插件"]);
+                        crate::ops::mark_step_running(&h, 0);
+                        crate::ops::update_step(&h, &format!("正在安装 {name_clone}…"));
                         match crate::sync::install_plugin(&h, &name).await {
                             Ok(()) => {
+                                crate::ops::finish_op(&h, &format!("{} 已就绪", name_clone));
                                 notify(&h, "插件已安装", &format!("{} 已就绪", name_clone));
                                 // 安装后立即同步一次（刷新状态 + 上报服务端）
                                 let cfg = load_cached();
                                 let _ = crate::sync::sync_once(&h, &cfg, None).await;
                                 refresh_sync_menu(&h);
                             }
-                            Err(e) => notify(&h, "插件安装失败", &e),
+                            Err(e) => {
+                                crate::ops::fail_op(&h, &e);
+                                notify(&h, "插件安装失败", &e);
+                                refresh_sync_menu(&h);
+                            }
                         }
                     });
                 }
@@ -402,8 +467,13 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             notify(app, "测速", "正在探测各加速源延迟，请稍候…");
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "speedtest", "加速源测速", &["探测 npm 源", "探测 GitHub 中转"]);
+                crate::ops::mark_step_running(&h, 0);
+                crate::ops::update_step(&h, "探测 npm 源…");
                 let cfg = load_cached();
                 let npm = crate::speedtest::speedtest_npm(&h, &cfg).await;
+                crate::ops::mark_step_running(&h, 1);
+                crate::ops::update_step(&h, "探测 GitHub 中转…");
                 let gh = crate::speedtest::speedtest_gh(&h, &cfg).await;
 
                 let mut lines: Vec<String> = Vec::new();
@@ -420,7 +490,9 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 let msg = lines.join("\n");
                 // 结果可能较长，截断到通知上限
                 let msg = if msg.len() > 900 { format!("{}…", &msg[..900]) } else { msg };
+                crate::ops::finish_op(&h, "测速完成（详见结果通知）");
                 notify(&h, "加速源测速结果", &msg);
+                refresh_sync_menu(&h);
             });
         }
         "log" => {

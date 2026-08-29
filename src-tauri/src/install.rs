@@ -31,6 +31,20 @@ pub const MATRIX_AGENT_PACKAGE: &str = "dsh-matrix-agent";
 /// 安装 / 修复全部组件 + 预置 profile 插件。
 pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let cfg = load_cached();
+
+    // 操作状态中心：登记安装操作 + 自动弹出进度窗口
+    let steps = vec![
+        "下载 / 安装 Node.js",
+        "安装 pnpm",
+        "下载 Harness 核心",
+        "预置 web 插件",
+        "预置 matrix 数字分身",
+    ];
+    crate::ops::start_op(app, "install", "安装 / 修复", &steps);
+    if let Err(e) = crate::console::open_console(app) {
+        log::warn!("进度窗口打开失败（降级为托盘状态 + 通知）：{e}");
+    }
+
     // 预写 npmrc，使加速源在安装后就绪（供后续插件拉包）
     let _ = crate::plugin::ensure_profile_npmrc(app, &cfg);
 
@@ -38,12 +52,44 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     #[cfg(windows)]
     order.push(Component::Git);
 
-    for component in order {
+    let mut step_index = 0usize;
+    for component in &order {
         if component.check_installed(app) {
             log::info!("{} 已安装，跳过", component.title());
             continue;
         }
-        component.install(app).await?;
+        crate::ops::mark_step_running(app, step_index);
+        crate::ops::update_step(app, &format!("正在安装 {}…", component.title()));
+        crate::ops::append_log(app, &format!("开始安装 {}…", component.title()));
+        crate::notify::notify(app, "安装 / 修复", &format!("正在安装 {}…", component.title()));
+
+        // 下载进度回调 → 更新窗口状态（如 "正在下载 Node.js 45%"）
+        let h = app.clone();
+        let comp_title = component.title().to_string();
+        let result = component.install(app, Some(&move |downloaded, total| {
+            let pct = if total > 0 {
+                (downloaded as f64 / total as f64 * 100.0).round() as u32
+            } else {
+                0
+            };
+            crate::ops::update_step(&h, &format!("正在下载 {comp_title} {pct}%"));
+        }))
+        .await;
+
+        match result {
+            Ok(()) => {
+                crate::ops::append_log(app, &format!("✓ {} 安装完成", component.title()));
+                crate::ops::update_step(app, &format!("✓ {} 安装完成", component.title()));
+                crate::notify::notify(app, "安装 / 修复", &format!("{} 安装完成", component.title()));
+            }
+            Err(e) => {
+                crate::ops::mark_step_failed(app, step_index);
+                crate::ops::fail_op(app, &format!("{} 安装失败：{e}", component.title()));
+                crate::notify::notify(app, "安装失败", &format!("{}：{e}", component.title()));
+                return Err(e);
+            }
+        }
+        step_index += 1;
     }
 
     // 安装完成后再次确保 npmrc 生效
@@ -57,12 +103,20 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     copy_launcher_brand(app, &cfg);
 
     // 预置 web profile 插件（幂等：已装的自动跳过/更新）
+    crate::ops::mark_step_running(app, 3);
+    crate::ops::update_step(app, "预置 web 插件…");
+    crate::notify::notify(app, "安装 / 修复", "预置 web 插件…");
     let web_packages: Vec<String> = PRESET_PLUGINS.iter().map(|s| s.to_string()).collect();
     preset_profile(app, &cfg, "web", &web_packages).await?;
 
     // 预置 matrix profile（数字分身）：dsh-matrix-agent + launcher-brand + 品牌 patch
+    crate::ops::mark_step_running(app, 4);
+    crate::ops::update_step(app, "预置 matrix 数字分身…");
+    crate::notify::notify(app, "安装 / 修复", "预置 matrix 数字分身…");
     preset_matrix_profile(app, &cfg).await?;
 
+    crate::ops::finish_op(app, "DeepSeek Harness 及依赖已就绪");
+    crate::notify::notify(app, "安装完成", "DeepSeek Harness 及依赖已就绪");
     log::info!("全部依赖安装完成");
     Ok(())
 }

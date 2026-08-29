@@ -756,6 +756,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tokio",
+ "url",
  "windows-sys 0.61.2",
  "zip",
 ]

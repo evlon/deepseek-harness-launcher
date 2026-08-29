@@ -61,13 +61,13 @@ impl Component {
     }
 
     /// 下载并安装该组件（含校验）。
-    pub async fn install<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
+    pub async fn install<R: Runtime>(&self, app: &AppHandle<R>, on_progress: ProgressCallback<'_>) -> Result<(), String> {
         log::info!("开始安装组件：{}", self.title());
         match self {
             Component::Node => {
                 let (url, filename) = node_download_url();
                 let sha = fetch_node_sha256(&filename).await.ok();
-                let buf = download_bytes(&[url]).await?;
+                let buf = download_bytes(&[url], on_progress).await?;
                 if let Some(expected) = &sha {
                     verify_sha256(&buf, expected)?;
                 }
@@ -75,7 +75,7 @@ impl Component {
             }
             Component::Pnpm => {
                 let urls = pnpm_download_urls();
-                let buf = download_bytes(&urls).await?;
+                let buf = download_bytes(&urls, on_progress).await?;
                 verify_sha256(&buf, PNPM_SHA256)?;
                 ensure_extract("pnpm.tgz", buf, self.install_dest(app)).await?;
             }
@@ -86,7 +86,7 @@ impl Component {
                 // 官方直连 + 全部镜像前缀（多源按序尝试）
                 let mut urls = vec![release.asset_url.clone()];
                 urls.extend(mirror_urls(&release.asset_url, &cfg));
-                let buf = download_bytes(&urls).await?;
+                let buf = download_bytes(&urls, on_progress).await?;
                 if let Some(digest) = &release.digest {
                     verify_sha256(&buf, digest)?;
                 } else {
@@ -98,7 +98,7 @@ impl Component {
             Component::Git => {
                 let (url, filename) = mingit_download_url()?;
                 let sha = mingit_sha256()?;
-                let buf = download_bytes(&[url]).await?;
+                let buf = download_bytes(&[url], on_progress).await?;
                 verify_sha256(&buf, sha)?;
                 ensure_extract(&filename, buf, self.install_dest(app)).await?;
             }
@@ -186,7 +186,12 @@ fn node_version_matches(bin: &Path) -> bool {
 /// 加速策略：**第一个源（通常是官方直连）快速失败**——只重试 `FAST_FAIL_ATTEMPTS` 次
 /// 就切换到镜像源，避免国内环境在直连 GitHub/npmjs 上浪费大量时间（此前 5 次重试
 /// 需 ~100 秒才切镜像）。镜像源是兜底，保留标准重试次数。
-pub async fn download_bytes(urls: &[String]) -> Result<Vec<u8>, String> {
+///
+/// `on_progress` 可选：每收到一块数据回调 `(downloaded, total)`，用于展示下载进度。
+pub async fn download_bytes(
+    urls: &[String],
+    on_progress: ProgressCallback<'_>,
+) -> Result<Vec<u8>, String> {
     if urls.is_empty() {
         return Err("DOWNLOAD_URL_EMPTY: 没有提供下载源".to_string());
     }
@@ -196,7 +201,7 @@ pub async fn download_bytes(urls: &[String]) -> Result<Vec<u8>, String> {
             log::warn!("主下载源失败，切换镜像源重试：{url}");
         }
         let attempts = if index == 0 { FAST_FAIL_ATTEMPTS } else { MAX_ATTEMPTS };
-        match download_with_retry(url, attempts).await {
+        match download_with_retry(url, attempts, on_progress).await {
             Ok(buf) => return Ok(buf),
             Err(e) => last_err = e,
         }
@@ -208,13 +213,20 @@ pub async fn download_bytes(urls: &[String]) -> Result<Vec<u8>, String> {
     })
 }
 
+/// 下载进度回调（每收到一块数据触发）：`(downloaded_bytes, total_bytes)`。
+pub type ProgressCallback<'a> = Option<&'a (dyn Fn(u64, u64) + Send + Sync)>;
+
 /// 镜像源（最后一个兜底）的标准重试次数。
 const MAX_ATTEMPTS: usize = 5;
 /// 首个源（官方直连）的快速失败次数：国内环境直连 GitHub/npmjs 大概率不通，
 /// 快速切换到镜像源提升体验。
 const FAST_FAIL_ATTEMPTS: usize = 2;
 
-async fn download_with_retry(url: &str, attempts: usize) -> Result<Vec<u8>, String> {
+async fn download_with_retry(
+    url: &str,
+    attempts: usize,
+    on_progress: ProgressCallback<'_>,
+) -> Result<Vec<u8>, String> {
     validate_url(url)?;
     let client = reqwest::Client::builder()
         .user_agent("deepseek-harness-launcher")
@@ -235,7 +247,7 @@ async fn download_with_retry(url: &str, attempts: usize) -> Result<Vec<u8>, Stri
             );
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
         }
-        match download_attempt(&client, url, &mut buffer).await {
+        match download_attempt(&client, url, &mut buffer, on_progress).await {
             Ok(()) => {
                 log::info!("下载完成：{} 字节", buffer.len());
                 return Ok(buffer);
@@ -253,6 +265,7 @@ async fn download_attempt(
     client: &reqwest::Client,
     url: &str,
     buffer: &mut Vec<u8>,
+    on_progress: ProgressCallback<'_>,
 ) -> Result<(), String> {
     let resume_from = buffer.len() as u64;
     let mut req = client.get(url);
@@ -279,6 +292,11 @@ async fn download_attempt(
         buffer.extend_from_slice(&chunk);
         downloaded += chunk.len() as u64;
         let received = resume_from + downloaded;
+        // 进度回调（窗口/托盘实时展示）
+        if let Some(cb) = on_progress {
+            let total = if total_size > 0 { total_size } else { 0 };
+            cb(received, total);
+        }
         if total_size > 0 {
             log::debug!("下载进度：{:.1}/{:.1} MB", received as f64 / 1e6, total_size as f64 / 1e6);
         }
