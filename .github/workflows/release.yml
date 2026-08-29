@@ -23,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Rust 工具链（edition 2021，稳定版）
       - name: Setup Rust
@@ -33,7 +33,7 @@ jobs:
 
       # 缓存 cargo 依赖（加速重复构建）
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -42,7 +42,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
       # Windows 构建需要 WebView2（runner 自带）+ MSVC 链接器（windows-latest 自带）
       - name: Build (release)
         shell: bash
@@ -77,7 +76,7 @@ jobs:
 
       # 发布 GitHub Release（客户端包 + 服务端包）
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ matrix.client_artifact }}
