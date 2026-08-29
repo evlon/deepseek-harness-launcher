@@ -59,6 +59,10 @@ node server.js --port 8080 --token 你的管理口令
 
 - 管理页：`http://<服务器IP>:8080/admin`（增删推荐插件、查看各客户端同步情况）。
 - 客户端拉取：`http://<服务器IP>:8080/api/config`。
+
+> **⚠️ 部署数据保护**：本机部署环境在 `E:\ai-works\caddy\launcher-data`（生产 config + 客户端数据）。
+> **测试/调试时严禁 `POST /api/config` 重置 plugins 为空、删除或移动该目录**——数据不可再生。
+> 详见 `launcher-data/README-DEPLOY.md`；改动前先备份。
 - 数据存于 `server/data/`（`config.json` + `clients/<clientId>.json`）。
 - 详见 [`server/README.md`](server/README.md)。
 
