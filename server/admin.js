@@ -120,8 +120,9 @@ async function startMirrorUpload(){
 let mirrorPollTimer=null;
 async function pollMirrorProgress(){
   if(!bridgePort) return;
+  const bridgeTok=localStorage.getItem("bridgeToken")||"";
   try{
-    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/progress",{headers:headers(false)});
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/progress?token="+encodeURIComponent(bridgeTok),{headers:headers(false)});
     const j=await r.json();
     if(!j.ok) return;
     const p=j.progress||{};
@@ -289,7 +290,7 @@ async function renderPlugins(){
     else if(ss.state==="unsynced") badge='<span class="sync-badge unsynced">⚠ 未同步</span>';
     else badge='<span class="sync-badge checking">查询中…</span>';
     // 同步按钮（未同步或已同步都可点，重新同步）
-    const syncBtn='<button class="btn sm primary sync-btn" onclick="syncOnePlugin('+i+')">同步此插件</button>';
+    const syncBtn='<button class="btn sm primary sync-btn" id="syncbtn-'+i+'" onclick="syncOnePlugin('+i+')">同步此插件</button>';
     card.className="pcard";
     card.innerHTML='<div class="phead"><span class="pname">'+esc(p)+'</span>'+ver+'</div>'
       +'<div class="pdesc">'+desc+'</div>'
@@ -330,37 +331,80 @@ async function checkAllSyncStatus(){
   renderPlugins();
 }
 async function syncOnePlugin(i){
-  if(!bridgePort){ toast("请先连接管理员本机管理能力","warn"); return; }
+  const btn=document.getElementById("syncbtn-"+i);
+  const setBtn=(text,disabled)=>{ if(btn){ btn.textContent=text; btn.disabled=!!disabled; } };
+  // 前置条件检查（明确反馈，不只 toast）
+  if(!bridgePort){
+    toast("❌ 未连接管理员本机管理能力——请在上方「本机管理能力」输入端口并连接","err");
+    return;
+  }
+  const bridgeTok=localStorage.getItem("bridgeToken")||"";
   const name=(current.plugins||[])[i];
   const token=document.getElementById("mirrorToken").value.trim();
-  if(!token){ toast("请先配置发布 token（下方镜像设置）","warn"); return; }
+  if(!token){
+    toast("❌ 未配置发布 token——请滚动到下方「镜像上传」卡片填写","err");
+    setBtn("同步此插件",false);
+    return;
+  }
   const reg=syncRegistryUrl();
+  // 点击立即反馈：按钮禁用 + 状态
+  setBtn("⏳ 同步中…",true);
   try{
-    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start",{
+    const ctrl=new AbortController();
+    setTimeout(()=>ctrl.abort(),15000); // 15s 超时
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start?token="+encodeURIComponent(bridgeTok),{
       method:"POST",headers:headers(true),
-      body:JSON.stringify({registry:reg,token:token,only:name})
+      body:JSON.stringify({registry:reg,token:token,only:name}),
+      signal:ctrl.signal
     });
     const j=await r.json();
-    if(!j.ok){ toast("启动失败："+esc(j.error||""),"err"); return; }
-    toast("正在同步 "+esc(name)+"（含依赖）…","ok");
+    if(!j.ok){
+      setBtn("同步此插件",false);
+      toast("❌ 同步启动失败："+esc(j.error||("HTTP "+r.status)),"err");
+      return;
+    }
+    toast("🚀 正在同步 "+esc(name)+"（含依赖）…","ok");
+    // 立即刷新一次进度 + 定时轮询
     pollMirrorProgress();
-  }catch(e){ toast("无法连接管理能力："+esc(e.message),"err"); }
+    // 轮询期间按钮保持「同步中」
+    const t=setInterval(()=>{
+      fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/progress?token="+encodeURIComponent(bridgeTok),{headers:headers(false)})
+        .then(r=>r.json()).then(j=>{
+          const p=(j&&j.progress)||{};
+          if(p.state==="done"||p.state==="error"){
+            clearInterval(t);
+            setBtn("同步此插件",false);
+            toast(p.state==="done" ? ("✅ "+esc(name)+" 已同步") : ("❌ 同步失败："+esc((p.error||"").slice(0,120))), p.state==="done"?"ok":"err");
+            renderPlugins(); // 刷新徽章
+          }
+        }).catch(()=>{});
+    },2000);
+  }catch(e){
+    setBtn("同步此插件",false);
+    toast("❌ 无法连接管理能力："+esc(e.message),"err");
+  }
 }
 async function syncAllPlugins(){
-  if(!bridgePort){ toast("请先连接管理员本机管理能力","warn"); return; }
+  const btn=document.getElementById("syncAllBtn");
+  if(!bridgePort){ toast("❌ 未连接管理员本机管理能力——请在上方输入端口并连接","err"); return; }
+  const bridgeTok=localStorage.getItem("bridgeToken")||"";
   const token=document.getElementById("mirrorToken").value.trim();
-  if(!token){ toast("请先配置发布 token（下方镜像设置）","warn"); return; }
+  if(!token){ toast("❌ 未配置发布 token——请滚动到「镜像上传」卡片填写","err"); return; }
   const reg=syncRegistryUrl();
+  if(btn){ btn.disabled=true; btn.textContent="⏳ 同步中…"; }
   try{
-    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start",{
+    const ctrl=new AbortController();
+    setTimeout(()=>ctrl.abort(),15000);
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/start?token="+encodeURIComponent(bridgeTok),{
       method:"POST",headers:headers(true),
-      body:JSON.stringify({registry:reg,token:token})
+      body:JSON.stringify({registry:reg,token:token}),
+      signal:ctrl.signal
     });
     const j=await r.json();
-    if(!j.ok){ toast("启动失败："+esc(j.error||""),"err"); return; }
-    toast("已开始同步全部未同步插件","ok");
+    if(!j.ok){ toast("❌ 同步启动失败："+esc(j.error||""),"err"); if(btn){btn.disabled=false;btn.textContent="🚀 同步全部未同步";} return; }
+    toast("🚀 已开始同步全部未同步插件","ok");
     pollMirrorProgress();
-  }catch(e){ toast("无法连接管理能力："+esc(e.message),"err"); }
+  }catch(e){ toast("❌ 无法连接管理能力："+esc(e.message),"err"); if(btn){btn.disabled=false;btn.textContent="🚀 同步全部未同步";} }
 }
 function addPlugin(){
   const v=document.getElementById("newPlugin").value.trim();

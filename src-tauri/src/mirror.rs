@@ -243,12 +243,14 @@ pub fn start_mirror_upload<R: Runtime>(
     log::info!("mirror::start_mirror_upload 已读进度：state={}", p.state);
     if p.state == "running" {
         // 检测是否陈旧（started_at 距今超过整体超时 → 上次任务已死/被中断）
+        log::info!("mirror:: running 分支：检查是否陈旧（started_at={}）", p.started_at);
         let stale = p
             .started_at
             .parse::<chrono::DateTime<chrono::Utc>>()
             .ok()
             .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds() as u64 > MIRROR_TOTAL_TIMEOUT_SECS)
             .unwrap_or(false);
+        log::info!("mirror:: running 分支：stale={}", stale);
         if stale {
             log::warn!("检测到陈旧的 running 上传（启动于 {}），视为卡死并重置", p.started_at);
             let mut reset = p.clone();
@@ -256,10 +258,13 @@ pub fn start_mirror_upload<R: Runtime>(
             reset.error = "上次上传中断（进程退出/崩溃），已自动重置".to_string();
             reset.finished_at = now_iso();
             save_progress(app, cfg, &reset);
+            log::info!("mirror:: 已重置陈旧 running");
         } else {
+            log::info!("mirror:: 返回 UPLOAD_ALREADY_RUNNING");
             return Err("UPLOAD_ALREADY_RUNNING: 上传正在进行中".to_string());
         }
     }
+    log::info!("mirror:: 通过 running 检查，继续");
 
     let h = app.clone();
     let cfg = cfg.clone();
@@ -267,32 +272,45 @@ pub fn start_mirror_upload<R: Runtime>(
     let token = token.to_string();
 
     // 应装清单来自服务端缓存的配置（SyncState.cached_config.plugins）
+    log::info!("mirror:: 读取 sync-state…");
     let mut plugins: Vec<String> = crate::sync::load_state(&h, &cfg)
         .cached_config
         .map(|c| c.plugins)
         .unwrap_or_default();
+    log::info!("mirror:: sync-state 读取完成，plugins={}", plugins.len());
     // 单包模式：只同步指定插件
     if let Some(only) = &only {
         plugins = vec![only.clone()];
     }
 
-    tauri::async_runtime::spawn(async move {
-        // 整体超时（默认 30 分钟）：防止网络卡死导致永久 running，
-        // 用户后续 mirror/start 一直被「上传进行中」拒绝。
-        let timeout = std::time::Duration::from_secs(MIRROR_TOTAL_TIMEOUT_SECS);
-        let result = tokio::time::timeout(timeout, run_mirror(&h, &cfg, &registry, &token, plugins)).await;
-        match result {
-            Ok(inner) => { let _ = inner; }
-            Err(_) => {
-                // 超时：强制标记失败
-                let mut p = load_progress(&h, &cfg);
-                p.state = "error".to_string();
-                p.error = format!("上传超时（{} 分钟），已自动终止——网络可能不通，请重试", MIRROR_TOTAL_TIMEOUT_SECS / 60);
-                p.finished_at = now_iso();
-                save_progress(&h, &cfg, &p);
-                log::error!("镜像上传整体超时，已标记失败");
+    log::info!("mirror:: 启动上传线程（plugins={}）", plugins.len());
+
+    // 用独立 std::thread + 自建 tokio runtime 执行上传：
+    // 不依赖 tauri::async_runtime（从 bridge 的 std::thread 调用 spawn 会阻塞主线程事件循环，
+    // 导致 HTTP 响应发不出去——实测 start 挂起、进度却显示 running）。
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("mirror tokio runtime");
+        rt.block_on(async move {
+            // 整体超时（默认 30 分钟）：防止网络卡死导致永久 running，
+            // 用户后续 mirror/start 一直被「上传进行中」拒绝。
+            let timeout = std::time::Duration::from_secs(MIRROR_TOTAL_TIMEOUT_SECS);
+            let result = tokio::time::timeout(timeout, run_mirror(&h, &cfg, &registry, &token, plugins)).await;
+            match result {
+                Ok(inner) => { let _ = inner; }
+                Err(_) => {
+                    // 超时：强制标记失败
+                    let mut p = load_progress(&h, &cfg);
+                    p.state = "error".to_string();
+                    p.error = format!("上传超时（{} 分钟），已自动终止——网络可能不通，请重试", MIRROR_TOTAL_TIMEOUT_SECS / 60);
+                    p.finished_at = now_iso();
+                    save_progress(&h, &cfg, &p);
+                    log::error!("镜像上传整体超时，已标记失败");
+                }
             }
-        }
+        });
     });
     Ok(())
 }

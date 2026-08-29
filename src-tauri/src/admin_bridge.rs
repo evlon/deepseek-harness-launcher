@@ -6,12 +6,10 @@
 //!
 //! 约束：
 //! - 仅绑定 127.0.0.1（不接受局域网访问）
-//! - 可选 token（X-Bridge-Token），防本机其他进程滥用
+//! - 可选 token（X-Bridge-Token / ?token=），防本机其他进程滥用
 //! - 脚本执行默认禁用（allowScripts），启用时受限执行
-//! - 零新依赖：std TcpListener + 极简 HTTP 解析（GET/POST + JSON + CORS）
+//! - 用 tiny_http（成熟 HTTP 服务器）替代自写解析——修复 body 读取死锁等自写缺陷
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,10 +72,11 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
         .unwrap_or(false);
 
     let h = app.clone();
+    // 端口冲突自动顺延
     let mut port = base;
-    let listener = loop {
-        match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(l) => break l,
+    let server = loop {
+        match tiny_http::Server::http(("127.0.0.1", port)) {
+            Ok(s) => break s,
             Err(_) => {
                 if port >= base + 50 {
                     return Err(format!("BRIDGE_PORT_EXHAUSTED: 端口 {base}~{} 均被占用", base + 50));
@@ -86,26 +85,24 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
             }
         }
     };
-    listener.set_nonblocking(false).map_err(|e| e.to_string())?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     let bridge_token_for_state = token.clone(); // 供 Bridge 状态记录
+
     let thread = std::thread::spawn(move || {
         log::info!("管理能力本地 API 已启动：http://127.0.0.1:{port}");
-        for stream in listener.incoming() {
+        // tiny_http 每个请求一个线程（内部线程池），此处主循环 accept
+        for request in server.incoming_requests() {
             if shutdown_clone.load(Ordering::Relaxed) {
                 break;
             }
-            match stream {
-                Ok(s) => {
-                    let h = h.clone();
-                    let token = token.clone();
-                    let allow_scripts = allow_scripts;
-                    std::thread::spawn(move || handle_conn(s, &h, &token, allow_scripts));
-                }
-                Err(_) => break,
-            }
+            let h = h.clone();
+            let token = token.clone();
+            let allow_scripts = allow_scripts;
+            std::thread::spawn(move || {
+                handle_request(request, &h, &token, allow_scripts);
+            });
         }
     });
 
@@ -123,8 +120,6 @@ pub fn stop() {
     let mut guard = CURRENT.lock().unwrap();
     if let Some(b) = guard.take() {
         b.shutdown.store(true, Ordering::Relaxed);
-        // 主动连一次让 accept 返回（唤醒阻塞的 incoming）
-        let _ = TcpStream::connect(("127.0.0.1", b.port));
         if let Some(t) = b.thread {
             let _ = t.join();
         }
@@ -132,104 +127,7 @@ pub fn stop() {
     }
 }
 
-// ---------- HTTP 极简处理 ----------
-
-struct Request {
-    method: String,
-    path: String,
-    query: std::collections::HashMap<String, String>,
-    headers: std::collections::HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-fn parse_request(stream: &mut TcpStream) -> Option<Request> {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).ok()?;
-    if n == 0 {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&buf[..n]);
-    let mut lines = text.split("\r\n");
-    let head = lines.next()?;
-    let mut parts = head.split_whitespace();
-    let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
-
-    // 分离 path 与 query
-    let (path, query_str) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target.clone(), String::new()),
-    };
-    let mut query = std::collections::HashMap::new();
-    for kv in query_str.split('&') {
-        if kv.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = kv.split_once('=') {
-            query.insert(
-                percent_decode(k),
-                percent_decode(v),
-            );
-        }
-    }
-
-    // 读取 body（Content-Length）+ headers
-    let mut body = Vec::new();
-    let mut clen = 0;
-    let mut headers = std::collections::HashMap::new();
-    for line in &mut lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(v) = line.strip_prefix("Content-Length:") {
-            clen = v.trim().parse().unwrap_or(0);
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-    if clen > 0 && clen <= 1 << 20 {
-        let mut remaining = clen as usize;
-        while remaining > 0 {
-            let mut chunk = vec![0u8; remaining.min(8192)];
-            let r = stream.read(&mut chunk).ok()?;
-            if r == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..r]);
-            remaining -= r;
-        }
-    }
-
-    Some(Request { method, path, query, headers, body })
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
+// ---------- 请求处理（tiny_http） ----------
 
 /// 允许的管理页 Origin（服务端管理页域名；浏览器同源请求无 Origin 头时放行）。
 /// 默认放行 ai-conf.ict.cmcc；可经环境变量 ADMIN_ORIGIN 覆盖（测试/内网别名）。
@@ -245,82 +143,54 @@ fn origin_allowed(origin: &str) -> bool {
     origin == "http://ai-conf.ict.cmcc" || origin == "https://ai-conf.ict.cmcc"
 }
 
-fn send_json(stream: &mut TcpStream, code: u16, obj: serde_json::Value) {
-    let body = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string());
-    let resp = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: application/json; charset=utf-8\r\n\
-         Access-Control-Allow-Origin: http://ai-conf.ict.cmcc\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type, X-Bridge-Token, X-Admin-Token\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status_text(code),
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(resp.as_bytes());
-}
+/// 处理单个请求：CORS → token → 路由。
+fn handle_request<R: Runtime>(
+    mut request: tiny_http::Request,
+    app: &AppHandle<R>,
+    token: &str,
+    allow_scripts: bool,
+) {
+    // 读取 body（tiny_http 正确处理 Content-Length/分片/keep-alive）
+    let mut body_bytes = Vec::new();
+    let _ = request.as_reader().read_to_end(&mut body_bytes);
 
-fn status_text(code: u16) -> &'static str {
-    match code {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Status",
-    }
-}
+    let method = request.method().to_string();
+    let url = request.url().to_string();
+    let path = url.split('?').next().unwrap_or(&url).to_string();
+    let query = parse_query(url.split('?').nth(1).unwrap_or(""));
 
-fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &str, allow_scripts: bool) {
-    let Some(req) = parse_request(&mut stream) else {
-        return;
-    };
-
-    // 安全：仅允许受信任的管理页 Origin 访问（服务端域名），
-    // 防止任意网页（DNS rebinding / CSRF）调用本机 API。
-    // 无 Origin 头的请求（curl / 同源脚本）放行；有 Origin 但非白名单 → 拒绝。
-    let origin = req.headers.get("origin").cloned().unwrap_or_default();
+    // Origin 校验（防 DNS rebinding / CSRF）
+    let origin = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("origin"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
     if !origin.is_empty() && !origin_allowed(&origin) {
-        send_json(&mut stream, 403, serde_json::json!({ "error": "origin not allowed" }));
+        respond_json(request, 403, serde_json::json!({ "error": "origin not allowed" }), &origin);
         return;
     }
 
     // CORS preflight
-    if req.method == "OPTIONS" {
-        let origin_hdr = if origin_allowed(&origin) {
-            format!("Access-Control-Allow-Origin: {origin}\r\n")
-        } else {
-            String::new()
-        };
-        let resp = format!(
-            "HTTP/1.1 204 No Content\r\n{origin_hdr}\
-             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Content-Type, X-Bridge-Token, X-Admin-Token\r\n\
-             Connection: close\r\n\r\n"
-        );
-        let _ = stream.write_all(resp.as_bytes());
+    if method == "OPTIONS" {
+        respond_options(request, &origin);
         return;
     }
 
     // token 校验（health 免 token——纯探测，无副作用；其余路由需 token）
-    let is_health = req.method == "GET" && req.path == "/api/health";
+    let is_health = method == "GET" && path == "/api/health";
     if !is_health {
-        let auth_ok = token.is_empty() || req_has_token(&req, token);
+        let auth_ok = token.is_empty() || req_has_token(&query, token);
         if !auth_ok {
-            log::warn!(
-                "管理能力：token 校验失败（path={} method={} query_token={:?}）",
-                req.path,
-                req.method,
-                req.query.get("token")
-            );
-            send_json(&mut stream, 403, serde_json::json!({ "error": "invalid bridge token" }));
+            log::warn!("管理能力：token 校验失败（path={path} method={method}）");
+            respond_json(request, 403, serde_json::json!({ "error": "invalid bridge token" }), &origin);
             return;
         }
     }
-    log::info!("管理能力：路由 {} {}", req.method, req.path);
+    log::info!("管理能力：路由 {method} {path}");
 
     // 路由分发
-    let resp: serde_json::Value = match (req.method.as_str(), req.path.as_str()) {
+    let resp: serde_json::Value = match (method.as_str(), path.as_str()) {
         ("GET", "/api/health") => serde_json::json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
@@ -328,7 +198,7 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
             "bridge": true,
         }),
         ("GET", "/api/registry/meta") => {
-            let name = req.query.get("name").cloned().unwrap_or_default();
+            let name = query.get("name").cloned().unwrap_or_default();
             match block_on_query_meta(&name) {
                 Ok(meta) => serde_json::json!({ "ok": true, "meta": meta }),
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
@@ -336,10 +206,10 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
         }
         ("POST", "/api/script/exec") => {
             if !allow_scripts {
-                send_json(&mut stream, 403, serde_json::json!({ "error": "scripts disabled (adminBridge.allowScripts)" }));
+                respond_json(request, 403, serde_json::json!({ "error": "scripts disabled (adminBridge.allowScripts)" }), &origin);
                 return;
             }
-            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
             match exec_script(&body) {
                 Ok(out) => serde_json::json!({ "ok": true, "output": out }),
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
@@ -353,7 +223,7 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
         ("POST", "/api/registry/mirror/start") => {
             let cfg = load_cached();
             // token 经 POST body 传递（不进 URL/日志）
-            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
             let registry = body
                 .get("registry")
                 .and_then(|v| v.as_str())
@@ -382,16 +252,93 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
             serde_json::json!({ "ok": true, "progress": p, "note": "cancel not implemented" })
         }
         _ => {
-            send_json(&mut stream, 404, serde_json::json!({ "error": "not found" }));
+            respond_json(request, 404, serde_json::json!({ "error": "not found" }), &origin);
             return;
         }
     };
-    send_json(&mut stream, 200, resp);
+    respond_json(request, 200, resp, &origin);
 }
 
-fn req_has_token(req: &Request, token: &str) -> bool {
-    // 简化：从 body/query 里不取，管理页通过 header 传——极简实现从 query 取（管理页可带 ?token=）
-    req.query.get("token").map(|t| t == token).unwrap_or(false)
+/// 解析 query string（百分号解码）。
+fn parse_query(qs: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for kv in qs.split('&') {
+        if kv.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = kv.split_once('=') {
+            out.insert(percent_decode(k), percent_decode(v));
+        }
+    }
+    out
+}
+
+fn req_has_token(query: &std::collections::HashMap<String, String>, token: &str) -> bool {
+    query.get("token").map(|t| t == token).unwrap_or(false)
+}
+
+/// 发送 JSON 响应（带 CORS 头）。
+fn respond_json(request: tiny_http::Request, code: u16, obj: serde_json::Value, origin: &str) {
+    let body = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string());
+    let status = match code {
+        200 => tiny_http::StatusCode(200),
+        403 => tiny_http::StatusCode(403),
+        404 => tiny_http::StatusCode(404),
+        _ => tiny_http::StatusCode(500),
+    };
+    let allow_origin = if origin_allowed(origin) && !origin.is_empty() {
+        origin.to_string()
+    } else {
+        "http://ai-conf.ict.cmcc".to_string()
+    };
+    let response = tiny_http::Response::from_string(body)
+        .with_status_code(status)
+        .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap())
+        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], allow_origin.as_bytes()).unwrap())
+        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap())
+        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Bridge-Token, X-Admin-Token"[..]).unwrap());
+    let _ = request.respond(response);
+}
+
+/// 发送 CORS preflight 响应。
+fn respond_options(request: tiny_http::Request, origin: &str) {
+    let allow_origin = if origin_allowed(origin) && !origin.is_empty() {
+        origin.to_string()
+    } else {
+        "http://ai-conf.ict.cmcc".to_string()
+    };
+    let response = tiny_http::Response::empty(204)
+        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], allow_origin.as_bytes()).unwrap())
+        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap())
+        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Bridge-Token, X-Admin-Token"[..]).unwrap());
+    let _ = request.respond(response);
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ---------- registry 查询（外网中转） ----------
