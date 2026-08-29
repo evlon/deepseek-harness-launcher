@@ -90,7 +90,7 @@ cargo build --release  # 发布版
 ./deepseek-harness-launcher.exe --cmd stop             # 停止
 ./deepseek-harness-launcher.exe --cmd sync             # 立即同步
 ./deepseek-harness-launcher.exe --cmd speedtest        # 测速
-./deepseek-harness-launcher.exe --cmd mirror --registry https://registry.ict.cmcc --token xxx
+./deepseek-harness-launcher.exe --cmd mirror --registry http://registry.ict.cmcc --token xxx
 ./deepseek-harness-launcher.exe --cmd open-console     # 打开进度窗口
 ./deepseek-harness-launcher.exe --cmd test             # 全流程自测
 ```

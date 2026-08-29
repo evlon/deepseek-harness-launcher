@@ -619,7 +619,7 @@ mod tests {
             total_pkgs: 10,
             done_pkgs: 3,
             current_pkg: "zod@4.4.3".to_string(),
-            registry: "https://registry.ict.cmcc".to_string(),
+            registry: "http://registry.ict.cmcc".to_string(),
             ..Default::default()
         };
         let json = serde_json::to_string(&p).unwrap();

@@ -53,7 +53,7 @@ function defaultConfig() {
     plugins: [],
     managedMenu: { enabled: false, quickLinks: [] },
     clientDefaults: {},
-    mirrorSettings: { registry: "https://registry.ict.cmcc", tokenValue: "" },
+    mirrorSettings: { registry: "http://registry.ict.cmcc", tokenValue: "" },
     updatedAt: new Date().toISOString(),
     baseUrl: "",
   };
@@ -77,7 +77,7 @@ function normalizeConfig(cfg) {
       cfg.clientDefaults = {};
     }
     if (typeof cfg.mirrorSettings !== "object" || cfg.mirrorSettings === null) {
-      cfg.mirrorSettings = { registry: "https://registry.ict.cmcc", tokenValue: "" };
+      cfg.mirrorSettings = { registry: "http://registry.ict.cmcc", tokenValue: "" };
     }
     if (typeof cfg.plugins !== "object" || !Array.isArray(cfg.plugins)) cfg.plugins = [];
   }
@@ -212,7 +212,7 @@ const REGISTRIES = [
   { url: "https://registry.npmmirror.com", label: "npmmirror" },
   // 内网 registry（如企业私服）：命中即优先，放在最后作兜底
 ];
-// 允许通过环境变量注入内网 registry（server 启动时 REGISTRY_OVERRIDE=https://registry.ict.cmcc）
+// 允许通过环境变量注入内网 registry（server 启动时 REGISTRY_OVERRIDE=http://registry.ict.cmcc）
 if (process.env.REGISTRY_OVERRIDE) {
   REGISTRIES.unshift({ url: process.env.REGISTRY_OVERRIDE.replace(/\/+$/, ""), label: "内网" });
 }
@@ -372,7 +372,7 @@ async function route(req, res) {
         cleanedMs.tokenValue = ms.tokenValue.trim();
       }
       cfg.mirrorSettings = Object.assign(
-        { registry: "https://registry.ict.cmcc", tokenValue: "" },
+        { registry: "http://registry.ict.cmcc", tokenValue: "" },
         cleanedMs
       );
     }
@@ -751,7 +751,7 @@ function adminPageHtml() {
         <div class="card-desc">此处配置的 registry 同时用于：① 上方插件清单的「同步状态」检查与「同步」按钮；② 把「应装插件 + 全部依赖」上传（镜像）到该 registry</div></div>
       </div>
       <div class="row" style="margin-bottom:10px">
-        <input class="input" id="mirrorRegistry" placeholder="内网 registry（如 https://registry.ict.cmcc）">
+        <input class="input" id="mirrorRegistry" placeholder="内网 registry（如 http://registry.ict.cmcc）">
         <input class="input" type="password" id="mirrorToken" placeholder="发布 token（NODE_AUTH_TOKEN 值，存服务端，调用时传递）" style="max-width:320px">
       </div>
       <div style="margin-bottom:10px;font-size:12.5px;color:var(--muted)">token 存于服务端 config.json；点击「开始上传」时经管理能力临时传给管理员 launcher（内存使用，不落盘客户端）。</div>

@@ -113,7 +113,7 @@ pub fn mirror_registry(cfg: &LauncherConfig) -> String {
         .as_ref()
         .and_then(|m| m.registry.clone())
         .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| "https://registry.ict.cmcc".to_string())
+        .unwrap_or_else(|| "http://registry.ict.cmcc".to_string())
 }
 
 /// 是否启用「使用系统 node」（默认 false = 自包含）。

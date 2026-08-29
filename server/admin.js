@@ -55,7 +55,7 @@ function renderClientDefaults(){
   document.getElementById("cdProfile").value=cd.profile||"";
   document.getElementById("cdUseSystemNode").checked=!!cd.useSystemNode;
   const ms=current.mirrorSettings||{};
-  document.getElementById("mirrorRegistry").value=ms.registry||"https://registry.ict.cmcc";
+  document.getElementById("mirrorRegistry").value=ms.registry||"http://registry.ict.cmcc";
   document.getElementById("mirrorToken").value=ms.tokenValue||"";
 }
 async function saveClientDefaults(){
@@ -101,7 +101,7 @@ async function saveMirrorSettings(){
 }
 async function startMirrorUpload(){
   if(!bridgePort){ toast("请先连接管理员本机管理能力（插件策略页顶部）","warn"); return; }
-  const reg=document.getElementById("mirrorRegistry").value.trim()||"https://registry.ict.cmcc";
+  const reg=document.getElementById("mirrorRegistry").value.trim()||"http://registry.ict.cmcc";
   const token=document.getElementById("mirrorToken").value.trim();
   if(!token){ toast("请先配置发布 token（镜像设置）","warn"); return; }
   try{
@@ -303,7 +303,7 @@ let syncRegistryCache="";
 // 同步目标 registry 单一来源：「镜像上传」卡片的 mirrorRegistry（避免两处配置困惑）
 function syncRegistryUrl(){
   const v=document.getElementById("mirrorRegistry").value.trim();
-  return v||"https://registry.ict.cmcc";
+  return v||"http://registry.ict.cmcc";
 }
 async function checkRegistryStatus(names){
   const reg=syncRegistryUrl().replace(/\/+$/,"");
