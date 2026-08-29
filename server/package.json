@@ -1,6 +1,6 @@
 {
   "name": "dsh-launcher-center-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "DeepSeek Harness Launcher 企业中心服务端：推荐插件配置分发 + 客户端同步状态收集（零依赖）。",
   "main": "server.js",
