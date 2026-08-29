@@ -285,6 +285,15 @@ pub fn start_mirror_upload<R: Runtime>(
 
     log::info!("mirror:: 启动上传线程（plugins={}）", plugins.len());
 
+    // 登记到操作状态中心（进度窗口显示）
+    let step_labels: Vec<&str> = if plugins.len() <= 1 {
+        vec!["上传插件及依赖"]
+    } else {
+        vec!["解析依赖树", "上传插件及依赖"]
+    };
+    crate::ops::start_op(app, "mirror", "同步到内网 registry", &step_labels);
+    crate::ops::update_step(app, "准备上传…");
+
     // 用独立 std::thread + 自建 tokio runtime 执行上传：
     // 不依赖 tauri::async_runtime（从 bridge 的 std::thread 调用 spawn 会阻塞主线程事件循环，
     // 导致 HTTP 响应发不出去——实测 start 挂起、进度却显示 running）。
@@ -299,7 +308,16 @@ pub fn start_mirror_upload<R: Runtime>(
             let timeout = std::time::Duration::from_secs(MIRROR_TOTAL_TIMEOUT_SECS);
             let result = tokio::time::timeout(timeout, run_mirror(&h, &cfg, &registry, &token, plugins)).await;
             match result {
-                Ok(inner) => { let _ = inner; }
+                Ok(inner) => {
+                    let _ = inner;
+                    // 结束时 ops 收尾（run_mirror 内已标记进度；此处根据最终状态收尾）
+                    let p = load_progress(&h, &cfg);
+                    if p.state == "done" {
+                        crate::ops::finish_op(&h, &format!("已同步 {} 个包到 {}", p.done_pkgs, p.registry));
+                    } else if p.state == "error" {
+                        crate::ops::fail_op(&h, &p.error);
+                    }
+                }
                 Err(_) => {
                     // 超时：强制标记失败
                     let mut p = load_progress(&h, &cfg);
@@ -307,6 +325,7 @@ pub fn start_mirror_upload<R: Runtime>(
                     p.error = format!("上传超时（{} 分钟），已自动终止——网络可能不通，请重试", MIRROR_TOTAL_TIMEOUT_SECS / 60);
                     p.finished_at = now_iso();
                     save_progress(&h, &cfg, &p);
+                    crate::ops::fail_op(&h, &p.error);
                     log::error!("镜像上传整体超时，已标记失败");
                 }
             }
@@ -334,6 +353,7 @@ async fn run_mirror<R: Runtime>(
             ..Default::default()
         };
         save_progress(app, cfg, &p);
+        crate::ops::fail_op(app, "应装清单为空，无可上传");
         return Ok(());
     }
 
@@ -363,6 +383,7 @@ async fn run_mirror<R: Runtime>(
                 p.error = format!("解析 {plugin} 依赖树失败：{e}");
                 p.finished_at = now_iso();
                 save_progress(app, cfg, &p);
+                crate::ops::fail_op(app, &p.error);
                 return Ok(());
             }
         };
@@ -377,12 +398,20 @@ async fn run_mirror<R: Runtime>(
     p.total_pkgs = all_pkgs.len();
     save_progress(app, cfg, &p);
     log::info!("依赖树解析完成：共 {} 个包（含依赖）", all_pkgs.len());
+    // 进度窗口：解析完成 → 上传步骤
+    if plugins.len() > 1 {
+        crate::ops::mark_step_running(app, 1);
+    }
+    crate::ops::update_step(app, &format!("依赖树解析完成，共 {} 个包", all_pkgs.len()));
 
     let mut errors: Vec<String> = Vec::new();
     for (i, (name, version)) in all_pkgs.iter().enumerate() {
         let mut cur = load_progress(app, cfg);
         cur.current_pkg = format!("{name}@{version}");
         save_progress(app, cfg, &cur);
+        // 进度窗口：当前包 + 进度
+        crate::ops::update_step(app, &format!("上传 [{}/{}] {}@{}…", i + 1, all_pkgs.len(), name, version));
+        crate::ops::append_log(app, &format!("上传 {name}@{version}…"));
 
         match upload_one_pkg(name, version, registry, token) {
             Ok(()) => {
@@ -419,19 +448,33 @@ fn upload_one_pkg(name: &str, version: &str, registry: &str, token: &str) -> Res
     let tarball = find_tarball(&tmp)?;
 
     // 2. npm publish（认证：NODE_AUTH_TOKEN 环境变量，token 由管理页传递，不落盘）
+    // 预发布版本（含 - 后缀，如 0.1.1-rc.2）必须显式 --tag（npm 规则）
+    let mut publish_args = vec![
+        "publish".to_string(),
+        tarball.to_string_lossy().to_string(),
+        "--registry".to_string(),
+        registry.to_string(),
+        "--access".to_string(),
+        "public".to_string(),
+    ];
+    if is_prerelease(version) {
+        publish_args.push("--tag".to_string());
+        publish_args.push("next".to_string());
+    }
     let mut envs: Vec<(String, String)> = Vec::new();
     if !token.is_empty() {
         envs.push(("NODE_AUTH_TOKEN".to_string(), token.to_string()));
     }
     let _ = pack_out;
-    run_npm(
-        &tmp,
-        &["publish", &tarball.to_string_lossy(), "--registry", registry, "--access", "public"],
-        &envs,
-    )?;
+    run_npm(&tmp, &publish_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &envs)?;
 
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
+}
+
+/// 是否预发布版本（含 `-` 后缀，如 0.1.1-rc.2 / 1.0.0-beta.1）。
+fn is_prerelease(version: &str) -> bool {
+    version.contains('-')
 }
 
 /// npm 单次命令超时（秒）：pack / publish 网络慢或卡死时防止永久挂起。
@@ -625,5 +668,17 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"state\":\"running\""));
         assert!(json.contains("\"total_pkgs\":10"));
+    }
+
+    #[test]
+    fn prerelease_detection() {
+        // 预发布版本（含 - 后缀）→ 需要 --tag
+        assert!(is_prerelease("0.1.1-rc.2"));
+        assert!(is_prerelease("1.0.0-beta.1"));
+        assert!(is_prerelease("2.3.4-alpha"));
+        // 正式版本 → 不需要 --tag
+        assert!(!is_prerelease("0.2.2"));
+        assert!(!is_prerelease("1.0.0"));
+        assert!(!is_prerelease("0.1.0"));
     }
 }
