@@ -57,7 +57,6 @@ function renderClientDefaults(){
   const ms=current.mirrorSettings||{};
   document.getElementById("mirrorRegistry").value=ms.registry||"https://registry.ict.cmcc";
   document.getElementById("mirrorToken").value=ms.tokenValue||"";
-  document.getElementById("syncRegistry").value=ms.registry||"https://registry.ict.cmcc";
 }
 async function saveClientDefaults(){
   try{
@@ -301,8 +300,9 @@ async function renderPlugins(){
 
 // ── 同步状态查询（管理页浏览器直查内网 registry） ──
 let syncRegistryCache="";
+// 同步目标 registry 单一来源：「镜像上传」卡片的 mirrorRegistry（避免两处配置困惑）
 function syncRegistryUrl(){
-  const v=document.getElementById("syncRegistry").value.trim();
+  const v=document.getElementById("mirrorRegistry").value.trim();
   return v||"https://registry.ict.cmcc";
 }
 async function checkRegistryStatus(names){

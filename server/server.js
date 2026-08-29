@@ -710,10 +710,10 @@ function adminPageHtml() {
         <button class="btn primary" onclick="addPlugin()">＋ 添加</button>
       </div>
       <div class="row" style="margin-bottom:14px;flex-wrap:wrap;gap:8px">
-        <input class="input" id="syncRegistry" placeholder="同步目标 registry（如 https://registry.ict.cmcc）" style="max-width:300px">
         <button class="btn" onclick="checkAllSyncStatus()">⟳ 刷新同步状态</button>
         <button class="btn primary" id="syncAllBtn" onclick="syncAllPlugins()">🚀 同步全部未同步</button>
         <span class="sync-hint" id="syncState"></span>
+        <span style="color:var(--faint);font-size:12px">同步目标：下方「镜像上传」卡片的 registry</span>
       </div>
       <div id="syncProgress" style="margin-bottom:12px"></div>
       <div class="plugin-cards" id="pluginList"></div>
@@ -747,8 +747,8 @@ function adminPageHtml() {
     </div>
     <div class="card">
       <div class="card-head">
-        <div><h2 class="card-title">镜像上传（同步到内网 registry）</h2>
-        <div class="card-desc">管理员 launcher 把「应装插件 + 全部依赖」上传到内网 registry（需连接管理能力，管理员机配 NODE_AUTH_TOKEN）</div></div>
+        <div><h2 class="card-title">内网 registry（镜像上传 + 同步状态）</h2>
+        <div class="card-desc">此处配置的 registry 同时用于：① 上方插件清单的「同步状态」检查与「同步」按钮；② 把「应装插件 + 全部依赖」上传（镜像）到该 registry</div></div>
       </div>
       <div class="row" style="margin-bottom:10px">
         <input class="input" id="mirrorRegistry" placeholder="内网 registry（如 https://registry.ict.cmcc）">
