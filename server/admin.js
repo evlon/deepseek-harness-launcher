@@ -25,21 +25,54 @@ document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
   document.getElementById("view-"+t.dataset.view).classList.add("active");
 }));
 
-// ── 口令 ──
-function openTokenModal(){ document.getElementById("tokenInput").value=TOKEN; document.getElementById("tokenMask").classList.add("show"); }
-function closeTokenModal(){ document.getElementById("tokenMask").classList.remove("show"); }
-document.getElementById("tokenMask").addEventListener("click",e=>{ if(e.target.id==="tokenMask") closeTokenModal(); });
-function saveToken(){
+// ── 登录门禁 ──
+// 页面加载先验证 token：403 → 锁定全屏登录；通过 → 正常加载数据
+function openTokenModal(){
+  const ti=document.getElementById("tokenInput");
+  if(ti) ti.value=TOKEN;
+  showLoginGate();
+}
+function showLoginGate(){
+  const m=document.getElementById("tokenMask");
+  if(m) m.classList.add("show");
+  const err=document.getElementById("tokenError");
+  if(err) err.style.display="none";
+}
+function hideLoginGate(){
+  const m=document.getElementById("tokenMask");
+  if(m) m.classList.remove("show");
+}
+// 验证当前 TOKEN 是否有效（调 /api/status——GET 需 token；/api/config GET 是公开的不适合）
+async function verifyToken(){
+  try{
+    const r=await fetch("/api/status",{headers:headers(false)});
+    if(r.ok) return true;
+    if(r.status===403) return false;
+    return true; // 其他错误（网络等）不锁页面
+  }catch(e){ return true; }
+}
+async function saveToken(){
   TOKEN=document.getElementById("tokenInput").value.trim();
   localStorage.setItem("adminToken",TOKEN);
-  closeTokenModal(); toast("管理口令已保存","ok");
-  refreshAll();
+  const err=document.getElementById("tokenError");
+  // 用新 token 验证（/api/status 需 token）
+  try{
+    const r=await fetch("/api/status",{headers:headers(false)});
+    if(r.ok){
+      if(err) err.style.display="none";
+      hideLoginGate(); toast("登录成功","ok");
+      refreshAll();
+    } else {
+      if(err) err.style.display="block";
+    }
+  }catch(e){ hideLoginGate(); refreshAll(); }
 }
 
 // ── 数据加载 ──
 async function loadConfig(){
   try{
     const r=await fetch("/api/config"); const j=await r.json();
+    if(r.status===403){ showLoginGate(); return; }
     if(!r.ok){ throw new Error((j&&j.error)||("HTTP "+r.status)); }
     current=j; current.managedMenu=current.managedMenu||{enabled:false,quickLinks:[]};
     current.clientDefaults=current.clientDefaults||{};
@@ -171,9 +204,9 @@ async function pollMirrorProgress(){
 async function loadStatus(){
   try{
     const r=await fetch("/api/status",{headers:headers(false)}); const j=await r.json();
+    if(r.status===403){ showLoginGate(); return; }
     if(!r.ok){
-      if(r.status===403){ toast("管理口令错误或未设置，点右上角「管理口令」配置","warn"); }
-      else throw new Error((j&&j.error)||("HTTP "+r.status));
+      throw new Error((j&&j.error)||("HTTP "+r.status));
       return;
     }
     latestClients=j.clients||[];
@@ -561,5 +594,17 @@ function renderClients(){
 }
 
 // ── 启动 ──
-refreshAll();
+// 先验证 token：有效 → 加载数据；无效 → 锁定登录门禁
+(async()=>{
+  const ok=await verifyToken();
+  if(ok){
+    hideLoginGate();
+    refreshAll();
+  } else {
+    showLoginGate();
+    // 预填上次输入的 token（方便重试）
+    const ti=document.getElementById("tokenInput");
+    if(ti && TOKEN) ti.value=TOKEN;
+  }
+})();
 setInterval(loadStatus, 15000);

@@ -791,19 +791,19 @@ function adminPageHtml() {
   </section>
 </main>
 
-<!-- 口令弹窗 -->
+<!-- 登录门禁：口令验证通过前锁定管理页（不可关闭） -->
 <div class="mask" id="tokenMask">
   <div class="modal">
     <h3>管理口令</h3>
-    <div class="desc">输入服务端启动时的 <code>--token</code> 值（未设置则留空）。保存后存于本浏览器。</div>
+    <div class="desc">输入服务端启动时的 <code>--token</code> 值（未设置则留空）。验证通过后进入管理页。</div>
     <div class="field">
       <label>管理口令</label>
-      <input class="input" type="password" id="tokenInput" placeholder="如 test123">
+      <input class="input" type="password" id="tokenInput" placeholder="如 local-admin" onkeydown="if(event.key==='Enter')saveToken()">
     </div>
     <div class="row" style="justify-content:flex-end">
-      <button class="btn" onclick="closeTokenModal()">取消</button>
-      <button class="btn primary" onclick="saveToken()">保存</button>
+      <button class="btn primary" id="tokenSaveBtn" onclick="saveToken()">登录</button>
     </div>
+    <div class="desc" id="tokenError" style="color:var(--red);display:none">口令错误，请重试</div>
   </div>
 </div>
 
