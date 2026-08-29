@@ -24,10 +24,8 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| handle_menu_event(app, event))
         .on_tray_icon_event(|tray, event| {
-            // 点击托盘图标时刷新菜单，让「启动/停止」按当前运行状态实时可用
-            if let TrayIconEvent::Click { .. } = event {
-                refresh_sync_menu(tray.app_handle());
-            }
+            // 注意：不要在 Click 事件里重建菜单（Windows 右键弹出菜单的同时
+            // set_menu 会导致菜单弹不出来）。菜单状态在操作完成后刷新即可。
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 ..
