@@ -307,10 +307,17 @@ fn handle_conn<R: Runtime>(mut stream: TcpStream, app: &AppHandle<R>, token: &st
     if !is_health {
         let auth_ok = token.is_empty() || req_has_token(&req, token);
         if !auth_ok {
+            log::warn!(
+                "管理能力：token 校验失败（path={} method={} query_token={:?}）",
+                req.path,
+                req.method,
+                req.query.get("token")
+            );
             send_json(&mut stream, 403, serde_json::json!({ "error": "invalid bridge token" }));
             return;
         }
     }
+    log::info!("管理能力：路由 {} {}", req.method, req.path);
 
     // 路由分发
     let resp: serde_json::Value = match (req.method.as_str(), req.path.as_str()) {

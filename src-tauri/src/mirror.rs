@@ -237,10 +237,28 @@ pub fn start_mirror_upload<R: Runtime>(
     token: &str,
     only: Option<String>,
 ) -> Result<(), String> {
-    // 已在运行 → 拒绝
+    log::info!("mirror::start_mirror_upload 进入：registry={registry} only={:?}", only);
+    // 已在运行 → 拒绝；但陈旧 running（启动超过 30 分钟无更新）视为卡死，自动重置
     let p = load_progress(app, cfg);
+    log::info!("mirror::start_mirror_upload 已读进度：state={}", p.state);
     if p.state == "running" {
-        return Err("UPLOAD_ALREADY_RUNNING: 上传正在进行中".to_string());
+        // 检测是否陈旧（started_at 距今超过整体超时 → 上次任务已死/被中断）
+        let stale = p
+            .started_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .ok()
+            .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds() as u64 > MIRROR_TOTAL_TIMEOUT_SECS)
+            .unwrap_or(false);
+        if stale {
+            log::warn!("检测到陈旧的 running 上传（启动于 {}），视为卡死并重置", p.started_at);
+            let mut reset = p.clone();
+            reset.state = "error".to_string();
+            reset.error = "上次上传中断（进程退出/崩溃），已自动重置".to_string();
+            reset.finished_at = now_iso();
+            save_progress(app, cfg, &reset);
+        } else {
+            return Err("UPLOAD_ALREADY_RUNNING: 上传正在进行中".to_string());
+        }
     }
 
     let h = app.clone();
@@ -259,10 +277,28 @@ pub fn start_mirror_upload<R: Runtime>(
     }
 
     tauri::async_runtime::spawn(async move {
-        let _ = run_mirror(&h, &cfg, &registry, &token, plugins).await;
+        // 整体超时（默认 30 分钟）：防止网络卡死导致永久 running，
+        // 用户后续 mirror/start 一直被「上传进行中」拒绝。
+        let timeout = std::time::Duration::from_secs(MIRROR_TOTAL_TIMEOUT_SECS);
+        let result = tokio::time::timeout(timeout, run_mirror(&h, &cfg, &registry, &token, plugins)).await;
+        match result {
+            Ok(inner) => { let _ = inner; }
+            Err(_) => {
+                // 超时：强制标记失败
+                let mut p = load_progress(&h, &cfg);
+                p.state = "error".to_string();
+                p.error = format!("上传超时（{} 分钟），已自动终止——网络可能不通，请重试", MIRROR_TOTAL_TIMEOUT_SECS / 60);
+                p.finished_at = now_iso();
+                save_progress(&h, &cfg, &p);
+                log::error!("镜像上传整体超时，已标记失败");
+            }
+        }
     });
     Ok(())
 }
+
+/// 镜像上传整体超时（秒）——防止网络卡死导致永久 running。
+const MIRROR_TOTAL_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// 实际执行上传（async）。
 async fn run_mirror<R: Runtime>(
