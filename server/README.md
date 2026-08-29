@@ -11,8 +11,11 @@ cd server
 node server.js --port 8080 --token 你的管理口令
 ```
 
+- **跨平台**：纯 Node.js（`node:http`/`node:fs`/`node:path`），Linux / Windows / macOS 均可运行，
+  服务端包不区分平台（一个 zip 通用）。
 - 无任何 npm 依赖，只要 Node.js ≥ 18。
 - 默认数据目录 `./data`（可用 `--data <dir>` 指定）；`config.json` 与 `clients/` 自动创建。
+- 建议部署在 Linux 服务器：`nohup node server.js --port 8080 --token xxx &` 或配 systemd 常驻。
 
 ## 端点
 
