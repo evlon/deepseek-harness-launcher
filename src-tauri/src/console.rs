@@ -15,8 +15,10 @@ pub fn open_console<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         return Ok(());
     }
 
-    // 用自定义协议加载内嵌 HTML（data: URL 被 Tauri 2 External 安全策略拦截）
-    let url = WebviewUrl::External("console://localhost/index.html".parse().map_err(|e: url::ParseError| e.to_string())?);
+    // 用自定义协议加载内嵌 HTML。
+    // Windows 上 custom protocol 的访问地址是 http://<scheme>.localhost/<path>
+    // （tauri 文档：Windows/Android 用 http，非 console:// 形式）
+    let url = WebviewUrl::External("http://console.localhost/index.html".parse().map_err(|e: url::ParseError| e.to_string())?);
 
     let window = WebviewWindowBuilder::new(app, "op-console", url)
         .title("操作进度")
@@ -33,11 +35,13 @@ pub fn open_console<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // 推送当前状态（若窗口刚建好时已有操作）；无操作则显示日志文件尾部
     match crate::ops::current() {
         Some(op) => {
+            log::info!("进度窗口：推送当前操作 state={:?} label={}", op.state, op.label);
             let _ = app.emit("op-update", op);
         }
         None => {
             // 无进行中操作：显示日志文件尾部（让窗口有内容）
             let tail = read_log_tail(app, 200);
+            log::info!("进度窗口：无操作，显示日志尾部 {} 行", tail.len());
             let op = crate::ops::Operation {
                 id: "log-view".to_string(),
                 label: "运行日志".to_string(),
@@ -63,8 +67,12 @@ fn read_log_tail<R: Runtime>(app: &AppHandle<R>, n: usize) -> Vec<String> {
 }
 
 /// 操作窗口的内嵌 HTML（由 main.rs 注册的 `console://` 协议返回）。
+/// 初始状态直接内嵌（custom protocol 下无 Tauri IPC，JS 用轮询 /state 更新）。
 pub fn console_html() -> String {
-    r#"<!doctype html>
+    let initial = crate::ops::current()
+        .map(|op| serde_json::to_string(&op).unwrap_or_else(|_| "null".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let html = r#"<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -152,15 +160,29 @@ pub fn console_html() -> String {
     statusEl.style.color = op.state==="failed" ? "var(--red)" : (op.state==="done" ? "var(--green)" : "var(--muted)");
   }
 
-  // 监听更新
-  window.__TAURI__ && window.__TAURI__.event.listen("op-update", (e)=>{ render(e.payload); });
-  // 加载完成后拉取当前状态（避免事件在 JS 就绪前发出而丢失）
-  window.addEventListener("load", ()=>{
-    fetch("console://localhost/state").then(r=>r.json()).then(op=>render(op)).catch(()=>{});
-  });
+  // 初始状态（协议 handler 内嵌）：custom protocol 下无 Tauri IPC/事件，
+  // 用内嵌初始状态 + 轮询 /state 更新。
+  // 心跳：确认 JS 已执行（协议日志可见 /ping）
+  fetch("http://console.localhost/ping").catch(()=>{});
+  const INITIAL = `__INITIAL_STATE__`;
+  let lastJson = "";
+  function applyState(json){
+    if(json===lastJson) return;
+    lastJson=json;
+    let op=null;
+    try{ op=JSON.parse(json); }catch(e){ return; }
+    render(op);
+  }
+  if(INITIAL && INITIAL!=="null") applyState(INITIAL);
+  // 轮询 /state（每 1.5s）
+  setInterval(()=>{
+    fetch("http://console.localhost/state").then(r=>r.text()).then(applyState).catch(()=>{});
+  }, 1500);
 })();
 </script>
 </body>
-</html>"#
-        .to_string()
+</html>"#.to_string();
+    // 内嵌初始状态（替换占位符；JSON 需转义避免破坏 JS 字符串）
+    let escaped = initial.replace('\\', "\\\\").replace('`', "\\`").replace("${", "\\${");
+    html.replace("__INITIAL_STATE__", &escaped)
 }

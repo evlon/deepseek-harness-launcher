@@ -31,9 +31,18 @@ fn main() {
             use tauri::http::Response;
             // /state → 当前操作状态 JSON（窗口加载后拉取）
             let path = request.uri().path().to_string();
+            log::info!("console:// 协议请求：{}", path);
+            if path == "/ping" {
+                log::info!("console:// JS 心跳：脚本已执行");
+                return Response::builder()
+                    .header("Content-Type", "text/plain")
+                    .body("pong".into())
+                    .unwrap_or_default();
+            }
             if path == "/state" {
                 let op = ops::current();
                 let body = serde_json::to_string(&op).unwrap_or_else(|_| "null".to_string());
+                log::info!("console:// /state 返回：{}", &body[..body.len().min(120)]);
                 return Response::builder()
                     .header("Content-Type", "application/json; charset=utf-8")
                     .body(body.into_bytes())
@@ -43,6 +52,11 @@ fn main() {
             let html = console::console_html();
             Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
+                // 关键：允许内联脚本 + 本协议 fetch（Tauri 默认注入的 CSP 会拦内联 JS）
+                .header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' http://console.localhost",
+                )
                 .body(html.into_bytes())
                 .unwrap_or_default()
         })
