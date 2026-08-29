@@ -70,6 +70,17 @@ cargo build --release  # 发布版
 ./target/debug/deepseek-harness-launcher.exe
 ```
 
+## 发布（GitHub Actions）
+
+打 tag（如 `v0.1.0`）自动触发 `.github/workflows/release.yml` 构建并发布 GitHub Release：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Release 产物（zip）：主程序 exe + `server/`（中心服务端）+ `launcher-brand/`（品牌插件）+ 配置示例。
+
 运行单元测试：
 
 ```bash

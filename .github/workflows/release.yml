@@ -1,0 +1,78 @@
+name: Release
+
+# 打 tag（如 v0.1.0）时自动构建并发布 GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: deepseek-harness-launcher-windows-x64.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust 工具链（edition 2021，稳定版）
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 缓存 cargo 依赖（加速重复构建）
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Windows 构建需要 WebView2（runner 自带）+ MSVC 链接器（windows-latest 自带）
+      - name: Build (release)
+        shell: bash
+        run: |
+          # tauri-build 读 tauri.conf.json 的 frontendDist（../dist），无窗口应用
+          # 不需要前端产物，但目录必须存在（避免构建告警/失败）
+          mkdir -p dist
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+        env:
+          RUST_BACKTRACE: 1
+
+      # 组装发布产物：主程序 exe + 服务端 + 品牌插件
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/launcher/server, dist/launcher/launcher-brand | Out-Null
+          Copy-Item src-tauri/target/release/deepseek-harness-launcher.exe dist/launcher/
+          # 服务端（零依赖 node 脚本 + 管理页 JS + 文档）
+          Copy-Item server/server.js, server/admin.js, server/package.json, server/README.md, server/INTEGRATION-CADDY.md dist/launcher/server/
+          # 品牌插件
+          Copy-Item launcher-brand/* dist/launcher/launcher-brand/ -Recurse -Force
+          # 配置示例
+          Copy-Item launcher-config.json.example dist/launcher/
+          # 压缩（PowerShell 内置 Compress-Archive，无需 7z）
+          Compress-Archive -Path dist/launcher -DestinationPath ${{ matrix.artifact }} -Force
+          Get-Item ${{ matrix.artifact }} | Select-Object Name, Length
+
+      # 发布 GitHub Release（含 tag 版本号）
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
+          generate_release_notes: true
+          name: DeepSeek Harness Launcher ${{ github.ref_name }}
