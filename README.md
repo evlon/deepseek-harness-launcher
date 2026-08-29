@@ -74,6 +74,25 @@ cargo build --release  # 发布版
 ./target/debug/deepseek-harness-launcher.exe
 ```
 
+## CLI 与 IPC（测试/自动化）
+
+程序支持命令行控制（执行后退出）与 IPC 命令（常驻实例可调用），共享执行核心，便于自动化测试：
+
+```bash
+# CLI：一次性执行后退出
+./deepseek-harness-launcher.exe --cmd status --json   # 查询状态
+./deepseek-harness-launcher.exe --cmd install          # 安装/修复
+./deepseek-harness-launcher.exe --cmd launch           # 启动 Harness
+./deepseek-harness-launcher.exe --cmd stop             # 停止
+./deepseek-harness-launcher.exe --cmd sync             # 立即同步
+./deepseek-harness-launcher.exe --cmd speedtest        # 测速
+./deepseek-harness-launcher.exe --cmd mirror --registry https://registry.ict.cmcc --token xxx
+./deepseek-harness-launcher.exe --cmd open-console     # 打开进度窗口
+./deepseek-harness-launcher.exe --cmd test             # 全流程自测
+```
+
+IPC 命令（`invoke('cmd_status')` 等，与 CLI 一一对应）：`cmd_install` / `cmd_launch` / `cmd_stop` / `cmd_sync` / `cmd_speedtest` / `cmd_mirror` / `cmd_status` / `cmd_open_console`。
+
 ## 发布（GitHub Actions）
 
 打 tag（如 `v0.1.0`）自动触发 `.github/workflows/release.yml` 构建并发布 GitHub Release：

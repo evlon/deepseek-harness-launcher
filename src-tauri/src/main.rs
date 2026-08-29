@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod admin_bridge;
+mod cli;
+mod commands;
 mod config;
 mod console;
 mod download;
@@ -16,6 +18,31 @@ mod tray;
 mod workflow;
 
 fn main() {
+    // 解析 CLI 参数（--cmd 等）
+    let cli_args = cli::parse_args();
+    let cli_mode = cli::is_cli_mode(&cli_args);
+
+    // CLI 模式：也需要 Tauri 初始化（路径/配置/下载依赖 AppHandle），
+    // 但 build 后不 run 事件循环——执行命令后直接退出。
+    if cli_mode {
+        let app = tauri::Builder::default()
+            .plugin(tauri_plugin_notification::init())
+            .build(tauri::generate_context!())
+            .expect("error building launcher (cli)");
+        let handle = app.handle().clone();
+
+        // 日志
+        let log_path = config::log_file(&handle);
+        logging::init(&log_path);
+        config::ensure_base_dir(&handle);
+        let _ = config::load_config(&handle);
+        log::info!("CLI 模式：执行命令 {}", cli_args.cmd.as_deref().unwrap_or(""));
+
+        let code = cli::run_cli(&handle, &cli_args);
+        std::process::exit(code);
+    }
+
+    // 正常常驻模式
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -25,6 +52,17 @@ fn main() {
             log::info!("检测到重复启动，本次实例退出，已有实例继续运行");
             let _ = app;
         }))
+        // IPC 命令（前端/测试脚本通过 invoke 调用常驻实例）
+        .invoke_handler(tauri::generate_handler![
+            commands::cmd_install,
+            commands::cmd_launch,
+            commands::cmd_stop,
+            commands::cmd_sync,
+            commands::cmd_speedtest,
+            commands::cmd_mirror,
+            commands::cmd_status,
+            commands::cmd_open_console,
+        ])
         // 操作进度窗口的内嵌 HTML 协议（console://localhost/index.html）
         // data: URL 在 Tauri 2 External 里被安全策略拦截，改用自定义协议。
         .register_uri_scheme_protocol("console", |_ctx, request| {
