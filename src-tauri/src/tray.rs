@@ -24,6 +24,10 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| handle_menu_event(app, event))
         .on_tray_icon_event(|tray, event| {
+            // 点击托盘图标时刷新菜单，让「启动/停止」按当前运行状态实时可用
+            if let TrayIconEvent::Click { .. } = event {
+                refresh_sync_menu(tray.app_handle());
+            }
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 ..
@@ -139,10 +143,18 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             owned.push(MenuItem::with_id(app, "op-view", "📋 查看进度 / 日志", true, None::<&str>)?);
         }
     }
-    owned.push(MenuItem::with_id(app, "install", "安装 / 修复", true, None::<&str>)?);
-    owned.push(MenuItem::with_id(app, "launch", "启动 Harness", true, None::<&str>)?);
-    owned.push(MenuItem::with_id(app, "open-page", "打开 Harness 页面", true, None::<&str>)?);
-    owned.push(MenuItem::with_id(app, "stop", "停止 Harness", true, None::<&str>)?);
+    // Harness 运行状态：菜单项按状态动态可用
+    // 运行中 → 只能「停止」「打开页面」；未运行 → 只能「启动」
+    let running = crate::workflow::is_running();
+    let launch_enabled = !running && !crate::ops::has_running();
+    let stop_enabled = running;
+    let open_page_enabled = running;
+    let install_enabled = !crate::ops::has_running();
+
+    owned.push(MenuItem::with_id(app, "install", "安装 / 修复", install_enabled, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "launch", "启动 Harness", launch_enabled, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "open-page", "打开 Harness 页面", open_page_enabled, None::<&str>)?);
+    owned.push(MenuItem::with_id(app, "stop", "停止 Harness", stop_enabled, None::<&str>)?);
     owned.push(MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?);
     owned.push(MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?);
 
