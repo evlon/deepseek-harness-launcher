@@ -191,21 +191,27 @@ async function autoDetectBridge(){
   // 尝试常用端口（可配置），确认本机管理能力真的开启
   const candidates=[parseInt(localStorage.getItem("bridgePort")||"0",10)||3410, 3410];
   for(const port of candidates){
+    // fetch 加超时（3s）——防止端口有服务但不响应时永远「检测中…」
+    const ctrl=new AbortController();
+    const timer=setTimeout(()=>ctrl.abort(),3000);
     try{
-      const r=await fetch("http://127.0.0.1:"+port+"/api/health",{headers:headers(false)});
+      const r=await fetch("http://127.0.0.1:"+port+"/api/health",{headers:headers(false),signal:ctrl.signal});
+      clearTimeout(timer);
       if(r.ok){
         const j=await r.json();
         if(j&&j.ok){
           bridgePort=port;
           document.getElementById("bridgePortInput").value=port;
-          // 恢复已保存的 token
+          // 恢复已保存的 token（输入框 + localStorage）
           const saved=localStorage.getItem("bridgeToken")||"";
-          if(saved) document.getElementById("bridgeTokenInput").value=saved;
+          document.getElementById("bridgeTokenInput").value=saved;
+          // 自动连接成功也持久化（刷新不丢）
+          localStorage.setItem("bridgePort",String(port));
           st.innerHTML='<span style="color:var(--green)">✓ 已连接本机管理能力（端口 '+port+'）</span>';
           return;
         }
       }
-    }catch(e){ /* 该端口无服务，继续 */ }
+    }catch(e){ clearTimeout(timer); /* 该端口无服务，继续 */ }
   }
   st.innerHTML='<span style="color:var(--muted)">本机管理能力未连接——同步/上传需管理员在本机 launcher 托盘「管理能力」开启</span>';
 }
@@ -213,17 +219,20 @@ async function setBridgePort(){
   const v=document.getElementById("bridgePortInput").value.trim();
   const p=parseInt(v,10);
   if(!p||p<1||p>65535){ toast("端口无效","warn"); return; }
-  // 验证该端口确实是本机管理能力
+  // 验证该端口确实是本机管理能力（带超时）
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),3000);
   try{
-    const r=await fetch("http://127.0.0.1:"+p+"/api/health",{headers:headers(false)});
+    const r=await fetch("http://127.0.0.1:"+p+"/api/health",{headers:headers(false),signal:ctrl.signal});
+    clearTimeout(timer);
     const j=await r.json();
     if(!r.ok||!j||!j.ok){ toast("该端口不是有效的管理能力服务","warn"); return; }
-  }catch(e){ toast("无法连接该端口（本机管理能力未开启？）","warn"); return; }
+  }catch(e){ clearTimeout(timer); toast("无法连接该端口（本机管理能力未开启？）","warn"); return; }
   bridgePort=p;
   localStorage.setItem("bridgePort",String(p));
-  // 保存连接 token（管理能力鉴权用）
+  // 保存连接 token（无条件写，空则清除旧值）
   const tok=document.getElementById("bridgeTokenInput").value.trim();
-  if(tok) localStorage.setItem("bridgeToken",tok);
+  localStorage.setItem("bridgeToken",tok);
   // 清缓存强制刷新插件信息
   Object.keys(pluginMetaCache).forEach(k=>delete pluginMetaCache[k]);
   renderPlugins();
@@ -233,7 +242,26 @@ function refreshAll(){ loadConfig(); loadStatus(); toast("已刷新","ok"); }
 
 // ── 插件策略 ──
 const pluginMetaCache = {}; // name -> meta
-let bridgePort = null; // 管理员本机管理能力端口（自动探测/手动设置）
+// 管理员本机管理能力端口：从 localStorage 恢复（刷新不丢），无则 null 交给自动探测
+let bridgePort = (()=>{
+  const saved=parseInt(localStorage.getItem("bridgePort")||"0",10);
+  return saved>0&&saved<65536 ? saved : null;
+})();
+// 预填端口 + token 输入框（刷新后可见已保存值）
+if(bridgePort){
+  const fill=()=>{
+    const pi=document.getElementById("bridgePortInput");
+    if(pi){ pi.value=bridgePort; }
+    const ti=document.getElementById("bridgeTokenInput");
+    const tok=localStorage.getItem("bridgeToken")||"";
+    if(ti && tok) ti.value=tok;
+    // 状态栏直接显示已连接（端口已保存）
+    const st=document.getElementById("bridgeState");
+    if(st) st.innerHTML='<span style="color:var(--green)">✓ 已连接本机管理能力（端口 '+bridgePort+'）</span>';
+  };
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",fill);
+  else fill();
+}
 async function fetchPluginMetas(names){
   const need = names.filter(n=>!pluginMetaCache[n]);
   if(need.length){

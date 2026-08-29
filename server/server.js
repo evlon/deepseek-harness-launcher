@@ -700,9 +700,9 @@ function adminPageHtml() {
       <div class="bridge-bar" style="background:#f2f5fc;border:1px solid #dbe3f5;border-radius:9px;padding:8px 12px;margin-bottom:14px;font-size:12.5px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span>🛰 本机管理能力：</span>
         <span id="bridgeState" style="color:var(--muted)">检测中…</span>
-        <input class="input" id="bridgePortInput" placeholder="端口" style="width:80px;padding:4px 8px" value="">
-        <input class="input" id="bridgeTokenInput" type="password" placeholder="连接 token（托盘开启时通知里显示）" style="width:200px;padding:4px 8px" value="">
-        <button class="btn sm" onclick="setBridgePort()">连接</button>
+        <input class="input" id="bridgePortInput" placeholder="端口" style="width:80px;padding:4px 8px" value="" oninput="onBridgeInputChanged()">
+        <input class="input" id="bridgeTokenInput" type="password" placeholder="连接 token（托盘开启时通知里显示）" style="width:200px;padding:4px 8px" value="" oninput="onBridgeInputChanged()">
+        <button class="btn sm primary" id="bridgeBtn" onclick="setBridgePort()">连接</button>
         <span style="color:var(--faint)">（仅连管理页所在电脑的 launcher；token 见管理员本机托盘「开启管理能力」通知）</span>
       </div>
       <div class="row" style="margin-bottom:12px">
