@@ -15,10 +15,8 @@ pub fn open_console<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         return Ok(());
     }
 
-    let html = console_html();
-    let url_str = format!("data:text/html;charset=utf-8,{}", urlencode(&html));
-    let parsed = url_str.parse::<url::Url>().map_err(|e| e.to_string())?;
-    let url = WebviewUrl::External(parsed);
+    // 用自定义协议加载内嵌 HTML（data: URL 被 Tauri 2 External 安全策略拦截）
+    let url = WebviewUrl::External("console://localhost/index.html".parse().map_err(|e: url::ParseError| e.to_string())?);
 
     let window = WebviewWindowBuilder::new(app, "op-console", url)
         .title("操作进度")
@@ -39,28 +37,8 @@ pub fn open_console<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
-fn urlencode(s: &str) -> String {
-    // 极简 URL 编码（HTML 里主要是 ASCII + 少量中文；中文字符原样保留，
-    // 浏览器按 charset=utf-8 解析 data URL）
-    s.chars()
-        .map(|c| match c {
-            '#' => "%23".to_string(),
-            '%' => "%25".to_string(),
-            '"' => "%22".to_string(),
-            '<' => "%3C".to_string(),
-            '>' => "%3E".to_string(),
-            '{' => "%7B".to_string(),
-            '}' => "%7D".to_string(),
-            '|' => "%7C".to_string(),
-            '\\' => "%5C".to_string(),
-            '^' => "%5E".to_string(),
-            '`' => "%60".to_string(),
-            _ => c.to_string(),
-        })
-        .collect()
-}
-
-fn console_html() -> String {
+/// 操作窗口的内嵌 HTML（由 main.rs 注册的 `console://` 协议返回）。
+pub fn console_html() -> String {
     r#"<!doctype html>
 <html lang="zh-CN">
 <head>

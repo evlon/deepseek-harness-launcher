@@ -25,6 +25,16 @@ fn main() {
             log::info!("检测到重复启动，本次实例退出，已有实例继续运行");
             let _ = app;
         }))
+        // 操作进度窗口的内嵌 HTML 协议（console://localhost/index.html）
+        // data: URL 在 Tauri 2 External 里被安全策略拦截，改用自定义协议。
+        .register_uri_scheme_protocol("console", |_ctx, _request| {
+            use tauri::http::Response;
+            let html = console::console_html();
+            Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .body(html.into_bytes())
+                .unwrap_or_default()
+        })
         .setup(|app| {
             let handle = app.handle().clone();
 

@@ -432,8 +432,12 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             }
         }
         "op-view" => {
-            if let Err(e) = crate::console::open_console(app) {
-                notify(app, "无法打开进度窗口", &e);
+            match crate::console::open_console(app) {
+                Ok(()) => {}
+                Err(e) => {
+                    log::error!("无法打开进度窗口：{e}");
+                    notify(app, "无法打开进度窗口", &e);
+                }
             }
         }
         "bridge-start" => {
