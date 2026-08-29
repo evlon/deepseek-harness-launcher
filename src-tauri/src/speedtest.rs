@@ -27,6 +27,37 @@ pub struct SpeedResult {
     pub ok: bool,
 }
 
+/// 最近一次测速结果（进程内缓存，供托盘菜单显示各源速度）。
+static LAST_RESULTS: std::sync::Mutex<Vec<SpeedResult>> = std::sync::Mutex::new(Vec::new());
+
+/// 保存最近一次测速结果。
+pub fn set_last_results(results: Vec<SpeedResult>) {
+    *LAST_RESULTS.lock().unwrap_or_else(|e| e.into_inner()) = results;
+}
+
+/// 读取最近一次测速结果（无则空）。
+pub fn last_results() -> Vec<SpeedResult> {
+    LAST_RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// 查询某个 URL（归一化后）对应的测速延迟；未测过返回 None。
+/// 匹配规则：测速 URL 形如 `<base>/dsh-nested-followups`，传入 base（如
+/// `https://registry.npmjs.org/`）也能匹配（按前缀）。
+pub fn latency_for(url: &str) -> Option<u64> {
+    let normalized = normalize_url(url);
+    last_results()
+        .into_iter()
+        .find(|r| {
+            let rn = normalize_url(&r.url);
+            rn == normalized || rn.starts_with(&format!("{normalized}/"))
+        })
+        .map(|r| r.latency_ms)
+}
+
+fn normalize_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
 /// 测速超时（单个源）。
 const SPEED_TIMEOUT_MS: u64 = 6000;
 

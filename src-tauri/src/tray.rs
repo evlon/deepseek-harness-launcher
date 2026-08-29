@@ -82,29 +82,61 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .collect();
     let url_submenu = Submenu::with_id_and_items(app, "urls", "常用网址", true, &url_items)?;
 
-    // 加速 ▸ npm 源 / GitHub 中转
-    let npm_submenu = Submenu::with_id_and_items(
-        app,
-        "npm",
-        "npm 源",
-        true,
-        &[
-            &MenuItem::with_id(app, "npm-auto", "自动（按地域）", true, None::<&str>)?,
-            &MenuItem::with_id(app, "npm-official", "官方源 npmjs.org", true, None::<&str>)?,
-            &MenuItem::with_id(app, "npm-npmmirror", "npmmirror 镜像", true, None::<&str>)?,
-        ],
-    )?;
-    let gh_submenu = Submenu::with_id_and_items(
-        app,
-        "gh",
-        "GitHub 中转",
-        true,
-        &[
-            &MenuItem::with_id(app, "gh-auto", "自动（按地域）", true, None::<&str>)?,
-            &MenuItem::with_id(app, "gh-none", "直连（无中转）", true, None::<&str>)?,
-            &MenuItem::with_id(app, "gh-ghfast", "ghfast.top 中转", true, None::<&str>)?,
-        ],
-    )?;
+    // 加速 ▸ npm 源 / GitHub 中转（动态：常用源预设 + 当前选择标记 + 测速结果）
+    // npm 源子菜单（测速后显示各源延迟）
+    let npm_rows: Vec<MenuItem<R>> = NPM_REGISTRY_PRESETS
+        .iter()
+        .enumerate()
+        .map(|(i, (label, url))| {
+            let id = format!("npm-preset-{i}");
+            // 当前选中的源打 ✓
+            let active = resolve_npm_registry(&load_cached()) == resolve_preset_url(*url);
+            // 测速结果显示延迟（自动/空地址不显示）
+            let speed = if url.is_empty() {
+                None
+            } else {
+                crate::speedtest::latency_for(url)
+            };
+            let mut text = label.to_string();
+            if let Some(ms) = speed {
+                text.push_str(&format!("  {ms}ms"));
+            }
+            if active && !url.is_empty() {
+                text.push_str("  ✓");
+            }
+            MenuItem::with_id(app, id, text, true, None::<&str>)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let npm_refs: Vec<&dyn tauri::menu::IsMenuItem<R>> = npm_rows
+        .iter()
+        .map(|m| m as &dyn tauri::menu::IsMenuItem<R>)
+        .collect();
+    let npm_submenu = Submenu::with_id_and_items(app, "npm", "npm 源", true, &npm_refs)?;
+
+    // GitHub 中转子菜单（测速后显示各镜像延迟）
+    let gh_rows: Vec<MenuItem<R>> = GH_MIRROR_PRESETS
+        .iter()
+        .enumerate()
+        .map(|(i, (label, url))| {
+            let id = format!("gh-preset-{i}");
+            // 测速结果显示延迟（自动/直连不显示）
+            let speed = if url.is_empty() || *url == "none" {
+                None
+            } else {
+                crate::speedtest::latency_for(url)
+            };
+            let mut text = label.to_string();
+            if let Some(ms) = speed {
+                text.push_str(&format!("  {ms}ms"));
+            }
+            MenuItem::with_id(app, id, text, true, None::<&str>)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let gh_refs: Vec<&dyn tauri::menu::IsMenuItem<R>> = gh_rows
+        .iter()
+        .map(|m| m as &dyn tauri::menu::IsMenuItem<R>)
+        .collect();
+    let gh_submenu = Submenu::with_id_and_items(app, "gh", "GitHub 中转", true, &gh_refs)?;
     // 加速 ▸ npm 源 / GitHub 中转 / 测速
     let speedtest_item = MenuItem::with_id(app, "accel-speedtest", "测速（探测各源延迟）", true, None::<&str>)?;
     let accel_submenu = Submenu::with_id_and_items(
@@ -495,12 +527,20 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 }
             }
         }
-        "npm-auto" => apply_accel(app, "npm", ""),
-        "npm-official" => apply_accel(app, "npm", "https://registry.npmjs.org/"),
-        "npm-npmmirror" => apply_accel(app, "npm", "https://registry.npmmirror.com/"),
-        "gh-auto" => apply_accel(app, "gh", ""),
-        "gh-none" => apply_accel(app, "gh", "none"),
-        "gh-ghfast" => apply_accel(app, "gh", "https://ghfast.top/"),
+        id if id.starts_with("npm-preset-") => {
+            if let Some(i) = id.strip_prefix("npm-preset-").and_then(|s| s.parse::<usize>().ok()) {
+                if let Some((_, url)) = NPM_REGISTRY_PRESETS.get(i) {
+                    apply_accel(app, "npm", url);
+                }
+            }
+        }
+        id if id.starts_with("gh-preset-") => {
+            if let Some(i) = id.strip_prefix("gh-preset-").and_then(|s| s.parse::<usize>().ok()) {
+                if let Some((_, url)) = GH_MIRROR_PRESETS.get(i) {
+                    apply_accel(app, "gh", url);
+                }
+            }
+        }
         "accel-speedtest" => {
             notify(app, "测速", "正在探测各加速源延迟，请稍候…");
             let h = app.clone();
@@ -528,7 +568,11 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 let msg = lines.join("\n");
                 // 结果可能较长，截断到通知上限
                 let msg = if msg.len() > 900 { format!("{}…", &msg[..900]) } else { msg };
-                crate::ops::finish_op(&h, "测速完成（详见结果通知）");
+                // 缓存测速结果（托盘菜单显示各源速度）
+                let mut all = npm.clone();
+                all.extend(gh.clone());
+                crate::speedtest::set_last_results(all);
+                crate::ops::finish_op(&h, "测速完成（菜单「加速设置」可见各源速度）");
                 notify(&h, "加速源测速结果", &msg);
                 refresh_sync_menu(&h);
             });

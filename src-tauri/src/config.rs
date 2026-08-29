@@ -18,6 +18,38 @@ pub enum Region {
     Overseas,
 }
 
+/// 常用 npm registry（托盘「npm 源」子菜单候选，对齐 nrm ls 列表）。
+/// 每项：显示名 + 地址（空地址 = 自动/按地域）。
+pub const NPM_REGISTRY_PRESETS: &[(&str, &str)] = &[
+    ("自动（按地域）", ""),
+    ("npm 官方 npmjs.org", "https://registry.npmjs.org/"),
+    ("npmmirror 镜像（淘宝）", "https://registry.npmmirror.com/"),
+    ("腾讯云 tencent", "https://mirrors.tencent.com/npm/"),
+    ("华为云 huawei", "https://repo.huaweicloud.com/repository/npm/"),
+    ("cnpm", "https://r.cnpmjs.org/"),
+    ("yarn", "https://registry.yarnpkg.com/"),
+    ("npmMirror", "https://skimdb.npmjs.com/registry/"),
+];
+
+/// 常用 GitHub 中转（托盘「GitHub 中转」子菜单候选）。
+pub const GH_MIRROR_PRESETS: &[(&str, &str)] = &[
+    ("自动（按地域）", ""),
+    ("直连（无中转）", "none"),
+    ("ghfast.top", "https://ghfast.top/"),
+    ("ghproxy.net", "https://ghproxy.net/"),
+];
+
+/// 预设 URL 归一化（用于菜单选中标记比较）：
+/// 空/"none" → 空串（表示自动/直连）；否则补尾斜杠。
+pub fn resolve_preset_url(url: &str) -> String {
+    let t = url.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        String::new()
+    } else {
+        ensure_trailing_slash(t)
+    }
+}
+
 /// 可配置网址菜单项
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuickLink {
@@ -1090,6 +1122,7 @@ mod tests {
         let cfg = builtin_default_config();
         assert_eq!(cfg.port, Some(3180), "默认端口应避开 3080");
         assert_eq!(cfg.profile.as_deref(), Some("matrix"), "默认 profile 为 matrix（与 web 区分）");
+        assert_eq!(cfg.server_url.as_deref(), Some("http://ai-conf.ict.cmcc"), "默认同步服务端");
         assert!(cfg.geo_detection.as_ref().map(|g| g.enabled).unwrap_or(false), "IP 检测默认开启");
         assert_eq!(geo_provider(&cfg), DEFAULT_GEO_PROVIDER);
     }
