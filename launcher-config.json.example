@@ -54,10 +54,10 @@
   // 服务端未设 token 时留空即可。
   "adminToken": "",
 
-  // 启动的 Harness profile（缺省 web）。
+  // 启动的 Harness profile（缺省 matrix 数字分身；与 web 常规工作环境区分）。
   // 预置会创建：web（常规）+ matrix（数字分身，dsh-matrix-agent）。
   // 也可在托盘「切换 Profile」菜单里切换。
-  "profile": "web",
+  "profile": "matrix",
 
   // ============================================================
   // 管理能力（外网代理网关，可选）

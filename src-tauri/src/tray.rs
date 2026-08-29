@@ -149,23 +149,45 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let open_page_enabled = running;
     let install_enabled = !crate::ops::has_running();
 
+    // 菜单顺序（按使用频率 + 逻辑分组）：
+    //   操作状态区（动态）
+    //   ── 常用 ──
+    //   启动/停止（互斥可用）→ 打开页面 → 安装/修复
+    //   ── 配置 ──
+    //   切换 Profile → 同步/推荐插件 → 常用网址 → 加速设置
+    //   ── 高级 ──
+    //   管理能力 → 查看日志 → 退出
+    // 菜单顺序（按使用频率 + 逻辑分组）：
+    //   [操作状态区（动态）]
+    //   ── 常用操作 ──
+    //   启动/停止（状态互斥可用）→ 打开页面 → 安装/修复
+    //   ── 配置 ──
+    //   切换 Profile → 同步/推荐插件 → 常用网址 → 加速设置
+    //   ── 高级 ──
+    //   管理能力 → 查看日志 → 退出
     owned.push(MenuItem::with_id(app, "install", "安装 / 修复", install_enabled, None::<&str>)?);
     owned.push(MenuItem::with_id(app, "launch", "启动 Harness", launch_enabled, None::<&str>)?);
     owned.push(MenuItem::with_id(app, "open-page", "打开 Harness 页面", open_page_enabled, None::<&str>)?);
     owned.push(MenuItem::with_id(app, "stop", "停止 Harness", stop_enabled, None::<&str>)?);
-    owned.push(MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?);
-    owned.push(MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?);
 
-    // 固定子菜单（引用）
+    // 固定子菜单（引用）——按分组顺序
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<R>> = owned
         .iter()
         .map(|m| m as &dyn tauri::menu::IsMenuItem<R>)
         .collect();
+    // 配置组
     items.push(&profile_submenu);
-    items.push(&bridge_submenu);
-    items.push(&accel_submenu);
     items.push(&sync_submenu);
     items.push(&url_submenu);
+    items.push(&accel_submenu);
+    // 高级组
+    items.push(&bridge_submenu);
+
+    // 收尾：查看日志 / 退出
+    let log_item = MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    items.push(&log_item);
+    items.push(&quit_item);
 
     let menu = Menu::with_items(app, &items)?;
     Ok(menu)

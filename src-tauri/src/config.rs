@@ -373,11 +373,12 @@ pub fn sync_interval_secs(cfg: &LauncherConfig) -> u64 {
     cfg.sync_interval_secs.unwrap_or(300).max(30)
 }
 
-/// 启动的 Harness profile（缺省 web）。过滤掉非法名字（路径穿越等）。
+/// 启动的 Harness profile（缺省 matrix 数字分身）。过滤掉非法名字（路径穿越等）。
+/// 与用户的 web 区分开：同事默认跑 matrix，web 供需要标准工作环境的用户切换。
 pub fn resolve_profile(cfg: &LauncherConfig) -> String {
-    let p = cfg.profile.as_deref().unwrap_or("web").trim();
+    let p = cfg.profile.as_deref().unwrap_or("matrix").trim();
     if p.is_empty() || p.contains('/') || p.contains('\\') || p == "." || p == ".." {
-        "web".to_string()
+        "matrix".to_string()
     } else {
         p.to_string()
     }
@@ -1079,7 +1080,7 @@ mod tests {
     fn builtin_default_config_has_sane_values() {
         let cfg = builtin_default_config();
         assert_eq!(cfg.port, Some(3180), "默认端口应避开 3080");
-        assert_eq!(cfg.profile.as_deref(), Some("web"));
+        assert_eq!(cfg.profile.as_deref(), Some("matrix"), "默认 profile 为 matrix（与 web 区分）");
         assert!(cfg.geo_detection.as_ref().map(|g| g.enabled).unwrap_or(false), "IP 检测默认开启");
         assert_eq!(geo_provider(&cfg), DEFAULT_GEO_PROVIDER);
     }
@@ -1096,7 +1097,7 @@ mod tests {
         assert_eq!(builtin.port, Some(4080));
         assert_eq!(builtin.server_url.as_deref(), Some("http://server.internal"));
         // 未显式设置的字段保留内置默认
-        assert_eq!(builtin.profile.as_deref(), Some("web"));
+        assert_eq!(builtin.profile.as_deref(), Some("matrix"));
         assert_eq!(builtin.sync_interval_secs, Some(300));
     }
 
@@ -1135,7 +1136,7 @@ mod tests {
         apply_server_overrides(&mut local, &server, &[]);
         assert_eq!(local.port, Some(3180), "非法端口被忽略");
         assert_eq!(local.sync_interval_secs, Some(300), "过小同步间隔被忽略");
-        assert_eq!(local.profile.as_deref(), Some("web"), "非法 profile 被忽略");
+        assert_eq!(local.profile.as_deref(), Some("matrix"), "非法 profile 被忽略，保留内置默认 matrix");
     }
 
     #[test]

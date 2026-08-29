@@ -1,6 +1,6 @@
 {
   "port": 3180,
-  "profile": "web",
+  "profile": "matrix",
   "syncIntervalSecs": 300,
   "geoDetection": {
     "enabled": true,
