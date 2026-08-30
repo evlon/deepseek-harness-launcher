@@ -130,7 +130,7 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
-/// 把服务器推荐的、当前 profile 未装的插件安装到当前 profile。
+/// 把服务器推荐的、当前 profile 未装或版本落后的插件安装/更新到当前 profile。
 /// 失败不阻断（仅日志+通知），避免单个插件问题拖垮整个安装流程。
 async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
     let server_url = resolve_server_url(cfg);
@@ -144,14 +144,19 @@ async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
         log::info!("暂无服务端推荐清单缓存，跳过");
         return Ok(());
     };
-    let installed = crate::sync::installed_plugins_current_profile(app, cfg);
-    let pending = crate::sync::pending_plugins(&recommended, &installed);
+    // 待处理 = 未装 + 已装旧版（版本信息来自同步缓存的 registry 最新版）
+    let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, cfg);
+    let entries = crate::sync::pending_with_updates(&recommended, &installed_with_ver, &state.plugin_latest_versions);
+    let pending: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e["name"].as_str().map(|s| s.to_string()))
+        .collect();
     if pending.is_empty() {
-        log::info!("当前 profile 无待装推荐插件");
+        log::info!("当前 profile 无待装/待更新推荐插件");
         return Ok(());
     }
     let profile = resolve_profile(cfg);
-    log::info!("安装服务器推荐插件到 {profile}：{}", pending.join(", "));
+    log::info!("安装/更新服务器推荐插件到 {profile}：{}", pending.join(", "));
     let result = preset_profile(app, cfg, &profile, &pending).await;
     // 安装结果不影响整体完成（失败有日志 + 托盘可重试）
     if let Err(e) = &result {

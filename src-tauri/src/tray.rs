@@ -382,7 +382,7 @@ fn build_profile_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submen
     Submenu::with_id_and_items(app, "profiles", "切换 Profile", true, &items)
 }
 
-/// 构建「同步 / 推荐插件」子菜单：待装推荐各一条「安装 X」+ 立即同步。
+/// 构建「同步 / 推荐插件」子菜单：待装/待更新推荐各一条 + 立即同步。
 fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R>> {
     let cfg = load_cached();
     let enabled = !resolve_server_url(&cfg).is_empty();
@@ -396,27 +396,42 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
         );
     }
 
-    // 待装清单：优先用缓存的服务端配置（离线也可显示），实时拉取由同步循环负责。
-    // 判断口径 = 当前 profile 已装（服务器推荐装到同事实际运行的 profile）
-    let installed = crate::sync::installed_plugins_current_profile(app, &cfg);
+    // 待装/待更新清单：优先用缓存的服务端配置（离线也可显示）。
+    // 判断口径 = 当前 profile 已装 + registry 最新版本（已装旧版 → 提示更新）
+    let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
     let state = crate::sync::load_state(app, &cfg);
-    let pending: Vec<String> = state
+    let pending_entries: Vec<serde_json::Value> = state
         .cached_config
         .as_ref()
-        .map(|c| crate::sync::pending_plugins(&c.plugins, &installed))
+        .map(|c| {
+            crate::sync::pending_with_updates(
+                &c.plugins,
+                &installed_with_ver,
+                &state.plugin_latest_versions,
+            )
+        })
         .unwrap_or_default();
 
     let mut status_items: Vec<MenuItem<R>> = Vec::new();
     let mut install_items: Vec<MenuItem<R>> = Vec::new();
 
-    if pending.is_empty() {
-        status_items.push(MenuItem::with_id(app, "sync-uptodate", "已是最新（无待装推荐）", false, None::<&str>)?);
+    if pending_entries.is_empty() {
+        status_items.push(MenuItem::with_id(app, "sync-uptodate", "已是最新（无待装/待更新推荐）", false, None::<&str>)?);
     } else {
-        for (i, name) in pending.iter().enumerate() {
+        for (i, entry) in pending_entries.iter().enumerate() {
+            let name = entry["name"].as_str().unwrap_or("").to_string();
+            let action = entry["action"].as_str().unwrap_or("install");
+            let label = if action == "update" {
+                let installed_v = entry["installed"].as_str().unwrap_or("");
+                let latest_v = entry["latest"].as_str().unwrap_or("");
+                format!("更新 {name}（{installed_v} → {latest_v}）")
+            } else {
+                format!("安装 {name}")
+            };
             install_items.push(MenuItem::with_id(
                 app,
                 format!("sync-install-{i}"),
-                format!("安装 {name}"),
+                label,
                 true,
                 None::<&str>,
             )?);
@@ -436,12 +451,16 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
 /// 供菜单点击时取「第 i 个待装插件名」（与 build_sync_submenu 的索引一致）。
 fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<String> {
     let cfg = load_cached();
-    let installed = crate::sync::installed_plugins_current_profile(app, &cfg);
+    let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
     let state = crate::sync::load_state(app, &cfg);
     state
         .cached_config
         .as_ref()
-        .and_then(|c| crate::sync::pending_plugins(&c.plugins, &installed).get(index).cloned())
+        .and_then(|c| {
+            crate::sync::pending_with_updates(&c.plugins, &installed_with_ver, &state.plugin_latest_versions)
+                .get(index)
+                .and_then(|p| p["name"].as_str().map(|s| s.to_string()))
+        })
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {

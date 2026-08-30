@@ -82,6 +82,10 @@ pub struct SyncState {
     /// 菜单策略缓存（服务端下发，托盘渲染时据此展示）。
     #[serde(default)]
     pub cached_managed_menu: Option<ManagedMenu>,
+    /// 各插件 registry 最新版本缓存（name → latest version）。
+    /// 版本检查用：已装插件对比最新版，落后则提示更新。
+    #[serde(default)]
+    pub plugin_latest_versions: std::collections::HashMap<String, String>,
 }
 
 // ---------- 路径 ----------
@@ -163,6 +167,8 @@ static SYNC_MARKER: u8 = 0;
 /// 必须以「同事当前运行的 profile」为准，否则会出现「web 装了、matrix 没装，
 /// 但默认跑 matrix 却提示已装」的矛盾（用户实测：服务器配了 dsh-codebuddy-models，
 /// 装进 web 后默认 matrix 找不到）。
+/// 注：生产用带版本的 `installed_plugins_current_profile_with_versions`；此纯名字版保留供测试。
+#[allow(dead_code)]
 pub fn installed_plugins_current_profile<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
@@ -191,6 +197,45 @@ pub fn installed_plugins_current_profile<R: Runtime>(
         })
         .cloned()
         .collect()
+}
+
+/// 当前生效 profile 已装插件（name → 已装版本）。
+/// 版本读 `<profile>/node_modules/<pkg>/package.json`；读不到则空串（视为未装/异常）。
+pub fn installed_plugins_current_profile_with_versions<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+) -> std::collections::HashMap<String, String> {
+    let profile = resolve_profile(cfg);
+    let profile_dir = dsh_home(app, cfg).join("profiles").join(profile);
+    let manifest = profile_dir.join("package.json");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return std::collections::HashMap::new();
+    };
+    let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) else {
+        return std::collections::HashMap::new();
+    };
+    let mut out = std::collections::HashMap::new();
+    for name in deps.keys() {
+        let nm = profile_dir.join("node_modules");
+        let pkg_dir = match name.split_once('/') {
+            Some((scope, rest)) => nm.join(scope).join(rest),
+            None => nm.join(name),
+        };
+        let pkg_manifest = pkg_dir.join("package.json");
+        if !pkg_manifest.is_file() {
+            continue; // 未真正安装
+        }
+        let version = std::fs::read_to_string(&pkg_manifest)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|j| j.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default();
+        out.insert(name.clone(), version);
+    }
+    out
 }
 
 /// 枚举所有 profile 的插件详情（name/version/description/profile/client）。
@@ -261,9 +306,91 @@ fn read_plugin_info(profile_dir: &Path, name: &str) -> PluginInfo {
     PluginInfo { name: name.to_string(), version, description, client, ..Default::default() }
 }
 
+/// 批量查询推荐插件的 registry 最新版本（npmmirror → npmjs，带缓存）。
+/// 更新 `state.plugin_latest_versions`；返回 name → latest 的 map。
+/// 网络失败保留旧缓存，不阻断同步。
+async fn refresh_plugin_latest_versions<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+    recommended: &[String],
+    state: &mut SyncState,
+) -> std::collections::HashMap<String, String> {
+    if recommended.is_empty() {
+        return state.plugin_latest_versions.clone();
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("dsh-harness-launcher-plugin-check")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    // registry 候选：内网 → npmmirror → npmjs
+    let mut registries: Vec<String> = Vec::new();
+    if let Some(ms) = &cfg.mirror_settings {
+        if let Some(reg) = &ms.registry {
+            if !reg.is_empty() {
+                registries.push(reg.trim_end_matches('/').to_string());
+            }
+        }
+    }
+    registries.push("https://registry.npmmirror.com".to_string());
+    registries.push("https://registry.npmjs.org".to_string());
+
+    for name in recommended {
+        // 跳过本地已是最新且缓存有的（减少查询）
+        if let Some(cached) = state.plugin_latest_versions.get(name) {
+            let installed = installed_plugin_version(app, cfg, name);
+            if !installed.is_empty() && !version_greater(cached, &installed) {
+                continue; // 已装版本 >= 缓存最新 → 无需再查
+            }
+        }
+        let encoded = name.replace('/', "%2F");
+        let mut latest: Option<String> = None;
+        for reg in &registries {
+            let url = format!("{reg}/{encoded}");
+            match client.get(&url).send().await {
+                Ok(res) if res.status().is_success() => {
+                    if let Ok(meta) = res.json::<serde_json::Value>().await {
+                        latest = meta
+                            .get("dist-tags")
+                            .and_then(|d| d.get("latest"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if latest.is_some() {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(lv) = latest {
+            state.plugin_latest_versions.insert(name.clone(), lv);
+            log::info!("插件 {name} 最新版本：{}", state.plugin_latest_versions.get(name).unwrap());
+        } else {
+            log::warn!("插件 {name} 版本查询失败（registry 不可达），保留缓存");
+        }
+    }
+    // 清理不在推荐清单里的缓存项（防膨胀）
+    let recommended_set: HashSet<&str> = recommended.iter().map(|s| s.as_str()).collect();
+    state.plugin_latest_versions.retain(|k, _| recommended_set.contains(k.as_str()));
+    save_state(app, cfg, state);
+    state.plugin_latest_versions.clone()
+}
+
+/// 读取当前 profile 已装插件的版本号（空 = 未装/读不到）。
+fn installed_plugin_version<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig, name: &str) -> String {
+    installed_plugins_current_profile_with_versions(app, cfg)
+        .get(name)
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// 待安装清单 = 服务端推荐 − 已装（保推荐顺序，去重；任一 profile 装了即算已装）。
-pub fn pending_plugins(recommended: &[String], installed: &[String]) -> Vec<String> {
-    let have: HashSet<&str> = installed.iter().map(|s| s.as_str()).collect();
+/// 注：版本感知判断见 `pending_with_updates`；此纯名字版保留供测试/简单位调用。
+#[allow(dead_code)]
+pub fn pending_plugins(recommended: &[String], installed: &[String]) -> Vec<String> {    let have: HashSet<&str> = installed.iter().map(|s| s.as_str()).collect();
     let mut seen = HashSet::new();
     recommended
         .iter()
@@ -271,6 +398,45 @@ pub fn pending_plugins(recommended: &[String], installed: &[String]) -> Vec<Stri
         .filter(|p| seen.insert(p.as_str()))
         .cloned()
         .collect()
+}
+
+/// 带版本信息的待处理插件：未装（install）或已装但版本落后（update）。
+/// `installed`：当前 profile 已装插件名 → 已装版本（可能空 = 未装或版本读不到）。
+/// `latest`：各插件 registry 最新版本（来自同步缓存）。
+/// 返回保序去重；每项 { name, installed, latest, action }。
+pub fn pending_with_updates(
+    recommended: &[String],
+    installed: &std::collections::HashMap<String, String>,
+    latest: &std::collections::HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for name in recommended {
+        let have = installed.get(name).map(|v| v.as_str()).unwrap_or("");
+        let lv = latest.get(name).map(|v| v.as_str()).unwrap_or("");
+        let action = if have.is_empty() {
+            "install"
+        } else if !lv.is_empty() && version_greater(lv, have) {
+            "update"
+        } else {
+            // 已装且为最新（或查不到最新）→ 不处理
+            continue;
+        };
+        out.push(serde_json::json!({
+            "name": name,
+            "installed": have,
+            "latest": lv,
+            "action": action,
+        }));
+    }
+    out
+}
+
+/// 简单版本比较（a > b → true）。容忍 rc/beta 预发布。
+fn version_greater(a: &str, b: &str) -> bool {
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(x), Ok(y)) => x > y,
+        _ => a != b && a.trim_start_matches('v').cmp(b.trim_start_matches('v')) == std::cmp::Ordering::Greater,
+    }
 }
 
 // ---------- 本地缓存 ----------
@@ -446,14 +612,21 @@ pub async fn sync_once<R: Runtime>(
     }
     let token = cfg.admin_token.as_deref().unwrap_or("").to_string();
     let plugin_infos = collect_client_state(app, cfg);
-    // 上报用全量（管理页看所有 profile）；待装判断用「当前 profile 已装」
+    // 上报用全量（管理页看所有 profile）；待装判断用「当前 profile 已装 + 版本」
     let installed_all: Vec<String> = plugin_infos.iter().map(|p| p.name.clone()).collect();
-    let installed_current = installed_plugins_current_profile(app, cfg);
+    let installed_with_ver = installed_plugins_current_profile_with_versions(app, cfg);
     let mut state = load_state(app, cfg);
 
     let outcome = match fetch_config(&server_url, &token).await {
         Ok(config) => {
-            let pending = pending_plugins(&config.plugins, &installed_current);
+            // 版本检查：查 registry 最新版（带缓存），已装但落后的计入待处理
+            let latest = refresh_plugin_latest_versions(app, cfg, &config.plugins, &mut state).await;
+            let pending_entries = pending_with_updates(&config.plugins, &installed_with_ver, &latest);
+            // 纯名字列表（通知/上报用）
+            let pending: Vec<String> = pending_entries
+                .iter()
+                .filter_map(|p| p["name"].as_str().map(|s| s.to_string()))
+                .collect();
             // 服务器配置覆盖本地（遵循「用户显式设置过的不被覆盖」）
             apply_server_defaults(app, &config);
             // 缓存菜单策略（托盘渲染据此展示；用户配置永不被覆盖）
@@ -479,11 +652,16 @@ pub async fn sync_once<R: Runtime>(
         }
         Err(e) => {
             log::warn!("同步失败（离线？）：{e}；使用缓存配置");
-            // 离线：用缓存配置继续，不上报（避免误导管理员）
-            let pending = state
+            // 离线：用缓存配置 + 缓存的最新版本信息继续（版本判断用上次查到的）
+            let pending: Vec<String> = state
                 .cached_config
                 .as_ref()
-                .map(|c| pending_plugins(&c.plugins, &installed_current))
+                .map(|c| {
+                    crate::sync::pending_with_updates(&c.plugins, &installed_with_ver, &state.plugin_latest_versions)
+                        .iter()
+                        .filter_map(|p| p["name"].as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             SyncOutcome {
                 pending_changed: false,
@@ -626,10 +804,10 @@ pub async fn spawn_sync_loop<R: Runtime>(app: &AppHandle<R>) {
         let last = *LAST_NOTIFIED.lock().unwrap();
         let outcome = sync_once(app, &cfg, last).await;
 
-        // 待装变化 → 通知 + 刷新托盘
+        // 待装变化 → 通知 + 刷新托盘（待装含「未装」与「已装旧版需更新」）
         if outcome.pending_changed && !outcome.pending.is_empty() {
             let msg = format!(
-                "有 {} 个推荐插件待安装：{}\n请在托盘「同步 / 推荐插件」菜单中确认安装",
+                "有 {} 个推荐插件待处理：{}\n请在托盘「同步 / 推荐插件」菜单中确认安装/更新",
                 outcome.pending.len(),
                 outcome.pending.join(", ")
             );
