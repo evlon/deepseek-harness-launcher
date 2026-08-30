@@ -822,9 +822,10 @@ pub async fn spawn_sync_loop<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// 安装一个插件（供托盘菜单调用）：`node <dsh>/lib/bin.js plugin --profile <当前profile> add <name>`。
-/// profile 取当前生效配置（`resolve_profile`）——服务器推荐的插件要装到
-/// 同事实际运行的 profile（默认 matrix），否则会出现「装了但运行的 profile 里没有」。
+/// 安装/更新一个插件（供托盘菜单调用）：`node <dsh>/lib/bin.js plugin --profile <当前profile> add <spec>`。
+/// - 已装旧版（版本检查检测到落后）→ `add <pkg>@<latest>`（显式版本，pnpm 100% 升级；
+///   裸 `add <pkg>` 或 `@latest` 对已装包可能不升级/解析到旧版）
+/// - 未装 → `add <pkg>`（装 registry 最新）
 pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Result<(), String> {
     let cfg = load_cached();
     let profile = resolve_profile(&cfg);
@@ -833,6 +834,28 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
     if !node.exists() || !dsh_bin.exists() {
         return Err("NODE_OR_DSH_NOT_FOUND: 请先「安装 / 修复」".to_string());
     }
+    // 决定安装 spec：已装旧版 → name@latest（显式版本更新）
+    let state = load_state(app, &cfg);
+    let installed_with_ver = installed_plugins_current_profile_with_versions(app, &cfg);
+    let is_update = match installed_with_ver.get(name) {
+        Some(installed_v) if !installed_v.is_empty() => {
+            state
+                .plugin_latest_versions
+                .get(name)
+                .map(|lv| version_greater(lv, installed_v))
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
+    let spec = if is_update {
+        // 用缓存的最新版本（版本检查已拉取）；没有缓存则用 @latest 兜底
+        match state.plugin_latest_versions.get(name) {
+            Some(lv) => format!("{name}@{lv}"),
+            None => format!("{name}@latest"),
+        }
+    } else {
+        name.to_string()
+    };
     let env = crate::workflow::child_env(app, &cfg)?;
     let mut cmd = std::process::Command::new(&node);
     cmd.arg(&dsh_bin)
@@ -840,7 +863,7 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
         .arg("--profile")
         .arg(&profile)
         .arg("add")
-        .arg(name)
+        .arg(&spec)
         .current_dir(dsh_install_path(app))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -853,10 +876,10 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
     let output = output.map_err(|e| format!("INSTALL_LAUNCH_FAILED: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log::error!("安装插件 {name} 失败（exit={}）：{}", output.status, stderr.trim());
+        log::error!("安装插件 {spec} 失败（exit={}）：{}", output.status, stderr.trim());
         return Err(format!("PLUGIN_INSTALL_FAILED: {name}（exit={}），详情见日志", output.status));
     }
-    log::info!("插件已安装：{name}（profile={profile}）");
+    log::info!("插件已安装：{spec}（profile={profile}）");
     Ok(())
 }
 

@@ -147,17 +147,30 @@ async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
     // 待处理 = 未装 + 已装旧版（版本信息来自同步缓存的 registry 最新版）
     let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, cfg);
     let entries = crate::sync::pending_with_updates(&recommended, &installed_with_ver, &state.plugin_latest_versions);
-    let pending: Vec<String> = entries
+    // 构造安装 spec：未装 → 裸名（装最新）；已装旧版 → name@<latest>（显式版本，pnpm 才升级）
+    let specs: Vec<String> = entries
         .iter()
-        .filter_map(|e| e["name"].as_str().map(|s| s.to_string()))
+        .filter_map(|e| {
+            let name = e["name"].as_str()?;
+            if e["action"].as_str() == Some("update") {
+                let latest = e["latest"].as_str().unwrap_or("latest");
+                Some(if latest.is_empty() || latest == "latest" {
+                    format!("{name}@latest")
+                } else {
+                    format!("{name}@{latest}")
+                })
+            } else {
+                Some(name.to_string())
+            }
+        })
         .collect();
-    if pending.is_empty() {
+    if specs.is_empty() {
         log::info!("当前 profile 无待装/待更新推荐插件");
         return Ok(());
     }
     let profile = resolve_profile(cfg);
-    log::info!("安装/更新服务器推荐插件到 {profile}：{}", pending.join(", "));
-    let result = preset_profile(app, cfg, &profile, &pending).await;
+    log::info!("安装/更新服务器推荐插件到 {profile}：{}", specs.join(", "));
+    let result = preset_profile(app, cfg, &profile, &specs).await;
     // 安装结果不影响整体完成（失败有日志 + 托盘可重试）
     if let Err(e) = &result {
         log::error!("服务器推荐插件安装失败：{e}");
