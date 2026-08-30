@@ -237,7 +237,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     Ok(menu)
 }
 
-/// 构建「dsh 版本」子菜单：当前版本 + 检查更新 + 已装版本切换。
+/// 构建「dsh 版本」子菜单：当前版本 + 检查更新 + 已装版本切换 + 远程可安装版本。
 fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R>> {
     let mut rows: Vec<MenuItem<R>> = Vec::new();
     let active = crate::dsh_versions::active_version(app);
@@ -254,7 +254,28 @@ fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Su
     // 检查更新（点击触发异步查询）
     rows.push(MenuItem::with_id(app, "dsh-check-update", "🔍 检查更新", true, None::<&str>)?);
 
-    // 分隔：已装版本列表
+    // 远程可安装版本（「检查更新」后缓存；点击即下载安装；已装的自动过滤）
+    let remote = crate::dsh_versions::installable_remote_releases(app);
+    let remote_rows: Vec<MenuItem<R>> = remote
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let version = r["version"].as_str().unwrap_or("").to_string();
+            let prerelease = r["prerelease"].as_bool().unwrap_or(false);
+            let label = if prerelease {
+                format!("📥 安装 {version}（预发布）")
+            } else {
+                format!("📥 安装 {version}")
+            };
+            MenuItem::with_id(app, format!("dsh-install-{i}"), label, true, None::<&str>)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !remote_rows.is_empty() {
+        rows.push(MenuItem::with_id(app, "dsh-remote-sep", "─ 远程可用版本 ─", false, None::<&str>)?);
+        rows.extend(remote_rows);
+    }
+
+    // 已装版本列表
     if installed.is_empty() {
         rows.push(MenuItem::with_id(app, "dsh-none", "（无已装版本，请先安装 / 修复）", false, None::<&str>)?);
     } else {
@@ -531,11 +552,16 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 crate::ops::mark_step_running(&h, 0);
                 crate::ops::update_step(&h, "查询远程版本…");
                 let (current, latest, has_update) = crate::dsh_versions::check_update(&h).await;
+                // latest 是 tag 名，显示时用规范化版本号
+                let latest_display = latest
+                    .as_deref()
+                    .map(crate::dsh_versions::normalize_tag_version)
+                    .unwrap_or_default();
                 let msg = match (&latest, has_update) {
-                    (Some(latest), true) => format!(
-                        "当前 {current}，发现新版本 {latest}\n可在本子菜单切换（需先安装）"
+                    (Some(_), true) => format!(
+                        "当前 {current}，发现新版本 {latest_display}\n已在本子菜单出现「📥 安装」项，点击即可下载"
                     ),
-                    (Some(latest), false) => format!("当前 {current}，已是最新（{latest}）"),
+                    (Some(_), false) => format!("当前 {current}，已是最新（{latest_display}）"),
                     (None, _) => format!("当前 {current}，远程版本查询失败（网络受限？）"),
                 };
                 crate::ops::finish_op(&h, &msg);
@@ -566,6 +592,53 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                             Err(e) => {
                                 crate::ops::fail_op(&h, &e);
                                 notify(&h, "dsh 切换失败", &e);
+                                refresh_sync_menu(&h);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        id if id.starts_with("dsh-install-") => {
+            let idx = id
+                .strip_prefix("dsh-install-")
+                .and_then(|s| s.parse::<usize>().ok());
+            if let Some(idx) = idx {
+                let remote = crate::dsh_versions::installable_remote_releases(app);
+                if let Some(r) = remote.get(idx) {
+                    let tag = r["tag"].as_str().unwrap_or("").to_string();
+                    let version = r["version"].as_str().unwrap_or("").to_string();
+                    let h = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::ops::start_op(&h, "dsh-install", "安装 dsh 版本", &["下载", "安装"]);
+                        crate::ops::mark_step_running(&h, 0);
+                        crate::ops::update_step(&h, &format!("下载 {version}…"));
+                        // 带进度回调 → 进度窗口
+                        let h2 = h.clone();
+                        let version_cb = version.clone();
+                        let result = crate::dsh_versions::install_version(
+                            &h,
+                            &tag,
+                            Some(&move |downloaded, total| {
+                                let pct = if total > 0 {
+                                    (downloaded as f64 / total as f64 * 100.0).round() as u32
+                                } else {
+                                    0
+                                };
+                                crate::ops::update_step(&h2, &format!("下载 {version_cb} {pct}%"));
+                            }),
+                        )
+                        .await;
+                        match result {
+                            Ok(()) => {
+                                let msg = format!("dsh {version} 已安装，可在本子菜单切换");
+                                crate::ops::finish_op(&h, &msg);
+                                notify(&h, "dsh 版本已安装", &msg);
+                                refresh_sync_menu(&h);
+                            }
+                            Err(e) => {
+                                crate::ops::fail_op(&h, &e);
+                                notify(&h, "dsh 安装失败", &e);
                                 refresh_sync_menu(&h);
                             }
                         }

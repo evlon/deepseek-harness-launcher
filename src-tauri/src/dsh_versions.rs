@@ -161,6 +161,7 @@ pub async fn fetch_remote_releases() -> Result<Vec<serde_json::Value>, String> {
                         );
                         Some(serde_json::json!({
                             "tag": tag,
+                            "version": normalize_tag_version(&tag),
                             "prerelease": prerelease,
                             "assetUrl": asset_url,
                         }))
@@ -302,14 +303,111 @@ pub async fn switch_version<R: Runtime>(
     Ok((old_version, new_version))
 }
 
+/// 从 release tag 提取干净版本号。
+/// tag 格式多样：`v0.1.1-rc.1` / `dsh-src-0.1.2-alpha.1-33297864233` / `0.1.2`。
+/// 规则：找第一个 `数字.数字.数字` 起点，取完整 semver 主干；
+/// 预发布末尾的纯数字长段视为构建号（如 `-33297864233`）并去掉。
+pub fn normalize_tag_version(tag: &str) -> String {
+    // 找第一个数字开头的位置
+    let bytes = tag.as_bytes();
+    let mut start = None;
+    for (i, b) in bytes.iter().enumerate() {
+        if b.is_ascii_digit() {
+            start = Some(i);
+            break;
+        }
+    }
+    let Some(start) = start else {
+        return tag.to_string();
+    };
+    let rest = &tag[start..];
+
+    // 逐字符扩展，找最长的可被 semver 解析的前缀
+    let mut best = String::new();
+    let mut candidate = String::new();
+    for c in rest.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+' {
+            candidate.push(c);
+            if semver::Version::parse(&candidate).is_ok() {
+                best = candidate.clone();
+            }
+        } else {
+            break;
+        }
+    }
+    if best.is_empty() {
+        return rest.to_string();
+    }
+    // 去掉构建号（+ 之后）
+    if let Some(plus) = best.find('+') {
+        best.truncate(plus);
+    }
+    // 预发布里若含「-<长数字>」（构建号特征，如 `alpha.1-33297864233`）→ 从该 - 截断
+    if let Ok(ver) = semver::Version::parse(&best) {
+        let pre = ver.pre;
+        if !pre.is_empty() {
+            let pre_str = pre.as_str();
+            // 形如 alpha.1-33297864233：最后一段含连字符 + 长数字 → 截到连字符前
+            if let Some(hyphen) = pre_str.rfind('-') {
+                let suffix = &pre_str[hyphen + 1..];
+                if suffix.len() >= 5 && suffix.chars().all(|c| c.is_ascii_digit()) {
+                    let base = format!("{}.{}.{}", ver.major, ver.minor, ver.patch);
+                    let trimmed_pre = &pre_str[..hyphen];
+                    if trimmed_pre.is_empty() {
+                        return base;
+                    }
+                    return format!("{base}-{trimmed_pre}");
+                }
+            }
+        }
+    }
+    best
+}
+
+/// 最近一次「检查更新」拉到的远程版本列表（进程内缓存，托盘菜单渲染用）。
+static REMOTE_CACHE: std::sync::Mutex<Option<Vec<serde_json::Value>>> = std::sync::Mutex::new(None);
+
+/// 缓存远程版本列表（检查更新成功后写入）。
+pub fn cache_remote_releases(list: Vec<serde_json::Value>) {
+    *REMOTE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(list);
+}
+
+/// 读取缓存的远程版本列表（未检查过返回空）。
+pub fn cached_remote_releases() -> Vec<serde_json::Value> {
+    REMOTE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// 远程可安装版本列表（过滤掉已装的；菜单渲染与点击安装共用，保证索引一致）。
+pub fn installable_remote_releases<R: Runtime>(app: &AppHandle<R>) -> Vec<serde_json::Value> {
+    let installed = list_installed(app);
+    let installed_tags: std::collections::HashSet<String> = installed
+        .iter()
+        .filter_map(|v| v["tag"].as_str().map(|s| s.to_string()))
+        .collect();
+    cached_remote_releases()
+        .into_iter()
+        .filter(|r| {
+            let tag = r["tag"].as_str().unwrap_or("");
+            let version = r["version"].as_str().unwrap_or("");
+            !installed_tags.contains(tag) && !installed_tags.iter().any(|t| t.contains(version))
+        })
+        .collect()
+}
+
 /// 检查更新：当前激活版本 vs 远程最新 release。
 /// 返回 (当前版本, 最新版本, 是否有更新)。
 pub async fn check_update<R: Runtime>(app: &AppHandle<R>) -> (String, Option<String>, bool) {
     let current = active_version(app);
     let remote = match fetch_remote_releases().await {
-        Ok(list) => list
-            .first()
-            .and_then(|r| r["tag"].as_str().map(|s| s.to_string())),
+        Ok(list) => {
+            // 缓存整个列表（托盘菜单显示可安装的远程版本）
+            cache_remote_releases(list.clone());
+            list.first().and_then(|r| r["tag"].as_str().map(|s| s.to_string()))
+        }
         Err(e) => {
             log::warn!("检查 dsh 更新失败：{e}");
             None
@@ -317,9 +415,8 @@ pub async fn check_update<R: Runtime>(app: &AppHandle<R>) -> (String, Option<Str
     };
     let has_update = match (&remote, current.is_empty()) {
         (Some(remote_tag), false) => {
-            // 远程 tag 形如 v0.1.2-rc.3；当前版本形如 0.1.1-rc.1
-            let remote_ver = remote_tag.trim_start_matches('v');
-            semver_compare(remote_ver, &current) == std::cmp::Ordering::Greater
+            let remote_ver = normalize_tag_version(remote_tag);
+            semver_compare(&remote_ver, &current) == std::cmp::Ordering::Greater
         }
         (Some(_), true) => true, // 未安装 → 有更新
         _ => false,
@@ -396,5 +493,31 @@ mod tests {
     #[test]
     fn asset_filename_windows() {
         assert_eq!(dsh_asset_filename().unwrap(), "deepseek-harness-pkg-windows.zip");
+    }
+
+    #[test]
+    fn normalize_tag_versions() {
+        // 标准 v 前缀
+        assert_eq!(normalize_tag_version("v0.1.1-rc.1"), "0.1.1-rc.1");
+        // 用户实测的 tag：dsh-src- 前缀 + 构建号
+        assert_eq!(normalize_tag_version("dsh-src-0.1.2-alpha.1-33297864233"), "0.1.2-alpha.1");
+        // 无前缀
+        assert_eq!(normalize_tag_version("0.1.2"), "0.1.2");
+        // 预发布多段
+        assert_eq!(normalize_tag_version("v1.0.0-beta.2"), "1.0.0-beta.2");
+        // 无版本号 → 原样返回
+        assert_eq!(normalize_tag_version("release"), "release");
+        // 空串
+        assert_eq!(normalize_tag_version(""), "");
+    }
+
+    #[test]
+    fn normalize_compare_detects_update() {
+        // 远程 dsh-src-0.1.2-alpha.1-xxx vs 本地 0.1.1-rc.1 → 有更新
+        let remote = normalize_tag_version("dsh-src-0.1.2-alpha.1-33297864233");
+        assert_eq!(semver_compare(&remote, "0.1.1-rc.1"), std::cmp::Ordering::Greater);
+        // 同版本无更新
+        let remote2 = normalize_tag_version("v0.1.1-rc.1");
+        assert_eq!(semver_compare(&remote2, "0.1.1-rc.1"), std::cmp::Ordering::Equal);
     }
 }
