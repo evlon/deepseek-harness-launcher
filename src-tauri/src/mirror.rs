@@ -133,15 +133,49 @@ pub async fn resolve_dependency_tree(
     Ok(all)
 }
 
-/// 拉取包元信息。
+/// 拉取包元信息（多 registry 按序尝试：内网 → npmmirror → npmjs）。
+/// 国内环境 npmjs 直连慢且易截断（zod 元信息 1MB+，`res.json()` 流式解析
+/// 中途断流报 "error decoding response body"）——用 `res.bytes()` 整包读取再解析。
 async fn fetch_meta(client: &reqwest::Client, name: &str) -> Result<serde_json::Value, String> {
     let encoded = name.replace('/', "%2F");
-    let url = format!("https://registry.npmjs.org/{encoded}");
-    let res = client.get(&url).send().await.map_err(|e| format!("fetch {name}: {e}"))?;
-    if !res.status().is_success() {
-        return Err(format!("fetch {name}: HTTP {}", res.status()));
+    // registry 候选：内网（配置的 mirror registry）→ npmmirror → npmjs
+    let cfg = load_cached();
+    let mut registries: Vec<String> = Vec::new();
+    if let Some(ms) = &cfg.mirror_settings {
+        if let Some(reg) = &ms.registry {
+            if !reg.is_empty() {
+                registries.push(reg.trim_end_matches('/').to_string());
+            }
+        }
     }
-    res.json().await.map_err(|e| format!("parse {name}: {e}"))
+    registries.push("https://registry.npmmirror.com".to_string());
+    registries.push("https://registry.npmjs.org".to_string());
+
+    let mut last_err = String::new();
+    for reg in registries {
+        let url = format!("{reg}/{encoded}");
+        match client.get(&url).send().await {
+            Ok(res) if res.status().is_success() => {
+                // 整包读取（大元信息如 zod 1MB+，避免流式解析截断）
+                let bytes = match res.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        last_err = format!("read {name} from {reg}: {e}");
+                        continue;
+                    }
+                };
+                match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        last_err = format!("parse {name} from {reg}: {e} ({} bytes)", bytes.len());
+                    }
+                }
+            }
+            Ok(res) => last_err = format!("HTTP {} from {reg}", res.status()),
+            Err(e) => last_err = format!("{reg}: {e}"),
+        }
+    }
+    Err(format!("fetch {name}: {last_err}"))
 }
 
 /// 解析具体版本：精确匹配 → dist-tags.latest → 最高版本（简化）。
