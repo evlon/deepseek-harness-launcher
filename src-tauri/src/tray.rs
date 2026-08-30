@@ -162,6 +162,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let profile_submenu = build_profile_submenu(app)?;
     // 管理能力子菜单（动态）
     let bridge_submenu = build_bridge_submenu(app)?;
+    // dsh 版本子菜单（动态：当前版本 + 已装版本切换 + 检查更新）
+    let dsh_submenu = build_dsh_version_submenu(app)?;
 
     // 操作状态区（动态）：有进行中/最近操作时显示在菜单顶部
     // 先创建所有 owned 菜单项，再收集引用（避免临时值借用问题）
@@ -222,6 +224,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     items.push(&url_submenu);
     items.push(&accel_submenu);
     // 高级组
+    items.push(&dsh_submenu);
     items.push(&bridge_submenu);
 
     // 收尾：查看日志 / 退出
@@ -232,6 +235,54 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     let menu = Menu::with_items(app, &items)?;
     Ok(menu)
+}
+
+/// 构建「dsh 版本」子菜单：当前版本 + 检查更新 + 已装版本切换。
+fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R>> {
+    let mut rows: Vec<MenuItem<R>> = Vec::new();
+    let active = crate::dsh_versions::active_version(app);
+    let installed = crate::dsh_versions::list_installed(app);
+    let active_tag = crate::dsh_versions::active_tag(app);
+
+    // 状态行：当前版本
+    let status_text = if active.is_empty() {
+        "dsh 未安装".to_string()
+    } else {
+        format!("当前 dsh：{active}")
+    };
+    rows.push(MenuItem::with_id(app, "dsh-status", status_text, false, None::<&str>)?);
+    // 检查更新（点击触发异步查询）
+    rows.push(MenuItem::with_id(app, "dsh-check-update", "🔍 检查更新", true, None::<&str>)?);
+
+    // 分隔：已装版本列表
+    if installed.is_empty() {
+        rows.push(MenuItem::with_id(app, "dsh-none", "（无已装版本，请先安装 / 修复）", false, None::<&str>)?);
+    } else {
+        for (i, v) in installed.iter().enumerate() {
+            let tag = v["tag"].as_str().unwrap_or("").to_string();
+            let ver = v["version"].as_str().unwrap_or("").to_string();
+            let is_active = v["active"].as_bool().unwrap_or(false) || tag == active_tag;
+            let label = if is_active {
+                format!("{ver}  ✓（当前）")
+            } else {
+                format!("{ver}")
+            };
+            // 当前版本不可切换；其他版本可切换
+            rows.push(MenuItem::with_id(
+                app,
+                format!("dsh-switch-{i}"),
+                label,
+                !is_active,
+                None::<&str>,
+            )?);
+        }
+    }
+
+    let refs: Vec<&dyn tauri::menu::IsMenuItem<R>> = rows
+        .iter()
+        .map(|m| m as &dyn tauri::menu::IsMenuItem<R>)
+        .collect();
+    Submenu::with_id_and_items(app, "dsh", "dsh 版本", true, &refs)
 }
 
 /// 构建「管理能力」子菜单：外网代理网关开关 + 状态。
@@ -470,6 +521,55 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                         crate::ops::finish_op(app, "连接 token 已复制到剪贴板");
                     }
                     Err(e) => notify(app, "复制失败", &e),
+                }
+            }
+        }
+        "dsh-check-update" => {
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "dsh-update", "检查 dsh 更新", &["检查更新"]);
+                crate::ops::mark_step_running(&h, 0);
+                crate::ops::update_step(&h, "查询远程版本…");
+                let (current, latest, has_update) = crate::dsh_versions::check_update(&h).await;
+                let msg = match (&latest, has_update) {
+                    (Some(latest), true) => format!(
+                        "当前 {current}，发现新版本 {latest}\n可在本子菜单切换（需先安装）"
+                    ),
+                    (Some(latest), false) => format!("当前 {current}，已是最新（{latest}）"),
+                    (None, _) => format!("当前 {current}，远程版本查询失败（网络受限？）"),
+                };
+                crate::ops::finish_op(&h, &msg);
+                notify(&h, "dsh 版本检查", &msg);
+                refresh_sync_menu(&h);
+            });
+        }
+        id if id.starts_with("dsh-switch-") => {
+            let idx = id
+                .strip_prefix("dsh-switch-")
+                .and_then(|s| s.parse::<usize>().ok());
+            if let Some(idx) = idx {
+                let installed = crate::dsh_versions::list_installed(app);
+                if let Some(v) = installed.get(idx) {
+                    let tag = v["tag"].as_str().unwrap_or("").to_string();
+                    let h = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::ops::start_op(&h, "dsh-switch", "切换 dsh 版本", &["停止 Harness", "替换版本", "重启 Harness"]);
+                        crate::ops::mark_step_running(&h, 0);
+                        crate::ops::update_step(&h, &format!("切换到 {tag}…"));
+                        match crate::dsh_versions::switch_version(&h, &tag).await {
+                            Ok((old, new)) => {
+                                let msg = format!("dsh 版本切换完成：{old} -> {new}");
+                                crate::ops::finish_op(&h, &msg);
+                                notify(&h, "dsh 版本已切换", &msg);
+                                refresh_sync_menu(&h);
+                            }
+                            Err(e) => {
+                                crate::ops::fail_op(&h, &e);
+                                notify(&h, "dsh 切换失败", &e);
+                                refresh_sync_menu(&h);
+                            }
+                        }
+                    });
                 }
             }
         }

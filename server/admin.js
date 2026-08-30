@@ -90,6 +90,7 @@ function renderClientDefaults(){
   const ms=current.mirrorSettings||{};
   document.getElementById("mirrorRegistry").value=ms.registry||"http://registry.ict.cmcc";
   document.getElementById("mirrorToken").value=ms.tokenValue||"";
+  document.getElementById("dshMirrorUrl").value=ms.dshMirrorUrl||"";
 }
 async function saveClientDefaults(){
   try{
@@ -120,11 +121,14 @@ async function saveClientDefaults(){
 // ── 镜像上传 ──
 async function saveMirrorSettings(){
   try{
+    const dshMirror=document.getElementById("dshMirrorUrl").value.trim();
     const ms={
       registry:document.getElementById("mirrorRegistry").value.trim(),
       tokenValue:document.getElementById("mirrorToken").value.trim(),
+      dshMirrorUrl:dshMirror,
     };
     if(!/^https?:\/\/\S+$/.test(ms.registry)){ toast("registry 必须是 http(s) 地址","warn"); return; }
+    if(dshMirror && !/^https?:\/\/\S+$/.test(dshMirror)){ toast("dsh 分发源必须是 http(s) 地址","warn"); return; }
     const body={plugins:current.plugins,managedMenu:current.managedMenu,clientDefaults:current.clientDefaults||{},mirrorSettings:ms};
     const r=await fetch("/api/config",{method:"POST",headers:headers(true),body:JSON.stringify(body)});
     const j=await r.json();

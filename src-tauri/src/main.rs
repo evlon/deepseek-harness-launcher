@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod console;
 mod download;
+mod dsh_versions;
 mod install;
 mod logging;
 mod mirror;
@@ -62,6 +63,9 @@ fn main() {
             commands::cmd_mirror,
             commands::cmd_status,
             commands::cmd_open_console,
+            commands::cmd_dsh_versions,
+            commands::cmd_dsh_install,
+            commands::cmd_dsh_switch,
         ])
         // 操作进度窗口的内嵌 HTML 协议（console://localhost/index.html）
         // data: URL 在 Tauri 2 External 里被安全策略拦截，改用自定义协议。

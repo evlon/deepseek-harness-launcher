@@ -46,6 +46,9 @@ pub struct ServerConfig {
     /// 客户端默认配置覆盖（服务端下发的 npmRegistry/ghMirrorPrefix/port 等）。
     #[serde(default, rename = "clientDefaults")]
     pub client_defaults: Option<serde_json::Value>,
+    /// 镜像相关设置（服务端统一管理：registry / dsh 分发源）。
+    #[serde(default, rename = "mirrorSettings")]
+    pub mirror_settings: Option<serde_json::Value>,
 }
 
 /// 客户端已装插件详情（跨所有 profile，上报给服务端）。
@@ -532,22 +535,38 @@ pub async fn sync_once<R: Runtime>(
 /// 应用服务器下发的客户端默认配置（clientDefaults），遵循「用户显式设置过的不覆盖」。
 /// 合并后写回 launcher-config.json 并刷新缓存。
 fn apply_server_defaults<R: Runtime>(app: &AppHandle<R>, server: &ServerConfig) {
-    let Some(defaults) = &server.client_defaults else {
-        return;
-    };
-    if !defaults.is_object() || defaults.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        return;
-    }
-    let user_set = crate::config::user_set_fields(app);
-    let user_set: Vec<&str> = user_set.iter().map(|s| s.as_str()).collect();
-
     let mut local = load_cached();
     let before = local.clone();
-    crate::config::apply_server_overrides(&mut local, defaults, &user_set);
+
+    // 1) clientDefaults：npmRegistry/ghMirrorPrefix/port 等
+    if let Some(defaults) = &server.client_defaults {
+        if defaults.is_object()
+            && !defaults.as_object().map(|o| o.is_empty()).unwrap_or(true)
+        {
+            let user_set = crate::config::user_set_fields(app);
+            let user_set: Vec<&str> = user_set.iter().map(|s| s.as_str()).collect();
+            crate::config::apply_server_overrides(&mut local, defaults, &user_set);
+        }
+    }
+
+    // 2) mirrorSettings.dshMirrorUrl：内网 dsh 分发源（客户端更新/切换 dsh 版本用）
+    if let Some(ms) = &server.mirror_settings {
+        if let Some(url) = ms.get("dshMirrorUrl").and_then(|v| v.as_str()) {
+            let trimmed = url.trim();
+            let mirror_settings = local.mirror_settings.get_or_insert_with(Default::default);
+            // 服务器显式下发的值覆盖本地（dshMirrorUrl 属企业统一管理项，
+            // 不遵循「用户显式设置不覆盖」——用户本地一般不手改这个字段）
+            if trimmed.is_empty() {
+                mirror_settings.dsh_mirror_url = None;
+            } else {
+                mirror_settings.dsh_mirror_url = Some(trimmed.to_string());
+            }
+        }
+    }
 
     // 有变化才写回 + 缓存
     if local != before {
-        log::info!("应用服务器默认配置：{:?}", defaults);
+        log::info!("应用服务器默认配置（含 dsh 分发源）：{:?}", server.mirror_settings);
         let _ = crate::config::save_config(app, &local);
     }
 }

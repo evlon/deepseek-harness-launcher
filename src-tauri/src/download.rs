@@ -443,7 +443,7 @@ fn flatten_directory(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+pub async fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }

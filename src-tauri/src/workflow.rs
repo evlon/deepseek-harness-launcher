@@ -57,7 +57,7 @@ fn reap_if_dead() {
 }
 
 /// 端口是否已被占用（bind 失败 = 占用；成功后临时 listener 立即释放）。
-fn port_in_use(port: u16) -> bool {
+pub fn port_in_use(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_err()
 }
 
@@ -197,14 +197,57 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
 }
 
 /// 停止 Harness 服务进程树。
+/// 优先停本进程记录的子进程；若本进程无记录（如 CLI 模式、别的实例启动的），
+/// 按配置端口探测占用进程并杀其进程树——保证切换 dsh 版本等操作能释放文件锁。
 pub fn stop() {
     let running = RUNNING.lock().unwrap().take();
-    let Some(r) = running else {
-        log::info!("没有需要停止的 Harness 进程");
-        return;
-    };
-    kill_pid_tree(r.pid);
-    log::info!("Harness 已停止：PID={}", r.pid);
+    match running {
+        Some(r) => {
+            kill_pid_tree(r.pid);
+            log::info!("Harness 已停止：PID={}", r.pid);
+        }
+        None => {
+            // 无记录：按端口探测（Windows netstat 找监听 PID）
+            let cfg = load_cached();
+            let port = resolve_port(&cfg);
+            if let Some(pid) = port_listener_pid(port) {
+                log::warn!("发现端口 {port} 被 PID={pid} 监听（非本进程记录），停止其进程树");
+                kill_pid_tree(pid);
+                log::info!("Harness 已停止（按端口探测）：PID={pid}");
+            } else {
+                log::info!("没有需要停止的 Harness 进程");
+            }
+        }
+    }
+}
+
+/// 通过 netstat 查找监听指定端口的进程 PID（Windows/Unix 通用）。
+fn port_listener_pid(port: u16) -> Option<u32> {
+    let output = Command::new("netstat")
+        .args(["-ano"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let needle = format!(":{port}");
+    for line in text.lines() {
+        if !line.contains("LISTENING") || !line.contains(&needle) {
+            continue;
+        }
+        // 取行尾的 PID（netstat -ano 最后一列）
+        if let Some(pid_str) = line.split_whitespace().last() {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                if pid != 0 {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn kill_pid_tree(pid: u32) {

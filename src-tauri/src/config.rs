@@ -105,6 +105,10 @@ pub struct MirrorSettings {
     /// 目标内网 registry（默认 registry.ict.cmcc）。
     #[serde(default)]
     pub registry: Option<String>,
+    /// 内网 dsh 分发源（形如 `http://registry.ict.cmcc/dsh/`）。
+    /// dsh 版本管理下载时优先走此源（内网快），未配置则用 GitHub + 镜像。
+    #[serde(default)]
+    pub dsh_mirror_url: Option<String>,
 }
 
 /// 镜像目标 registry（缺省内网 registry.ict.cmcc）。

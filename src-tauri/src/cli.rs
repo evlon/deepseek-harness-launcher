@@ -14,6 +14,9 @@
 //! - `mirror`       镜像上传（需 --registry --token）
 //! - `status`       查询状态（运行中/端口/上次操作/测速结果）
 //! - `open-console` 打开进度窗口
+//! - `dsh-versions` 查询 dsh 版本状态（当前/已装/最新）
+//! - `dsh-install`  下载安装指定 dsh 版本（需 --tag <版本>）
+//! - `dsh-switch`   切换 dsh 版本（需 --tag <版本>，停→换→重启）
 //! - `test`         全流程自测（install → launch → status → stop）
 //!
 //! 有 `--cmd` 时执行命令后退出（不常驻托盘）；无则正常常驻。
@@ -26,6 +29,7 @@ pub struct CliArgs {
     pub json: bool,
     pub registry: String,
     pub token: String,
+    pub tag: String,
 }
 
 pub fn parse_args() -> CliArgs {
@@ -34,6 +38,7 @@ pub fn parse_args() -> CliArgs {
         json: false,
         registry: String::new(),
         token: String::new(),
+        tag: String::new(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
@@ -42,6 +47,7 @@ pub fn parse_args() -> CliArgs {
             "--json" => args.json = true,
             "--registry" => args.registry = iter.next().unwrap_or_default(),
             "--token" => args.token = iter.next().unwrap_or_default(),
+            "--tag" => args.tag = iter.next().unwrap_or_default(),
             _ => {}
         }
     }
@@ -100,12 +106,37 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
             print_result("open-console", &r);
             if r.is_ok() { 0 } else { 1 }
         }
+        "dsh-versions" => {
+            let r = tauri_async_block(app, crate::commands::cmd_dsh_versions(app.clone()));
+            print_result("dsh-versions", &r);
+            0
+        }
+        "dsh-install" => {
+            if args.tag.is_empty() {
+                println!("[dsh-install] 缺少 --tag <版本>");
+                2
+            } else {
+                let r = tauri_async_block(app, crate::commands::cmd_dsh_install(app.clone(), args.tag.clone()));
+                print_result("dsh-install", &r);
+                if r.is_ok() { 0 } else { 1 }
+            }
+        }
+        "dsh-switch" => {
+            if args.tag.is_empty() {
+                println!("[dsh-switch] 缺少 --tag <版本>");
+                2
+            } else {
+                let r = tauri_async_block(app, crate::commands::cmd_dsh_switch(app.clone(), args.tag.clone()));
+                print_result("dsh-switch", &r);
+                if r.is_ok() { 0 } else { 1 }
+            }
+        }
         "test" => {
             run_selftest(app)
         }
         _ => {
             println!("未知命令：{cmd}");
-            println!("可用命令：install / launch / stop / sync / speedtest / mirror / status / open-console / test");
+            println!("可用命令：install / launch / stop / sync / speedtest / mirror / status / open-console / dsh-versions / dsh-install(--tag) / dsh-switch(--tag) / test");
             2
         }
     }
@@ -173,6 +204,7 @@ mod tests {
             json: true,
             registry: String::new(),
             token: String::new(),
+            tag: String::new(),
         };
         assert_eq!(args.cmd.as_deref(), Some("install"));
         assert!(args.json);
@@ -186,6 +218,7 @@ mod tests {
             json: false,
             registry: String::new(),
             token: String::new(),
+            tag: String::new(),
         };
         assert!(!is_cli_mode(&args));
     }

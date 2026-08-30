@@ -371,8 +371,17 @@ async function route(req, res) {
         if (typeof ms.tokenValue !== "string") return send(res, 400, { error: "mirrorSettings.tokenValue 必须是字符串" });
         cleanedMs.tokenValue = ms.tokenValue.trim();
       }
+      if (ms.dshMirrorUrl !== undefined) {
+        if (ms.dshMirrorUrl === "") {
+          cleanedMs.dshMirrorUrl = ""; // 清空内网 dsh 分发源
+        } else if (typeof ms.dshMirrorUrl !== "string" || !/^https?:\/\/\S+$/.test(ms.dshMirrorUrl.trim())) {
+          return send(res, 400, { error: "mirrorSettings.dshMirrorUrl 必须是 http(s) 地址" });
+        } else {
+          cleanedMs.dshMirrorUrl = ms.dshMirrorUrl.trim();
+        }
+      }
       cfg.mirrorSettings = Object.assign(
-        { registry: "http://registry.ict.cmcc", tokenValue: "" },
+        { registry: "http://registry.ict.cmcc", tokenValue: "", dshMirrorUrl: "" },
         cleanedMs
       );
     }
@@ -753,6 +762,9 @@ function adminPageHtml() {
       <div class="row" style="margin-bottom:10px">
         <input class="input" id="mirrorRegistry" placeholder="内网 registry（如 http://registry.ict.cmcc）">
         <input class="input" type="password" id="mirrorToken" placeholder="发布 token（NODE_AUTH_TOKEN 值，存服务端，调用时传递）" style="max-width:320px">
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <input class="input" id="dshMirrorUrl" placeholder="dsh 分发源（可选，如 http://registry.ict.cmcc/dsh/；客户端更新/切换 dsh 版本时优先走此内网源）" style="flex:1">
       </div>
       <div style="margin-bottom:10px;font-size:12.5px;color:var(--muted)">token 存于服务端 config.json；点击「开始上传」时经管理能力临时传给管理员 launcher（内存使用，不落盘客户端）。</div>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center">

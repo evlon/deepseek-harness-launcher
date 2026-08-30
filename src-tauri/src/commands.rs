@@ -121,3 +121,55 @@ pub fn cmd_open_console<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Val
     crate::console::open_console(&app).map_err(|e| e)?;
     Ok(ok(json!({})))
 }
+
+/// 查询 dsh 版本状态（当前激活 / 已装列表 / 远程最新 / 是否有更新）。
+#[tauri::command]
+pub async fn cmd_dsh_versions<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
+    let installed = crate::dsh_versions::list_installed(&app);
+    let active = crate::dsh_versions::active_version(&app);
+    let active_tag = crate::dsh_versions::active_tag(&app);
+    // 标记激活项
+    let installed: Vec<serde_json::Value> = installed
+        .into_iter()
+        .map(|mut v| {
+            if v["tag"].as_str() == Some(active_tag.as_str()) {
+                v["active"] = serde_json::Value::Bool(true);
+            }
+            v
+        })
+        .collect();
+    // 远程最新（失败返回 null，不阻断）
+    let (current, latest, has_update) = crate::dsh_versions::check_update(&app).await;
+    Ok(ok(json!({
+        "active": active,
+        "activeTag": active_tag,
+        "current": current,
+        "installed": installed,
+        "latest": latest,
+        "hasUpdate": has_update,
+    })))
+}
+
+/// 下载并安装指定 dsh 版本（不切换）。
+#[tauri::command]
+pub async fn cmd_dsh_install<R: Runtime>(
+    app: AppHandle<R>,
+    tag: String,
+) -> Result<serde_json::Value, String> {
+    crate::dsh_versions::install_version(&app, &tag, None)
+        .await
+        .map_err(|e| e)?;
+    Ok(ok(json!({"tag": tag, "message": "已安装"})))
+}
+
+/// 切换 dsh 版本（停 Harness → 换版本 → 重启）。
+#[tauri::command]
+pub async fn cmd_dsh_switch<R: Runtime>(
+    app: AppHandle<R>,
+    tag: String,
+) -> Result<serde_json::Value, String> {
+    let (old, new) = crate::dsh_versions::switch_version(&app, &tag)
+        .await
+        .map_err(|e| e)?;
+    Ok(ok(json!({"old": old, "new": new, "message": format!("{old} -> {new}")})))
+}
