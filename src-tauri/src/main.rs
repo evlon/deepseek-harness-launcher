@@ -80,7 +80,8 @@ fn main() {
             if path == "/state" {
                 let op = ops::current();
                 let body = serde_json::to_string(&op).unwrap_or_else(|_| "null".to_string());
-                log::info!("console:// /state 返回：{}", &body[..body.len().min(120)]);
+                // 日志截断必须按字符边界（body 含中文，直接字节切片会 panic）
+                log::info!("console:// /state 返回：{}", crate::config::truncate_utf8(&body, 120));
                 return Response::builder()
                     .header("Content-Type", "application/json; charset=utf-8")
                     .body(body.into_bytes())

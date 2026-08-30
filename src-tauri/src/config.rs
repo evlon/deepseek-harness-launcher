@@ -953,6 +953,21 @@ pub fn ensure_base_dir<R: Runtime>(app: &AppHandle<R>) {
     let _ = fs::create_dir_all(logs_dir(app));
 }
 
+/// 按 UTF-8 字符边界安全截断字符串（最多 max 字节）。
+/// 直接 `&s[..n]` 在中文等多字节字符处会 panic（byte index not a char boundary），
+/// 这里从截断点回退到最近的字符边界。
+pub fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    // 从 max 往前找字符边界（UTF-8 连续字节 0x80..=0xBF 都不是起始字节）
+    let mut end = max;
+    while end > 0 && (s.as_bytes()[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,6 +1130,30 @@ mod tests {
         assert_eq!(region_from_country("US"), Region::Overseas);
         assert_eq!(region_from_country("SG"), Region::Overseas);
         assert_eq!(region_from_country(""), Region::Overseas);
+    }
+
+    #[test]
+    fn truncate_utf8_respects_char_boundaries() {
+        // 英文/ASCII 直接截断
+        assert_eq!(truncate_utf8("hello world", 5), "hello");
+        // 短字符串不截断
+        assert_eq!(truncate_utf8("hi", 100), "hi");
+        // 中文：截断点不能落在多字节字符中间（否则 panic）
+        let s = "同步到内网 registry 同步到内网 registry 同步到内网";
+        // 强制截断到中文字节中间的位置——必须回退到字符边界且不 panic
+        let cut = truncate_utf8(s, 7);
+        assert!(cut.len() <= 7, "cut len {} > 7", cut.len());
+        assert!(cut.chars().all(|c| c.is_alphabetic() || c == ' '));
+        // 各种截断长度都不 panic
+        for n in 0..s.len() {
+            let _ = truncate_utf8(s, n);
+        }
+        // 空字符串
+        assert_eq!(truncate_utf8("", 10), "");
+        // 含 emoji（4 字节）
+        let e = "a😀b";
+        let cut = truncate_utf8(e, 2);
+        assert_eq!(cut, "a");
     }
 
     #[test]

@@ -602,8 +602,13 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     lines.push(format!("{mark} {} {}ms", r.name, r.latency_ms));
                 }
                 let msg = lines.join("\n");
-                // 结果可能较长，截断到通知上限
-                let msg = if msg.len() > 900 { format!("{}…", &msg[..900]) } else { msg };
+                // 结果可能较长，截断到通知上限（按字符边界，防中文切片 panic）
+                let msg = if msg.len() > 900 {
+                    let cut = crate::config::truncate_utf8(&msg, 900);
+                    format!("{cut}…")
+                } else {
+                    msg
+                };
                 // 缓存测速结果（托盘菜单显示各源速度）
                 let mut all = npm.clone();
                 all.extend(gh.clone());

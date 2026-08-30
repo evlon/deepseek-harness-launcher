@@ -522,11 +522,27 @@ fn run_npm(cwd: &PathBuf, args: &[&str], envs: &[(String, String)]) -> Result<St
             let _ = child_thread.join();
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // 已存在同版本 → 视为已同步（幂等）
-                if stderr.contains("EPUBLISHCONFLICT") || stderr.contains("cannot publish over") {
+                // 已存在同版本 → 视为已同步（幂等）。
+                // npm 不同版本/registry 报错文案不一：
+                // - 官方 npm: EPUBLISHCONFLICT / "cannot publish over"
+                // - verdaccio/CNPM 等内网 registry: E409 "already present"
+                let already = stderr.contains("EPUBLISHCONFLICT")
+                    || stderr.contains("cannot publish over")
+                    || stderr.contains("E409")
+                    || stderr.contains("already present");
+                if already {
+                    log::info!("npm {} 目标已存在该版本，视为已同步（幂等）", args[0]);
                     return Ok("already-published".to_string());
                 }
-                return Err(format!("npm {} 失败: {}", args[0], stderr.trim()));
+                // 错误文本截断（npm 会把整个包清单打到 stderr，几千字节），
+                // 避免超大错误串进入 ops 状态 / 进度窗口 / 桥接响应
+                let trimmed = stderr.trim();
+                let msg = if trimmed.len() > 800 {
+                    format!("{}…（已截断）", crate::config::truncate_utf8(trimmed, 800))
+                } else {
+                    trimmed.to_string()
+                };
+                return Err(format!("npm {} 失败: {}", args[0], msg));
             }
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }

@@ -183,6 +183,11 @@ pub fn console_html() -> String {
 </body>
 </html>"#.to_string();
     // 内嵌初始状态（替换占位符；JSON 需转义避免破坏 JS 字符串）
-    let escaped = initial.replace('\\', "\\\\").replace('`', "\\`").replace("${", "\\${");
+    // 注意：必须同时转义 </script>，防止错误文本里的标签提前闭合脚本块（注入/截断）
+    let escaped = initial
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace("${", "\\${")
+        .replace("</", "<\\/");
     html.replace("__INITIAL_STATE__", &escaped)
 }

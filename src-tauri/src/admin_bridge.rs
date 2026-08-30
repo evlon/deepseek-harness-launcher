@@ -144,15 +144,50 @@ fn origin_allowed(origin: &str) -> bool {
 }
 
 /// 处理单个请求：CORS → token → 路由。
+/// 外包一层整体超时：handler 意外卡死（读 body/写响应阻塞）时，
+/// 不再无限占用线程与连接（曾出现 CLOSE_WAIT 堆积 + 线程泄漏导致进程崩溃）。
 fn handle_request<R: Runtime>(
+    request: tiny_http::Request,
+    app: &AppHandle<R>,
+    token: &str,
+    allow_scripts: bool,
+) {
+    let h = app.clone();
+    let token = token.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        handle_request_inner(request, &h, &token, allow_scripts);
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(REQUEST_HANDLER_TIMEOUT_SECS)) {
+        Ok(()) => {
+            let _ = worker.join();
+        }
+        Err(_) => {
+            // 超时：记录并放弃（worker 线程 detached，连接由 OS 回收）
+            log::error!(
+                "管理能力：请求处理超时（{}s），已放弃该连接，防止线程/连接泄漏",
+                REQUEST_HANDLER_TIMEOUT_SECS
+            );
+        }
+    }
+}
+
+/// 单个请求处理超时（秒）：读 body / 写响应任一卡死超过该时长即放弃。
+const REQUEST_HANDLER_TIMEOUT_SECS: u64 = 15;
+
+/// 实际请求处理（被 handle_request 超时包装）。
+fn handle_request_inner<R: Runtime>(
     mut request: tiny_http::Request,
     app: &AppHandle<R>,
     token: &str,
     allow_scripts: bool,
 ) {
-    // 读取 body（tiny_http 正确处理 Content-Length/分片/keep-alive）
+    // 读取 body（tiny_http 正确处理 Content-Length/分片/keep-alive；
+    // 无 body 的 GET 得到 empty reader，立即返回）
     let mut body_bytes = Vec::new();
     let _ = request.as_reader().read_to_end(&mut body_bytes);
+    log::info!("管理能力：body 读取完成（{} 字节）", body_bytes.len());
 
     let method = request.method().to_string();
     let url = request.url().to_string();
@@ -256,7 +291,9 @@ fn handle_request<R: Runtime>(
             return;
         }
     };
+    log::info!("管理能力：路由处理完成，准备响应 {method} {path}");
     respond_json(request, 200, resp, &origin);
+    log::info!("管理能力：响应已发送 {method} {path}");
 }
 
 /// 解析 query string（百分号解码）。
