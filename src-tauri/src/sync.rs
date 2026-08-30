@@ -152,13 +152,41 @@ static SYNC_MARKER: u8 = 0;
 
 // ---------- 本地已装清单 ----------
 
-/// 读取所有 profile 已安装的插件名（跨 profile 去重），失败返回空。
-pub fn installed_plugins<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Vec<String> {
-    collect_client_state(app, cfg)
-        .iter()
-        .map(|p| p.name.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
+/// 当前生效 profile 已安装的插件名（用于「服务器推荐装到当前 profile」的待装判断）。
+///
+/// 口径：只看 `resolve_profile(cfg)` 对应的 profile 的 dependencies，
+/// 且 node_modules 里确实存在（package.json 写了但没装上不算已装）。
+/// 与 `installed_plugins`（跨所有 profile，用于上报）不同——待装判断
+/// 必须以「同事当前运行的 profile」为准，否则会出现「web 装了、matrix 没装，
+/// 但默认跑 matrix 却提示已装」的矛盾（用户实测：服务器配了 dsh-codebuddy-models，
+/// 装进 web 后默认 matrix 找不到）。
+pub fn installed_plugins_current_profile<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+) -> Vec<String> {
+    let profile = resolve_profile(cfg);
+    let profile_dir = dsh_home(app, cfg).join("profiles").join(profile);
+    let manifest = profile_dir.join("package.json");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) else {
+        return Vec::new();
+    };
+    deps.keys()
+        .filter(|name| {
+            // 需真实存在于 node_modules（含 scoped 包 @scope/name 的目录嵌套）
+            let nm = profile_dir.join("node_modules");
+            let pkg_dir = match name.split_once('/') {
+                Some((scope, rest)) => nm.join(scope).join(rest),
+                None => nm.join(name),
+            };
+            pkg_dir.join("package.json").is_file()
+        })
+        .cloned()
         .collect()
 }
 
@@ -415,18 +443,20 @@ pub async fn sync_once<R: Runtime>(
     }
     let token = cfg.admin_token.as_deref().unwrap_or("").to_string();
     let plugin_infos = collect_client_state(app, cfg);
-    let installed: Vec<String> = plugin_infos.iter().map(|p| p.name.clone()).collect();
+    // 上报用全量（管理页看所有 profile）；待装判断用「当前 profile 已装」
+    let installed_all: Vec<String> = plugin_infos.iter().map(|p| p.name.clone()).collect();
+    let installed_current = installed_plugins_current_profile(app, cfg);
     let mut state = load_state(app, cfg);
 
     let outcome = match fetch_config(&server_url, &token).await {
         Ok(config) => {
-            let pending = pending_plugins(&config.plugins, &installed);
+            let pending = pending_plugins(&config.plugins, &installed_current);
             // 服务器配置覆盖本地（遵循「用户显式设置过的不被覆盖」）
             apply_server_defaults(app, &config);
             // 缓存菜单策略（托盘渲染据此展示；用户配置永不被覆盖）
             state.cached_managed_menu = config.managed_menu.clone();
             state.cached_config = Some(config.clone());
-            state.last_installed = installed.clone();
+            state.last_installed = installed_all.clone();
             state.last_sync_at = Some(now_iso());
             save_state(app, cfg, &state);
             // 菜单策略可能变化 → 刷新托盘
@@ -450,7 +480,7 @@ pub async fn sync_once<R: Runtime>(
             let pending = state
                 .cached_config
                 .as_ref()
-                .map(|c| pending_plugins(&c.plugins, &installed))
+                .map(|c| pending_plugins(&c.plugins, &installed_current))
                 .unwrap_or_default();
             SyncOutcome {
                 pending_changed: false,
@@ -483,7 +513,7 @@ pub async fn sync_once<R: Runtime>(
             hostname: &hostname,
             dsh_version: &dsh_version,
             launcher_version: env!("CARGO_PKG_VERSION"),
-            installed: &installed,
+            installed: &installed_all,
             pending: &outcome.pending,
             offline: false,
             plugins: &plugin_infos,
@@ -595,9 +625,12 @@ pub async fn spawn_sync_loop<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// 安装一个插件（供托盘菜单调用）：`node <dsh>/lib/bin.js plugin --profile web add <name>`。
+/// 安装一个插件（供托盘菜单调用）：`node <dsh>/lib/bin.js plugin --profile <当前profile> add <name>`。
+/// profile 取当前生效配置（`resolve_profile`）——服务器推荐的插件要装到
+/// 同事实际运行的 profile（默认 matrix），否则会出现「装了但运行的 profile 里没有」。
 pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Result<(), String> {
     let cfg = load_cached();
+    let profile = resolve_profile(&cfg);
     let node = effective_node_path(app, &cfg);
     let dsh_bin = dsh_binary_path(app);
     if !node.exists() || !dsh_bin.exists() {
@@ -608,7 +641,7 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
     cmd.arg(&dsh_bin)
         .arg("plugin")
         .arg("--profile")
-        .arg("web")
+        .arg(&profile)
         .arg("add")
         .arg(name)
         .current_dir(dsh_install_path(app))
@@ -626,7 +659,7 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
         log::error!("安装插件 {name} 失败（exit={}）：{}", output.status, stderr.trim());
         return Err(format!("PLUGIN_INSTALL_FAILED: {name}（exit={}），详情见日志", output.status));
     }
-    log::info!("插件已安装：{name}");
+    log::info!("插件已安装：{name}（profile={profile}）");
     Ok(())
 }
 

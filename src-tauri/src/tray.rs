@@ -324,8 +324,9 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
         );
     }
 
-    // 待装清单：优先用缓存的服务端配置（离线也可显示），实时拉取由同步循环负责
-    let installed = crate::sync::installed_plugins(app, &cfg);
+    // 待装清单：优先用缓存的服务端配置（离线也可显示），实时拉取由同步循环负责。
+    // 判断口径 = 当前 profile 已装（服务器推荐装到同事实际运行的 profile）
+    let installed = crate::sync::installed_plugins_current_profile(app, &cfg);
     let state = crate::sync::load_state(app, &cfg);
     let pending: Vec<String> = state
         .cached_config
@@ -363,7 +364,7 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
 /// 供菜单点击时取「第 i 个待装插件名」（与 build_sync_submenu 的索引一致）。
 fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<String> {
     let cfg = load_cached();
-    let installed = crate::sync::installed_plugins(app, &cfg);
+    let installed = crate::sync::installed_plugins_current_profile(app, &cfg);
     let state = crate::sync::load_state(app, &cfg);
     state
         .cached_config

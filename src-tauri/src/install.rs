@@ -39,6 +39,7 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         "下载 Harness 核心",
         "预置 web 插件",
         "预置 matrix 数字分身",
+        "安装服务器推荐插件",
     ];
     crate::ops::start_op(app, "install", "安装 / 修复", &steps);
     if let Err(e) = crate::console::open_console(app) {
@@ -115,10 +116,51 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     crate::notify::notify(app, "安装 / 修复", "预置 matrix 数字分身…");
     preset_matrix_profile(app, &cfg).await?;
 
+    // 服务器推荐的插件装到当前生效 profile（同事实际运行的 profile）。
+    // 默认 profile 是 matrix，服务器推荐的 web 类插件（如 dsh-codebuddy-models）
+    // 必须装到这里才会在运行实例里生效——装到 web profile 对 matrix 用户不可见。
+    crate::ops::mark_step_running(app, 5);
+    crate::ops::update_step(app, "安装服务器推荐插件…");
+    crate::notify::notify(app, "安装 / 修复", "安装服务器推荐插件…");
+    install_server_recommended(app, &cfg).await?;
+
     crate::ops::finish_op(app, "DeepSeek Harness 及依赖已就绪");
     crate::notify::notify(app, "安装完成", "DeepSeek Harness 及依赖已就绪");
     log::info!("全部依赖安装完成");
     Ok(())
+}
+
+/// 把服务器推荐的、当前 profile 未装的插件安装到当前 profile。
+/// 失败不阻断（仅日志+通知），避免单个插件问题拖垮整个安装流程。
+async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+    let server_url = resolve_server_url(cfg);
+    if server_url.is_empty() {
+        log::info!("未配置服务端，跳过服务器推荐插件安装");
+        return Ok(());
+    }
+    // 用本地缓存的推荐清单（sync 循环已缓存；离线也能装上次拉到的）
+    let state = crate::sync::load_state(app, cfg);
+    let Some(recommended) = state.cached_config.as_ref().map(|c| c.plugins.clone()) else {
+        log::info!("暂无服务端推荐清单缓存，跳过");
+        return Ok(());
+    };
+    let installed = crate::sync::installed_plugins_current_profile(app, cfg);
+    let pending = crate::sync::pending_plugins(&recommended, &installed);
+    if pending.is_empty() {
+        log::info!("当前 profile 无待装推荐插件");
+        return Ok(());
+    }
+    let profile = resolve_profile(cfg);
+    log::info!("安装服务器推荐插件到 {profile}：{}", pending.join(", "));
+    let result = preset_profile(app, cfg, &profile, &pending).await;
+    // 安装结果不影响整体完成（失败有日志 + 托盘可重试）
+    if let Err(e) = &result {
+        log::error!("服务器推荐插件安装失败：{e}");
+        crate::notify::notify(app, "推荐插件安装未完成", &format!("部分插件安装失败，可在托盘「同步 / 推荐插件」重试：{e}"));
+    }
+    // 安装后刷新托盘（pending 归零则不再提示待装）
+    crate::tray::refresh_sync_menu(app);
+    result
 }
 
 /// 把 launcher-brand 插件目录复制到 `<dsh_home>/launcher-brand`。
