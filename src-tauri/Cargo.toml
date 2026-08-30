@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-harness-launcher"
-version = "0.2.0"
+version = "0.2.1"
 description = "托盘常驻启动器：安装 / 启动 DeepSeek Harness 及依赖，并提供加速与网址菜单"
 authors = [ "deepseek-harness-launcher contributors" ]
 edition = "2021"
