@@ -150,13 +150,18 @@ async function startMirrorUpload(){
   }catch(e){ toast("无法连接管理员管理能力："+esc(e.message),"err"); }
 }
 let mirrorPollTimer=null;
+let mirrorPollFailures=0; // 连续轮询失败次数（bridge 短暂卡顿时重试，不永久停在"同步中"）
+const MIRROR_POLL_MAX_FAILURES=5;
 async function pollMirrorProgress(){
   if(!bridgePort) return;
   const bridgeTok=localStorage.getItem("bridgeToken")||"";
   try{
-    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/progress?token="+encodeURIComponent(bridgeTok),{headers:headers(false)});
+    const ctrl=new AbortController();
+    setTimeout(()=>ctrl.abort(),8000); // 单次轮询超时（bridge 卡死时不无限挂起）
+    const r=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/progress?token="+encodeURIComponent(bridgeTok),{headers:headers(false),signal:ctrl.signal});
     const j=await r.json();
     if(!j.ok) return;
+    mirrorPollFailures=0; // 成功一次即重置失败计数
     const p=j.progress||{};
     const el=document.getElementById("mirrorProgress");
     const st=document.getElementById("mirrorState");
@@ -177,6 +182,7 @@ async function pollMirrorProgress(){
       if(mirrorPollTimer) clearTimeout(mirrorPollTimer);
       mirrorPollTimer=setTimeout(pollMirrorProgress,3000);
     } else if(p.state==="done"){
+      if(mirrorPollTimer){ clearTimeout(mirrorPollTimer); mirrorPollTimer=null; }
       el.innerHTML='<div style="background:#e8f7ee;border:1px solid #b7e3c8;border-radius:8px;padding:10px 14px">'+
         '✅ 上传完成：'+p.done_pkgs+'/'+p.total_pkgs+' 个包已同步到 '+esc(p.registry||"")+
         '</div>';
@@ -189,6 +195,7 @@ async function pollMirrorProgress(){
       // 完成后刷新插件同步状态徽章
       renderPlugins();
     } else if(p.state==="error"){
+      if(mirrorPollTimer){ clearTimeout(mirrorPollTimer); mirrorPollTimer=null; }
       el.innerHTML='<div style="background:#fdeaea;border:1px solid #f5c6c6;border-radius:8px;padding:10px 14px">'+
         '❌ 上传出错：'+esc((p.error||"").slice(0,300))+
         '</div>';
@@ -199,7 +206,21 @@ async function pollMirrorProgress(){
         '❌ 同步出错：'+esc((p.error||"").slice(0,200))+'</div>';
       if(ssEl) ssEl.innerHTML='<span style="color:var(--red)">出错</span>';
     }
-  }catch(e){ /* 连接断开忽略 */ }
+  }catch(e){
+    // 轮询失败（bridge 卡死/暂时不可用）：重试而不是永久停在"同步中"
+    mirrorPollFailures++;
+    if(mirrorPollFailures<=MIRROR_POLL_MAX_FAILURES){
+      if(mirrorPollTimer) clearTimeout(mirrorPollTimer);
+      mirrorPollTimer=setTimeout(pollMirrorProgress,5000); // 失败间隔拉长到 5s
+    }else{
+      if(mirrorPollTimer){ clearTimeout(mirrorPollTimer); mirrorPollTimer=null; }
+      const spEl=document.getElementById("syncProgress");
+      const ssEl=document.getElementById("syncState");
+      if(spEl) spEl.innerHTML='<div style="background:#fdf3e7;border:1px solid #f0d4b0;border-radius:8px;padding:8px 12px;font-size:13px">'+
+        '⚠ 进度查询中断（本机管理能力无响应）——已停止轮询，可刷新页面重试</div>';
+      if(ssEl) ssEl.innerHTML='<span style="color:var(--amber)">查询中断</span>';
+    }
+  }
 }
 async function loadStatus(){
   try{
@@ -212,6 +233,17 @@ async function loadStatus(){
     latestClients=j.clients||[];
     renderKpis(); renderOverviewClients(); renderClients();
     autoDetectBridge();
+    // 恢复镜像上传进度轮询：若本机管理能力已连接且上传可能在进行（上次停在了 running），
+    // 页面刷新/加载后继续显示进度，而不是停留在旧状态
+    if(bridgePort && !mirrorPollTimer){
+      try{
+        const ctrl=new AbortController();
+        setTimeout(()=>ctrl.abort(),4000);
+        const pr=await fetch("http://127.0.0.1:"+bridgePort+"/api/registry/mirror/progress?token="+encodeURIComponent(localStorage.getItem("bridgeToken")||""),{headers:headers(false),signal:ctrl.signal});
+        const pj=await pr.json();
+        if(pj&&pj.ok&&pj.progress&&pj.progress.state==="running") pollMirrorProgress();
+      }catch(e){ /* 未连接/无上传，忽略 */ }
+    }
     const t=latestClients.length? ("上次更新 " + fmtTime(latestClients[0].lastSyncAt)) : "等待客户端上报";
     document.getElementById("syncHint").innerHTML="<b>"+latestClients.length+"</b> 台客户端 · "+t;
   }catch(e){ toast("加载客户端失败："+esc(e.message),"err"); }
