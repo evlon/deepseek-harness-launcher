@@ -12,6 +12,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{AppHandle, Runtime};
 
 use crate::config::*;
@@ -154,6 +155,19 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
     }
     let cwd = dsh_install_path(app);
 
+    // stderr 重定向到日志文件：dsh 启动失败（缺插件 patch/配置等）时，
+    // 用户能在 launcher.log 里看到真实错误（此前 Stdio::null 吞掉错误，
+    // 表现为「提示成功但打不开网页」且无处查错）。
+    let cfg2 = load_cached();
+    let stderr_log = crate::config::dsh_home(app, &cfg2)
+        .join("logs")
+        .join(format!("dsh-launch-{}.log", std::process::id()));
+    if let Some(parent) = stderr_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stderr_file = std::fs::File::create(&stderr_log)
+        .map_err(|e| format!("STDERR_LOG_CREATE_FAILED: {e}"))?;
+
     let mut cmd = Command::new(&node);
     cmd.arg(&dsh_bin)
         .arg("--profile")
@@ -165,7 +179,8 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(stderr_file));
+    log::info!("Harness stderr 日志：{}", stderr_log.display());
 
     // rc.8+ 支持 --no-open（启动不弹系统浏览器）；更早版本无此标志。
     if version_supports_no_open(app) {
@@ -184,8 +199,24 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
 
     let child = cmd.spawn().map_err(|e| format!("HARNESS_LAUNCH_FAILED: {e}"))?;
     let pid = child.id();
-    // 不直接 wait，仅记录 PID + 端口；进程在后台运行。
+    // 等待端口就绪：spawn 成功 ≠ 服务可用（dsh 冷启动需加载插件/起 HTTP）。
+    // 轮询端口监听，就绪才算真正启动成功；超时/进程退出则报失败并清理。
     *RUNNING.lock().unwrap() = Some(Running { pid, port, profile: profile.to_string() });
+    log::info!(
+        "Harness 进程已 spawn：PID={}, 端口={}, profile={}，等待端口就绪…",
+        pid,
+        port,
+        profile
+    );
+    let ready = wait_for_port(port, pid, Duration::from_secs(LAUNCH_READY_TIMEOUT_SECS));
+    if !ready {
+        // 启动失败：杀进程树 + 清理状态
+        kill_pid_tree(pid);
+        *RUNNING.lock().unwrap() = None;
+        return Err(format!(
+            "HARNESS_NOT_READY: 进程已启动但 {LAUNCH_READY_TIMEOUT_SECS}s 内端口 {port} 未就绪（可能初始化失败/崩溃）"
+        ));
+    }
     log::info!(
         "Harness 已启动：PID={}, 端口={}, profile={}, 数据目录={}",
         pid,
@@ -194,6 +225,30 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
         crate::config::dsh_home(app, &cfg).display()
     );
     Ok(port)
+}
+
+/// 启动后等待端口就绪的最大时长（秒）。dsh 冷启动（插件加载 + HTTP 起服务）一般 5-20s。
+const LAUNCH_READY_TIMEOUT_SECS: u64 = 40;
+
+/// 轮询等待端口被监听；同时检测进程是否提前退出。
+fn wait_for_port(port: u16, pid: u32, timeout: Duration) -> bool {
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
+    loop {
+        if port_in_use(port) {
+            log::info!("端口 {port} 已就绪（耗时 {:.1}s）", started.elapsed().as_secs_f64());
+            return true;
+        }
+        if !pid_alive(pid) {
+            log::warn!("Harness 进程 PID={pid} 已退出，端口 {port} 未就绪");
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::warn!("等待端口 {port} 就绪超时（{}s）", timeout.as_secs());
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// 停止 Harness 服务进程树。

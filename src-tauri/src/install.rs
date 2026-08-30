@@ -124,6 +124,11 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     crate::notify::notify(app, "安装 / 修复", "安装服务器推荐插件…");
     install_server_recommended(app, &cfg).await?;
 
+    // 补齐缺失的 bundle patch：npm 发布的 bundle 可能声明 dsh.bundle.patch
+    // 但实际没打包该文件（如 dsh-matrix-agent 0.2.1），dsh 启动读 overlay 崩溃。
+    // 自动创建最小 patch（insert + disabled，用户配置后再启用）。
+    repair_missing_bundle_patches(app, &cfg);
+
     crate::ops::finish_op(app, "DeepSeek Harness 及依赖已就绪");
     crate::notify::notify(app, "安装完成", "DeepSeek Harness 及依赖已就绪");
     log::info!("全部依赖安装完成");
@@ -179,6 +184,106 @@ async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
     // 安装后刷新托盘（pending 归零则不再提示待装）
     crate::tray::refresh_sync_menu(app);
     result
+}
+
+/// 补齐缺失的 bundle patch 文件。
+///
+/// 背景：bundle 插件的 package.json 声明 `dsh.bundle.patch: ./cordis.patch.yml`，
+/// 但 npm 发布时可能没把该文件打进去（实测 dsh-matrix-agent 所有版本都缺）。
+/// dsh 启动时 `loadOverlayPatches` 读不到文件直接 throw → 整个插件树加载失败，
+/// 表现为「提示启动成功但打不开网页」。
+///
+/// 处理：遍历 profile 的 node_modules 下所有 bundle 声明插件，检测 patch 文件
+/// 缺失 → 自动创建最小 patch（`insert` 新 entry + `disabled: true`，避免插件
+/// 因缺少必需配置（如 Matrix token）在启动时抛错拖垮整棵树）。
+/// 用户配置好后在 profile 的 cordis.patch.yml 覆盖 disabled: false 即可启用。
+fn repair_missing_bundle_patches<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) {
+    let profiles_dir = dsh_home(app, cfg).join("profiles");
+    let Ok(entries) = std::fs::read_dir(&profiles_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let profile_dir = entry.path();
+        let nm = profile_dir.join("node_modules");
+        // 扫描 node_modules 顶层 + @scope 下的包（返回完整包名 name@scope 形式）
+        let scan = |dir: &PathBuf, scope: Option<&str>| -> Vec<(String, PathBuf)> {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return Vec::new();
+            };
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| {
+                    let pkg_json = e.path().join("package.json");
+                    if !pkg_json.is_file() {
+                        return None;
+                    }
+                    let text = std::fs::read_to_string(&pkg_json).ok()?;
+                    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+                    // 仅收集声明了 dsh.bundle.patch 的包
+                    let has_patch = json
+                        .get("dsh")
+                        .and_then(|d| d.get("bundle"))
+                        .and_then(|b| b.get("patch"))
+                        .and_then(|p| p.as_str())
+                        .is_some();
+                    if !has_patch {
+                        return None;
+                    }
+                    let leaf = e.file_name().to_string_lossy().to_string();
+                    let full = match scope {
+                        Some(s) => format!("@{s}/{leaf}"),
+                        None => leaf.clone(),
+                    };
+                    Some((full, e.path()))
+                })
+                .collect()
+        };
+        let mut bundles = scan(&nm, None);
+        if let Ok(scoped) = std::fs::read_dir(nm.join("@deepseek-ai")) {
+            for s in scoped.flatten() {
+                if s.path().is_dir() {
+                    bundles.extend(scan(&s.path(), Some("deepseek-ai")));
+                }
+            }
+        }
+        for (name, pkg_dir) in bundles {
+            // 从 package.json 读 patch 相对路径
+            let text = std::fs::read_to_string(pkg_dir.join("package.json")).unwrap_or_default();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+            let Some(patch_rel) = json
+                .get("dsh")
+                .and_then(|d| d.get("bundle"))
+                .and_then(|b| b.get("patch"))
+                .and_then(|p| p.as_str())
+            else {
+                continue;
+            };
+            let patch_path = pkg_dir.join(patch_rel.trim_start_matches("./"));
+            if patch_path.exists() {
+                continue;
+            }
+            // 创建最小 patch（insert + disabled）
+            let content = format!(
+                "# {name} bundle 层（launcher 自动补：npm 发布缺此文件导致 dsh 启动崩溃）\n\
+                 # 插件默认 disabled：配置好必需项后，在 profile 的 cordis.patch.yml 覆盖 disabled: false。\n\
+                 - insert:\n\
+                 \x20   - id: {name}\n\
+                 \x20     name: {name}\n\
+                 \x20     disabled: true\n\
+                 \x20     config: {{}}\n"
+            );
+            if let Some(parent) = patch_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&patch_path, content) {
+                Ok(()) => log::info!("已自动补缺失 bundle patch：{}", patch_path.display()),
+                Err(e) => log::warn!("补 bundle patch 失败 {}：{e}", patch_path.display()),
+            }
+        }
+    }
 }
 
 /// 把 launcher-brand 插件目录复制到 `<dsh_home>/launcher-brand`。
