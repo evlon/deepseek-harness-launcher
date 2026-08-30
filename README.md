@@ -10,6 +10,8 @@
   托盘「📋 查看进度 / 日志」随时重开窗口。
 - **安装 / 修复**：独立安装引擎，一键安装全部依赖（Node.js、pnpm、dsh 核心、Windows 上另有 MinGit），
   多下载源 + Range 断点续传 + SHA-256 校验 + 解压原子切换。Node 已装但版本不符（半成品安装）会重装。
+  **dsh 核心走 npm 安装**（`pnpm add @deepseek-ai/dsh@<version>`，npmmirror 稳定源，版本精确可控），
+  安装/修复时检测旧 GitHub 结构并自动重建为 npm 结构。
   安装完成后自动创建 web profile 并预置常用插件（`dsh-codebuddy-models`、`dsh-nested-followups`、
   `dsh-plugin-message-rewrite`、`@noob-stupid/dsh-plugin-console`，对齐桌面端）。
 - **启动 / 停止 Harness**：`node dsh/lib/bin.js --profile <name> --host 127.0.0.1 --port <port>`，

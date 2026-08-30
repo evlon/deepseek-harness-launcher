@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod console;
 mod download;
+mod dsh_npm;
 mod dsh_versions;
 mod install;
 mod logging;

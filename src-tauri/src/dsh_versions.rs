@@ -38,17 +38,30 @@ fn active_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     dsh_install_path(app)
 }
 
-/// 读取一个版本目录的 package.json 版本号（形如 `0.1.1-rc.1`）。
+/// 读取一个版本目录的版本号。
+/// - 旧 GitHub 版：顶层 package.json 有 version（deepseek-harness-pkg 薄壳）
+/// - npm 版：顶层是 dsh-runtime 壳（无 version），从 node_modules/@deepseek-ai/dsh/package.json 读
 /// 容忍 UTF-8 BOM（Windows 上 PowerShell/记事本写入可能带 BOM，serde_json 不认）。
 fn version_from_dir(dir: &Path) -> Option<String> {
-    let manifest = dir.join("package.json");
-    let mut text = std::fs::read_to_string(&manifest).ok()?;
-    // 剥离 UTF-8 BOM（\u{FEFF}）
-    if text.starts_with('\u{FEFF}') {
-        text = text.trim_start_matches('\u{FEFF}').to_string();
+    let read_version = |manifest: &Path| -> Option<String> {
+        let mut text = std::fs::read_to_string(manifest).ok()?;
+        if text.starts_with('\u{FEFF}') {
+            text = text.trim_start_matches('\u{FEFF}').to_string();
+        }
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        json.get("version")?.as_str().map(|s| s.to_string())
+    };
+
+    // 1) 顶层 package.json
+    if let Some(v) = read_version(&dir.join("package.json")) {
+        return Some(v);
     }
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    json.get("version")?.as_str().map(|s| s.to_string())
+    // 2) npm 版：node_modules/@deepseek-ai/dsh/package.json
+    read_version(
+        &dir.join("node_modules")
+            .join(crate::dsh_npm::DSH_NPM_PACKAGE)
+            .join("package.json"),
+    )
 }
 
 /// 已安装的版本列表（按版本号倒序，最新的在前）。
@@ -94,11 +107,16 @@ pub fn list_installed<R: Runtime>(app: &AppHandle<R>) -> Vec<serde_json::Value> 
 
 /// 简单 semver 比较（a < b → Less，a > b → Greater）。
 /// 处理 rc/beta 等预发布后缀（`0.1.1-rc.2` < `0.1.1`）。
-fn semver_compare(a: &str, b: &str) -> std::cmp::Ordering {
+pub fn semver_compare_public(a: &str, b: &str) -> std::cmp::Ordering {
     match (semver::Version::parse(a), semver::Version::parse(b)) {
         (Ok(x), Ok(y)) => x.cmp(&y),
         _ => a.cmp(b),
     }
+}
+
+/// 简单 semver 比较（内部别名，保持旧调用不变）。
+fn semver_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    semver_compare_public(a, b)
 }
 
 /// 当前激活版本的 tag（目录名；无版本目录时回退 "current"）。
@@ -123,121 +141,48 @@ pub fn active_version<R: Runtime>(app: &AppHandle<R>) -> String {
     version_from_dir(&active_dir(app)).unwrap_or_default()
 }
 
-/// GitHub 上 deepseek-harness-pkg 的 release tag 列表（含资产 URL）。
+/// npm registry 上的 @deepseek-ai/dsh 版本列表（含 dist-tag / 预发布标记）。
 /// 网络失败返回 Err——调用方降级为仅本地列表。
 pub async fn fetch_remote_releases() -> Result<Vec<serde_json::Value>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("dsh-harness-launcher-version")
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    // 直连 GitHub API，失败走 ghfast.top 镜像
-    let api_url = "https://api.github.com/repos/dsh-tauri-desk/deepseek-harness-pkg/releases?per_page=20";
-    let mut urls = vec![api_url.to_string()];
-    if let Ok(prefix) = std::env::var("GH_MIRROR") {
-        if !prefix.is_empty() {
-            urls.push(format!("{prefix}{api_url}"));
-        }
-    }
-    urls.push(format!("https://ghfast.top/{api_url}"));
-
-    let asset_name = dsh_asset_filename()?;
-    let mut last_err = String::new();
-    for url in &urls {
-        match client.get(url).send().await {
-            Ok(res) if res.status().is_success() => {
-                let releases: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-                let arr = releases.as_array().ok_or("releases 非数组")?;
-                let out: Vec<serde_json::Value> = arr
-                    .iter()
-                    .filter_map(|r| {
-                        let tag = r.get("tag_name")?.as_str()?.to_string();
-                        let prerelease = r.get("prerelease").and_then(|v| v.as_bool()).unwrap_or(false);
-                        // 资产 URL：固定命名，按 tag 拼
-                        let asset_url = format!(
-                            "https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/download/{tag}/{asset_name}"
-                        );
-                        Some(serde_json::json!({
-                            "tag": tag,
-                            "version": normalize_tag_version(&tag),
-                            "prerelease": prerelease,
-                            "assetUrl": asset_url,
-                        }))
-                    })
-                    .collect();
-                log::info!("dsh 版本列表：从 {url} 拉到 {} 个 release", out.len());
-                return Ok(out);
-            }
-            Ok(res) => last_err = format!("HTTP {}", res.status()),
-            Err(e) => last_err = e.to_string(),
-        }
-    }
-    Err(format!("FETCH_DSH_RELEASES_FAILED: {last_err}"))
+    let versions = crate::dsh_npm::fetch_remote_versions().await?;
+    // 兼容旧字段名（tag=版本号，version=版本号，prerelease，assetUrl 弃用）
+    let out: Vec<serde_json::Value> = versions
+        .into_iter()
+        .map(|mut v| {
+            let ver = v["version"].as_str().unwrap_or("").to_string();
+            v["tag"] = serde_json::Value::String(ver.clone());
+            v["distTag"] = v["distTag"].clone();
+            v
+        })
+        .collect();
+    log::info!("dsh 版本列表（npm）：拉到 {} 个版本", out.len());
+    Ok(out)
 }
 
-/// dsh 平台资产文件名（与 download.rs 一致）。
-fn dsh_asset_filename() -> Result<String, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", _) => Ok("deepseek-harness-pkg-windows.zip".to_string()),
-        ("macos", "aarch64") => Ok("deepseek-harness-pkg-macos-arm64.zip".to_string()),
-        ("macos", "x86_64") => Ok("deepseek-harness-pkg-macos-x64.zip".to_string()),
-        ("linux", _) => Ok("deepseek-harness-pkg-linux.zip".to_string()),
-        other => Err(format!("不支持的平台：{:?}", other)),
-    }
-}
-
-/// 下载并安装指定版本到 `dsh-versions/<tag>`（不切换激活）。
-/// 下载源优先级：内网镜像（config.dshMirrorUrl）→ GitHub 官方 → ghfast.top 镜像。
+/// 安装指定版本到 `dsh-versions/<tag>`（不切换激活）。
+/// 方式：pnpm 从 npm registry（npmmirror）安装 @deepseek-ai/dsh@<version>。
+/// tag 即 npm 版本号（如 `0.1.1-rc.2`），版本目录名用 `v<version>` 前缀区分。
 pub async fn install_version<R: Runtime>(
     app: &AppHandle<R>,
     tag: &str,
     on_progress: crate::download::ProgressCallback<'_>,
 ) -> Result<(), String> {
-    let cfg = load_cached();
-    let dest = version_dir(app, tag);
+    // tag 兼容：v0.1.1-rc.2 → 0.1.1-rc.2（npm 版本号不带 v）
+    let version = tag.trim_start_matches('v');
+    let dir_name = format!("v{version}");
+    let dest = version_dir(app, &dir_name);
     if dest.join("package.json").exists() {
-        log::info!("dsh 版本 {tag} 已存在，跳过下载");
+        log::info!("dsh 版本 {version} 已存在，跳过安装");
         return Ok(());
     }
 
     // 首次启用版本管理：把当前激活 dsh 备份进版本目录，避免旧版本"消失"
     ensure_active_backed_up(app);
 
-    let asset_name = dsh_asset_filename()?;
-    // 收集候选 URL：内网镜像 → GitHub 官方 → ghfast.top
-    let mut urls: Vec<String> = Vec::new();
-    // 1) 内网镜像（管理员配置，形如 http://registry.ict.cmcc/dsh/）
-    if let Some(mirror) = dsh_mirror_base(&cfg) {
-        urls.push(format!(
-            "{}{}/{}",
-            mirror.trim_end_matches('/'),
-            tag.trim_start_matches('v'),
-            asset_name
-        ));
-        urls.push(format!(
-            "{}{}/{}",
-            mirror.trim_end_matches('/'),
-            tag,
-            asset_name
-        ));
-    }
-    // 2) GitHub 官方
-    urls.push(format!(
-        "https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/download/{tag}/{asset_name}"
-    ));
-    // 3) ghfast.top 镜像
-    urls.push(format!(
-        "https://ghfast.top/https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/download/{tag}/{asset_name}"
-    ));
-
-    log::info!("下载 dsh {tag}：候选源 {} 个（第一个内网镜像）", urls.len());
-    let buf = crate::download::download_bytes(&urls, on_progress).await?;
-    // 解压到版本目录（ensure_extract 自动摊平 + 原子切换）
-    crate::download::ensure_extract(&asset_name, buf, dest.clone()).await?;
-    let version = version_from_dir(&dest).unwrap_or_else(|| tag.to_string());
-    log::info!("dsh 版本 {tag} 安装完成（package.json 版本 {version}）");
+    log::info!("pnpm 安装 dsh {version} 到版本目录…");
+    crate::dsh_npm::install_to(app, &dest, version, on_progress).await?;
+    let installed = version_from_dir(&dest).unwrap_or_else(|| version.to_string());
+    log::info!("dsh 版本 {version} 安装完成（实际 {installed}）");
     Ok(())
 }
 
@@ -247,7 +192,9 @@ pub async fn switch_version<R: Runtime>(
     app: &AppHandle<R>,
     tag: &str,
 ) -> Result<(String, String), String> {
-    let src = version_dir(app, tag);
+    // tag 可能是 v<version>（目录名）或裸版本号 → 统一找目录
+    let dir_name = if tag.starts_with('v') { tag.to_string() } else { format!("v{tag}") };
+    let src = version_dir(app, &dir_name);
     if !src.join("package.json").exists() {
         return Err(format!("DSH_VERSION_NOT_INSTALLED: 版本 {tag} 未安装"));
     }
@@ -265,14 +212,14 @@ pub async fn switch_version<R: Runtime>(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // 2. 复制版本目录 → 激活目录（原子替换）
+    // 2. 链接版本目录 → 激活目录（原子替换）
     // 删除可能因 Harness 进程占用而失败（Windows 文件锁）——重试等待，
     // 进程退出后锁释放（真实场景 workflow::stop 已先杀进程树）。
     let old_version = active_version(app);
     let dest = active_dir(app);
     let mut cleaned = false;
     for attempt in 1..=5 {
-        match crate::download::remove_path_if_exists(&dest).await {
+        match safe_remove_dir(&dest) {
             Ok(()) => {
                 cleaned = true;
                 break;
@@ -288,7 +235,31 @@ pub async fn switch_version<R: Runtime>(
     if !cleaned {
         return Err("DSH_SWAP_CLEAN_FAILED: 激活 dsh 目录被占用（Harness 未完全停止？），请重试".to_string());
     }
-    copy_dir_all(&src, &dest).map_err(|e| format!("DSH_SWAP_COPY_FAILED: {e}"))?;
+    // 用目录链接（Windows junction / Unix symlink）替代整目录复制——
+    // 复制 121MB/1 万文件需数分钟，链接瞬间完成。
+    // junction 对应用透明（dsh 通过链接路径访问 node_modules 无感知）。
+    #[cfg(windows)]
+    {
+        // cmd mklink /J <link> <target>（junction 无需管理员权限）
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&dest)
+            .arg(&src)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("DSH_JUNCTION_SPAWN_FAILED: {e}"))?;
+        if !status.success() {
+            // junction 失败（罕见）→ 回退复制
+            log::warn!("创建 junction 失败，回退复制（较慢）");
+            copy_dir_all(&src, &dest).map_err(|e| format!("DSH_SWAP_COPY_FAILED: {e}"))?;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(&src, &dest)
+            .map_err(|e| format!("DSH_SWAP_SYMLINK_FAILED: {e}"))?;
+    }
     let new_version = active_version(app);
     log::info!("dsh 版本切换完成：{old_version} -> {new_version}");
 
@@ -425,6 +396,26 @@ pub async fn check_update<R: Runtime>(app: &AppHandle<R>) -> (String, Option<Str
 }
 
 /// 复制目录（递归，覆盖已有）。
+/// 安全删除目录：junction/symlink 只删链接本身（不递归进目标），普通目录才递归删。
+/// 防止切换时 `remove_dir_all` 误删版本目录内容。
+fn safe_remove_dir(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            // FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+            if meta.file_attributes() & 0x400 != 0 {
+                return std::fs::remove_dir(path).map_err(|e| format!("{e}"));
+            }
+        }
+    }
+    std::fs::remove_dir_all(path).map_err(|e| format!("{e}"))
+}
+
+/// 复制目录（递归，覆盖已有）。
 fn copy_dir_all(src: &Path, dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
@@ -441,19 +432,6 @@ fn copy_dir_all(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// 内网 dsh 分发源（配置 `mirrorSettings.dshMirrorUrl` 或 `clientDefaults.dshMirrorUrl`）。
-/// 形如 `http://registry.ict.cmcc/dsh/`；空 = 未配置，只用 GitHub。
-fn dsh_mirror_base(cfg: &LauncherConfig) -> Option<String> {
-    cfg.mirror_settings
-        .as_ref()
-        .and_then(|m| m.dsh_mirror_url.clone())
-        .filter(|u| !u.is_empty())
-        .or_else(|| {
-            // clientDefaults 里也允许下发（服务器统一管理）
-            None
-        })
 }
 
 /// 首次启用版本管理时，把当前激活 dsh 备份进版本目录（tag=v<version>）。
@@ -488,11 +466,6 @@ mod tests {
         assert_eq!(semver_compare("0.1.2", "0.1.1-rc.3"), std::cmp::Ordering::Greater);
         assert_eq!(semver_compare("1.0.0", "0.9.9"), std::cmp::Ordering::Greater);
         assert_eq!(semver_compare("0.1.1", "0.1.1"), std::cmp::Ordering::Equal);
-    }
-
-    #[test]
-    fn asset_filename_windows() {
-        assert_eq!(dsh_asset_filename().unwrap(), "deepseek-harness-pkg-windows.zip");
     }
 
     #[test]

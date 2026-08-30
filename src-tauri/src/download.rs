@@ -38,7 +38,12 @@ impl Component {
         match self {
             Component::Node => node_installed_ok(app),
             Component::Pnpm => pnpm_binary_path(app).exists(),
-            Component::Dsh => dsh_binary_path(app).exists(),
+            Component::Dsh => {
+                // npm 结构才算已装（node_modules/@deepseek-ai/dsh/bin.js）。
+                // 旧 GitHub 版（deepseek-harness-pkg 薄壳）结构不同 → 视为未装，
+                // 安装/修复时强制重建为 npm 结构（用户确认：统一走 npm 方案）。
+                dsh_binary_path(app).exists() && crate::dsh_npm::is_npm_installed(&dsh_install_path(app))
+            }
             #[cfg(windows)]
             Component::Git => {
                 if git_binary_path(app).exists() {
@@ -80,19 +85,12 @@ impl Component {
                 ensure_extract("pnpm.tgz", buf, self.install_dest(app)).await?;
             }
             Component::Dsh => {
-                let release = fetch_latest_dsh().await?;
-                log::info!("最新 Harness 发行版：{}", release.tag);
-                let cfg = load_cached();
-                // 官方直连 + 全部镜像前缀（多源按序尝试）
-                let mut urls = vec![release.asset_url.clone()];
-                urls.extend(mirror_urls(&release.asset_url, &cfg));
-                let buf = download_bytes(&urls, on_progress).await?;
-                if let Some(digest) = &release.digest {
-                    verify_sha256(&buf, digest)?;
-                } else {
-                    log::warn!("未取到可信摘要，跳过 SHA-256 校验（仅作提示，安装仍继续）");
-                }
-                ensure_extract(&release.asset_name, buf, self.install_dest(app)).await?;
+                // npm 方式：pnpm 安装 @deepseek-ai/dsh@<version>（走 npm registry / npmmirror）。
+                // 相比 GitHub release zip：npm 镜像在国内更稳定，版本精确可控（dist-tags）。
+                let version = crate::dsh_npm::latest_version().await.unwrap_or_default();
+                log::info!("最新 Harness 版本：{}", version);
+                let dest = self.install_dest(app);
+                crate::dsh_npm::install_to(app, &dest, &version, on_progress).await?;
             }
             #[cfg(windows)]
             Component::Git => {
@@ -464,83 +462,7 @@ async fn commit(staging: PathBuf, dest: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------- GitHub 发行版 / 校验和抓取 ----------------
-
-struct DshRelease {
-    tag: String,
-    asset_url: String,
-    asset_name: String,
-    digest: Option<String>,
-}
-
-/// 查询 GitHub 最新 Harness 发行版（tag + 资产地址 + 可信摘要）。
-async fn fetch_latest_dsh() -> Result<DshRelease, String> {
-    let asset_name = dsh_asset_filename()?;
-    let client = gh_client()?;
-    let api = client
-        .get("https://api.github.com/repos/dsh-tauri-desk/deepseek-harness-pkg/releases/latest")
-        .send()
-        .await;
-    match api {
-        Ok(res) if res.status().is_success() => {
-            let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let tag = json
-                .get("tag_name")
-                .and_then(|v| v.as_str())
-                .ok_or("缺少 tag_name")?
-                .to_string();
-            let (asset_url, digest) = json
-                .get("assets")
-                .and_then(|v| v.as_array())
-                .and_then(|assets| {
-                    assets.iter().find(|a| {
-                        a.get("name").and_then(|v| v.as_str()) == Some(asset_name.as_str())
-                    })
-                })
-                .map(|asset| {
-                    let url = asset
-                        .get("browser_download_url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&fallback_dsh_url(&asset_name))
-                        .to_string();
-                    let digest = asset
-                        .get("digest")
-                        .and_then(|v| v.as_str())
-                        .filter(|d| d.starts_with("sha256:"))
-                        .map(|d| d.to_string());
-                    (url, digest)
-                })
-                .unwrap_or((fallback_dsh_url(&asset_name), None));
-            Ok(DshRelease {
-                tag,
-                asset_url,
-                asset_name,
-                digest,
-            })
-        }
-        _ => {
-            log::warn!("GitHub API 不可用，回退到固定发行版地址（无摘要校验）");
-            Ok(DshRelease {
-                tag: "latest".to_string(),
-                asset_url: fallback_dsh_url(&asset_name),
-                asset_name,
-                digest: None,
-            })
-        }
-    }
-}
-
-fn fallback_dsh_url(asset_name: &str) -> String {
-    format!("{DSH_CORE_URL}{asset_name}")
-}
-
-fn gh_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent("deepseek-harness-launcher")
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())
-}
+// ---------------- Node.js 校验和抓取 ----------------
 
 /// 从 Node.js 官方 SHASUMS256.txt 读取指定平台包摘要。
 async fn fetch_node_sha256(filename: &str) -> Result<String, String> {
@@ -568,16 +490,6 @@ async fn fetch_node_sha256(filename: &str) -> Result<String, String> {
 }
 
 // ---------------- 平台资产命名 ----------------
-
-fn dsh_asset_filename() -> Result<String, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", _) => Ok("deepseek-harness-pkg-windows.zip".to_string()),
-        ("macos", "aarch64") => Ok("deepseek-harness-pkg-macos-arm64.zip".to_string()),
-        ("macos", "x86_64") => Ok("deepseek-harness-pkg-macos-x64.zip".to_string()),
-        ("linux", _) => Ok("deepseek-harness-pkg-linux.zip".to_string()),
-        other => Err(format!("不支持的平台：{:?}", other)),
-    }
-}
 
 fn node_download_url() -> (String, String) {
     let filename = node_pkg_filename();

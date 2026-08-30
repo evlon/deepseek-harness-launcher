@@ -228,6 +228,8 @@ pub const NODE_VERSION: &str = "v22.22.0";
 pub const NODE_BASE_URL: &str = "https://nodejs.org/dist/";
 pub const NODE_MIRROR_BASE_URL: &str = "https://npmmirror.com/mirrors/node/";
 
+/// GitHub 直发 dsh 包地址（已弃用——dsh 安装改为 npm 方式；保留常量供回退/参考）。
+#[allow(dead_code)]
 pub const DSH_CORE_URL: &str =
     "https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/latest/download/";
 pub const DSH_MIRROR_PREFIX: &str = "https://ghfast.top/";
@@ -759,6 +761,8 @@ pub fn resolve_gh_prefix(cfg: &LauncherConfig) -> Option<String> {
 
 /// 为任意 GitHub 资产 URL 生成中转兜底地址列表（每个镜像前缀一个）。
 /// 顺序 = 配置顺序；直连时返回空（调用方应只用官方 URL）。
+/// 注：dsh 安装已改 npm 方式，此函数当前仅被测试引用；保留供其他 GitHub 下载回退。
+#[allow(dead_code)]
 pub fn mirror_urls(asset_url: &str, cfg: &LauncherConfig) -> Vec<String> {
     let prefixes = resolve_gh_prefixes(cfg);
     if prefixes.is_empty() {
