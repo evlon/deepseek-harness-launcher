@@ -46,7 +46,7 @@ pub fn cmd_stop<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, Stri
 #[tauri::command]
 pub async fn cmd_sync<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
     let cfg = crate::config::load_cached();
-    let outcome = crate::sync::sync_once(&app, &cfg, None).await;
+    let outcome = crate::sync::sync_once(&app, &cfg, None, true).await; // IPC 手动同步：强制刷新
     match outcome.config {
         Some(_) => Ok(ok(json!({"pending": outcome.pending}))),
         None => Err("无法连接中心服务端（已使用本地缓存）".to_string()),

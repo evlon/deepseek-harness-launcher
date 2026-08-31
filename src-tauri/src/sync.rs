@@ -318,6 +318,7 @@ async fn refresh_plugin_latest_versions<R: Runtime>(
     cfg: &LauncherConfig,
     recommended: &[String],
     state: &mut SyncState,
+    force: bool,
 ) -> std::collections::HashMap<String, String> {
     if recommended.is_empty() {
         return state.plugin_latest_versions.clone();
@@ -343,19 +344,24 @@ async fn refresh_plugin_latest_versions<R: Runtime>(
 
     // 版本检查缓存 TTL：超过该时长强制重新查询（registry 可能已更新）。
     // 之前「缓存 == 已装版本」就永久跳过查询，服务器升级插件后客户端发现不了。
+    // force=true（手动同步）忽略 TTL 和「缓存==已装」跳过，总是重查。
     const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60); // 6 小时
-    let cache_fresh = state
-        .plugin_versions_checked_at
-        .as_deref()
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| {
-            let age = chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc));
-            age < chrono::Duration::from_std(CACHE_TTL).unwrap_or(chrono::Duration::hours(6))
-        })
-        .unwrap_or(false);
+    let cache_fresh = if force {
+        false // 手动同步：总是重查
+    } else {
+        state
+            .plugin_versions_checked_at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| {
+                let age = chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc));
+                age < chrono::Duration::from_std(CACHE_TTL).unwrap_or(chrono::Duration::hours(6))
+            })
+            .unwrap_or(false)
+    };
 
     for name in recommended {
-        // 缓存新鲜 + 已装 >= 缓存 → 跳过（减少查询）；否则重查（含缓存过期场景）
+        // 缓存新鲜 + 已装 >= 缓存 → 跳过（减少查询）；否则重查（含缓存过期/手动强制场景）
         if cache_fresh {
             if let Some(cached) = state.plugin_latest_versions.get(name) {
                 let installed = installed_plugin_version(app, cfg, name);
@@ -670,11 +676,16 @@ pub struct SyncOutcome {
 
 /// 执行一次同步：拉取 → 对比 → 缓存 → 应用菜单策略 → 上报。
 ///
+/// `force_version_check`：true = 强制重新查询插件 registry 最新版
+/// （忽略缓存 TTL——手动「立即同步」应总是拿到最新结果）；
+/// false = 用缓存（自动同步，6h TTL 内不重复查，省流量）。
+///
 /// 永不抛错：任何失败都以 `SyncOutcome::default()`（或缓存内容）返回，并写日志。
 pub async fn sync_once<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
     last_notified_hash: Option<u64>,
+    force_version_check: bool,
 ) -> SyncOutcome {
     let server_url = resolve_server_url(cfg);
     if server_url.is_empty() {
@@ -689,8 +700,9 @@ pub async fn sync_once<R: Runtime>(
 
     let outcome = match fetch_config(&server_url, &token).await {
         Ok(config) => {
-            // 版本检查：查 registry 最新版（带缓存），已装但落后的计入待处理
-            let latest = refresh_plugin_latest_versions(app, cfg, &config.plugins, &mut state).await;
+            // 版本检查：查 registry 最新版（带缓存），已装但落后的计入待处理。
+            // 手动同步（force=true）忽略缓存强制重查。
+            let latest = refresh_plugin_latest_versions(app, cfg, &config.plugins, &mut state, force_version_check).await;
             let pending_entries = pending_with_updates(&config.plugins, &installed_with_ver, &latest);
             // 纯名字列表（通知/上报用）
             let pending: Vec<String> = pending_entries
@@ -872,7 +884,7 @@ pub async fn spawn_sync_loop<R: Runtime>(app: &AppHandle<R>) {
     loop {
         let cfg = load_cached();
         let last = *LAST_NOTIFIED.lock().unwrap();
-        let outcome = sync_once(app, &cfg, last).await;
+        let outcome = sync_once(app, &cfg, last, false).await; // 自动同步：用缓存 TTL
 
         // 待装变化 → 通知 + 刷新托盘（待装含「未装」与「已装旧版需更新」）
         if outcome.pending_changed && !outcome.pending.is_empty() {

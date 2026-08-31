@@ -718,7 +718,8 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 crate::ops::mark_step_running(&h, 0);
                 crate::ops::update_step(&h, "正在拉取服务端配置…");
                 let cfg = load_cached();
-                let outcome = crate::sync::sync_once(&h, &cfg, None).await;
+                // 手动「立即同步」：强制刷新版本检查（忽略缓存，总是拿到 registry 最新）
+                let outcome = crate::sync::sync_once(&h, &cfg, None, true).await;
                 crate::ops::mark_step_running(&h, 1);
                 crate::ops::update_step(&h, "执行策略…");
                 refresh_sync_menu(&h);
@@ -753,9 +754,9 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                             Ok(()) => {
                                 crate::ops::finish_op(&h, &format!("{} 已就绪", name_clone));
                                 notify(&h, "插件已安装", &format!("{} 已就绪", name_clone));
-                                // 安装后立即同步一次（刷新状态 + 上报服务端）
+                                // 安装后立即同步一次（刷新状态 + 上报服务端；用缓存 TTL，不强制）
                                 let cfg = load_cached();
-                                let _ = crate::sync::sync_once(&h, &cfg, None).await;
+                                let _ = crate::sync::sync_once(&h, &cfg, None, false).await;
                                 refresh_sync_menu(&h);
                             }
                             Err(e) => {
