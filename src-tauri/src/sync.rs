@@ -960,10 +960,72 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         log::error!("安装插件 {spec} 失败（exit={}）：{}", output.status, stderr.trim());
+        // pnpm 11 supply-chain 策略：新发布的包被 minimumReleaseAge 拦截 →
+        // 自动把该包加进 profile 的 pnpm-workspace.yaml exclude 并重试一次。
+        if stderr.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION") {
+            log::warn!("检测到 pnpm minimumReleaseAge 拦截 {spec}，自动加入豁免并重试…");
+            ensure_pnpm_min_release_exclude(app, &cfg, &spec);
+            // 重试一次
+            let env = crate::workflow::child_env(app, &cfg)?;
+            let mut cmd = std::process::Command::new(&node);
+            cmd.arg(&dsh_bin)
+                .arg("plugin")
+                .arg("--profile")
+                .arg(&profile)
+                .arg("add")
+                .arg(&spec)
+                .current_dir(dsh_install_path(app))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            let output = tauri::async_runtime::spawn_blocking(move || cmd.output()).await
+                .map_err(|e| format!("INSTALL_SPAWN_FAILED: {e}"))?;
+            let output = output.map_err(|e| format!("INSTALL_LAUNCH_FAILED: {e}"))?;
+            if !output.status.success() {
+                let stderr2 = String::from_utf8_lossy(&output.stderr);
+                log::error!("重试安装插件 {spec} 仍失败：{}", stderr2.trim());
+                return Err(format!("PLUGIN_INSTALL_FAILED: {name}（exit={}），详情见日志", output.status));
+            }
+            log::info!("插件已安装（重试成功）：{spec}（profile={profile}）");
+            return Ok(());
+        }
         return Err(format!("PLUGIN_INSTALL_FAILED: {name}（exit={}），详情见日志", output.status));
     }
     log::info!("插件已安装：{spec}（profile={profile}）");
     Ok(())
+}
+
+/// 把包加进 profile 的 pnpm-workspace.yaml 的 minimumReleaseAgeExclude
+/// （pnpm 11 的 supply-chain 策略豁免新发布包）。
+fn ensure_pnpm_min_release_exclude<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+    spec: &str,
+) {
+    let ws_path = dsh_home(app, cfg)
+        .join("profiles")
+        .join(resolve_profile(cfg))
+        .join("pnpm-workspace.yaml");
+    let Ok(mut content) = std::fs::read_to_string(&ws_path) else {
+        return;
+    };
+    if content.contains(spec) {
+        return; // 已豁免
+    }
+    // 追加到 minimumReleaseAgeExclude 列表（保持缩进）
+    if content.contains("minimumReleaseAgeExclude:") {
+        content = content.trim_end().to_string() + &format!("\n  - {spec}\n");
+    } else {
+        content = content.trim_end().to_string() + &format!("\nminimumReleaseAgeExclude:\n  - {spec}\n");
+    }
+    if let Err(e) = std::fs::write(&ws_path, content) {
+        log::warn!("写 pnpm-workspace.yaml 豁免失败：{e}");
+    } else {
+        log::info!("已把 {spec} 加入 minimumReleaseAgeExclude");
+    }
 }
 
 // ---------- 工具 ----------
