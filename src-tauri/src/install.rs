@@ -262,25 +262,48 @@ fn repair_missing_bundle_patches<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherC
                 continue;
             };
             let patch_path = pkg_dir.join(patch_rel.trim_start_matches("./"));
-            if patch_path.exists() {
-                continue;
-            }
-            // 创建最小 patch（insert + disabled）
-            let content = format!(
-                "# {name} bundle 层（launcher 自动补：npm 发布缺此文件导致 dsh 启动崩溃）\n\
-                 # 插件默认 disabled：配置好必需项后，在 profile 的 cordis.patch.yml 覆盖 disabled: false。\n\
-                 - insert:\n\
-                 \x20   - id: {name}\n\
-                 \x20     name: {name}\n\
-                 \x20     disabled: true\n\
-                 \x20     config: {{}}\n"
-            );
-            if let Some(parent) = patch_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::write(&patch_path, content) {
-                Ok(()) => log::info!("已自动补缺失 bundle patch：{}", patch_path.display()),
-                Err(e) => log::warn!("补 bundle patch 失败 {}：{e}", patch_path.display()),
+            let missing = !patch_path.exists();
+            if missing {
+                // bundle 层 patch：insert entry（id=包名，config 空）。
+                // 不 disabled——禁用/配置由 profile 层覆盖（同 id，避免重复 entry）。
+                let content = format!(
+                    "# {name} bundle 层（launcher 自动补：npm 发布缺此文件导致 dsh 启动崩溃）\n\
+                     # 此文件 insert entry；是否禁用/配置由 profile 层 cordis.patch.yml 覆盖。\n\
+                     - insert:\n\
+                     \x20   - id: {name}\n\
+                     \x20     name: {name}\n\
+                     \x20     config: {{}}\n"
+                );
+                if let Some(parent) = patch_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&patch_path, content) {
+                    Ok(()) => log::info!("已自动补缺失 bundle patch：{}", patch_path.display()),
+                    Err(e) => log::warn!("补 bundle patch 失败 {}：{e}", patch_path.display()),
+                }
+
+                // profile 层：追加「已装未启用」覆盖块（disabled: true + 配置指引），
+                // 用户可见可编辑——配置好必需项后把 disabled: true 改 false 即启用。
+                // 仅在 patch 缺失（launcher 补的）时才登记，正常 bundle 不动。
+                let profile_patch = profile_dir.join("cordis.patch.yml");
+                let mut existing = std::fs::read_to_string(&profile_patch).unwrap_or_default();
+                let marker = format!("{name}（launcher 自动补）");
+                if !existing.contains(&marker) {
+                    let block = format!(
+                        "\n# ── {marker} ──\n\
+                         # npm 发布缺 bundle patch，launcher 自动补；未配置必需项前禁用。\n\
+                         # 配置方法：设置页配置后，把下面 disabled: true 改为 false。\n\
+                         - id: {name}\n\
+                         \x20 name: {name}\n\
+                         \x20 disabled: true\n\
+                         \x20 config: {{}}\n"
+                    );
+                    existing.push_str(&block);
+                    match std::fs::write(&profile_patch, existing) {
+                        Ok(()) => log::info!("已在 profile 层登记未启用插件：{name}"),
+                        Err(e) => log::warn!("写 profile patch 失败：{e}"),
+                    }
+                }
             }
         }
     }

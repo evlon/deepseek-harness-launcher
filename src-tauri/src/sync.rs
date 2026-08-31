@@ -387,6 +387,55 @@ fn installed_plugin_version<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig
         .unwrap_or_default()
 }
 
+/// 当前 profile 已装但被 disabled 的 bundle 插件（patch 文件里 disabled: true）。
+/// 用于托盘提示「已装未启用」——插件因缺配置被 launcher 自动 disabled，
+/// 用户配置后需手动启用（profile 的 cordis.patch.yml 改 disabled: false）。
+pub fn disabled_installed_plugins<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+) -> Vec<String> {
+    let profile = resolve_profile(cfg);
+    let profile_dir = dsh_home(app, cfg).join("profiles").join(profile);
+    let nm = profile_dir.join("node_modules");
+    let mut out: Vec<String> = Vec::new();
+    let scan = |dir: &Path, scope: Option<&str>| -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        for e in rd.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            let patch = e.path().join("cordis.patch.yml");
+            if !patch.is_file() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&patch) else {
+                continue;
+            };
+            if text.contains("disabled: true") {
+                let leaf = e.file_name().to_string_lossy().to_string();
+                let full = match scope {
+                    Some(s) => format!("@{s}/{leaf}"),
+                    None => leaf.clone(),
+                };
+                names.push(full);
+            }
+        }
+        names
+    };
+    out.extend(scan(&nm, None));
+    if let Ok(scoped) = std::fs::read_dir(nm.join("@deepseek-ai")) {
+        for s in scoped.flatten() {
+            if s.path().is_dir() {
+                out.extend(scan(&s.path(), Some("deepseek-ai")));
+            }
+        }
+    }
+    out
+}
+
 /// 待安装清单 = 服务端推荐 − 已装（保推荐顺序，去重；任一 profile 装了即算已装）。
 /// 注：版本感知判断见 `pending_with_updates`；此纯名字版保留供测试/简单位调用。
 #[allow(dead_code)]
