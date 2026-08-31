@@ -414,9 +414,9 @@ fn installed_plugin_version<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig
         .unwrap_or_default()
 }
 
-/// 当前 profile 已装但被 disabled 的 bundle 插件（patch 文件里 disabled: true）。
-/// 用于托盘提示「已装未启用」——插件因缺配置被 launcher 自动 disabled，
-/// 用户配置后需手动启用（profile 的 cordis.patch.yml 改 disabled: false）。
+/// 当前 profile 已装但未完成配置的 bundle 插件（patch 里含占位 token `pending-config`）。
+/// 用于托盘提示「已装待配置」——插件启用（设置页可配置）但必需参数未配，
+/// 配置后（设置页/环境变量/编辑 patch）自动生效。
 pub fn disabled_installed_plugins<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
@@ -441,7 +441,8 @@ pub fn disabled_installed_plugins<R: Runtime>(
             let Ok(text) = std::fs::read_to_string(&patch) else {
                 continue;
             };
-            if text.contains("disabled: true") {
+            // 占位 token（launcher 补的）或 disabled → 视为未配置
+            if text.contains("pending-config") || text.contains("disabled: true") {
                 let leaf = e.file_name().to_string_lossy().to_string();
                 let full = match scope {
                     Some(s) => format!("@{s}/{leaf}"),

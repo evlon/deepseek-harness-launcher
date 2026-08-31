@@ -415,13 +415,13 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     let mut status_items: Vec<MenuItem<R>> = Vec::new();
     let mut install_items: Vec<MenuItem<R>> = Vec::new();
 
-    // 已装但被 disabled 的插件提示（如 dsh-matrix-agent 未配置 Matrix 账号）
+    // 已装但未完成配置的插件提示（如 dsh-matrix-agent 未配 accessToken）
     let disabled_plugins = crate::sync::disabled_installed_plugins(app, &cfg);
     for d in &disabled_plugins {
         status_items.push(MenuItem::with_id(
             app,
             format!("sync-disabled-{}", d.replace(['/', '@'], "_")),
-            format!("⚙️ {d} 已装但未启用（缺配置，设置页配置后启用）"),
+            format!("⚙️ {d} 已装待配置（设置页配置参数后生效）"),
             false,
             None::<&str>,
         )?);

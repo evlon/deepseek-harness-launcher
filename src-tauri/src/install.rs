@@ -282,8 +282,9 @@ fn repair_missing_bundle_patches<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherC
                     Err(e) => log::warn!("补 bundle patch 失败 {}：{e}", patch_path.display()),
                 }
 
-                // profile 层：追加「已装未启用」覆盖块（disabled: true + 配置指引），
-                // 用户可见可编辑——配置好必需项后把 disabled: true 改 false 即启用。
+                // profile 层：追加「已装未启用」覆盖块（id + config 覆盖，含占位 token 提示）。
+                // 用户可见可编辑——插件保持启用（设置页可见可配置），但用占位值避免
+                // 缺必需参数（如 accessToken）导致 dsh 启动崩溃。配好参数后覆盖生效。
                 // 仅在 patch 缺失（launcher 补的）时才登记，正常 bundle 不动。
                 let profile_patch = profile_dir.join("cordis.patch.yml");
                 let mut existing = std::fs::read_to_string(&profile_patch).unwrap_or_default();
@@ -291,12 +292,15 @@ fn repair_missing_bundle_patches<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherC
                 if !existing.contains(&marker) {
                     let block = format!(
                         "\n# ── {marker} ──\n\
-                         # npm 发布缺 bundle patch，launcher 自动补；未配置必需项前禁用。\n\
-                         # 配置方法：设置页配置后，把下面 disabled: true 改为 false。\n\
+                         # npm 发布缺 bundle patch，launcher 自动补；插件保持启用（设置页可配置），\n\
+                         # 但必需参数未配置前用占位值避免启动崩溃。配好后覆盖对应字段。\n\
                          - id: {name}\n\
                          \x20 name: {name}\n\
-                         \x20 disabled: true\n\
-                         \x20 config: {{}}\n"
+                         \x20 config:\n\
+                         \x20   accessToken: 'pending-config'\n\
+                         \x20   homeserverUrl: ''\n\
+                         \x20   userId: ''\n\
+                         \x20   owner: ''\n"
                     );
                     existing.push_str(&block);
                     match std::fs::write(&profile_patch, existing) {
