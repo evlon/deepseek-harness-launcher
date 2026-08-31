@@ -86,6 +86,10 @@ pub struct SyncState {
     /// 版本检查用：已装插件对比最新版，落后则提示更新。
     #[serde(default)]
     pub plugin_latest_versions: std::collections::HashMap<String, String>,
+    /// 上次版本检查时间（ISO 8601）。缓存过期后（PLUGIN_VERSION_CACHE_TTL）重新查询，
+    /// 否则「缓存 == 已装版本」会永远跳过查询，registry 更新了也发现不了。
+    #[serde(default)]
+    pub plugin_versions_checked_at: Option<String>,
 }
 
 // ---------- 路径 ----------
@@ -337,12 +341,27 @@ async fn refresh_plugin_latest_versions<R: Runtime>(
     registries.push("https://registry.npmmirror.com".to_string());
     registries.push("https://registry.npmjs.org".to_string());
 
+    // 版本检查缓存 TTL：超过该时长强制重新查询（registry 可能已更新）。
+    // 之前「缓存 == 已装版本」就永久跳过查询，服务器升级插件后客户端发现不了。
+    const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60); // 6 小时
+    let cache_fresh = state
+        .plugin_versions_checked_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| {
+            let age = chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc));
+            age < chrono::Duration::from_std(CACHE_TTL).unwrap_or(chrono::Duration::hours(6))
+        })
+        .unwrap_or(false);
+
     for name in recommended {
-        // 跳过本地已是最新且缓存有的（减少查询）
-        if let Some(cached) = state.plugin_latest_versions.get(name) {
-            let installed = installed_plugin_version(app, cfg, name);
-            if !installed.is_empty() && !version_greater(cached, &installed) {
-                continue; // 已装版本 >= 缓存最新 → 无需再查
+        // 缓存新鲜 + 已装 >= 缓存 → 跳过（减少查询）；否则重查（含缓存过期场景）
+        if cache_fresh {
+            if let Some(cached) = state.plugin_latest_versions.get(name) {
+                let installed = installed_plugin_version(app, cfg, name);
+                if !installed.is_empty() && !version_greater(cached, &installed) {
+                    continue; // 已装版本 >= 缓存最新 → 无需再查
+                }
             }
         }
         let encoded = name.replace('/', "%2F");
@@ -375,6 +394,8 @@ async fn refresh_plugin_latest_versions<R: Runtime>(
     // 清理不在推荐清单里的缓存项（防膨胀）
     let recommended_set: HashSet<&str> = recommended.iter().map(|s| s.as_str()).collect();
     state.plugin_latest_versions.retain(|k, _| recommended_set.contains(k.as_str()));
+    // 记录本次检查时间（用于缓存过期判断）
+    state.plugin_versions_checked_at = Some(now_iso());
     save_state(app, cfg, state);
     state.plugin_latest_versions.clone()
 }
