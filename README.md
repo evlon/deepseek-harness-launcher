@@ -61,26 +61,25 @@ JSON 文件，格式见 [`launcher-config.json.example`](launcher-config.json.ex
 
 ## 企业中心服务端（管理员）
 
-`server/` 目录是一个零依赖的 Node 服务，部署在内网服务器上，负责：
-向所有客户端分发推荐插件清单、收集各客户端同步状态。
+> **已独立成仓**：[`dsh-launcher-center`](https://github.com/evlon/dsh-launcher-center)（Harness 中心管理）。
+> 本仓库仅含客户端（托盘）；中心服务端 + 管理页在独立仓库，各自独立发版部署。
+
+中心服务端（`dsh-launcher-center`）负责：向所有客户端分发推荐插件清单、收集各客户端同步状态，
+并提供 Web 管理控制台。部署与使用见其仓库 README：
 
 ```bash
-cd server
+git clone git@github.com:evlon/dsh-launcher-center.git
+cd dsh-launcher-center
 node server.js --port 8080 --token 你的管理口令
 ```
 
 - 管理页：`http://<服务器IP>:8080/admin`（增删推荐插件、查看各客户端同步情况）。
   **登录门禁**：打开页面需输入服务端 `--token`（错误则锁定登录界面，不可绕过）。
 - 客户端拉取：`http://<服务器IP>:8080/api/config`（公开端点，客户端无需 token）。
-
-> **⚠️ 部署数据保护**：本机部署环境在 `E:\ai-works\caddy\launcher-data`（生产 config + 客户端数据）。
-> **测试/调试时严禁 `POST /api/config` 重置 plugins 为空、删除或移动该目录**——数据不可再生。
-> 详见 `launcher-data/README-DEPLOY.md`；改动前先备份。
-- 数据存于 `server/data/`（`config.json` + `clients/<clientId>.json`）。
-- 详见 [`server/README.md`](server/README.md)。
+- 生产部署数据（本机 `E:\ai-works\caddy\launcher-data`）保护说明见 `dsh-launcher-center` README。
 
 客户端侧：在 `launcher-config.json` 配置 `serverUrl`（如 `http://10.0.0.5:8080`）即可启用同步；
-管理员在服务端添加推荐插件后，各客户端下一次轮询（默认 5 分钟）会收到提示并可在托盘确认安装。
+管理员在中心服务端添加推荐插件后，各客户端下一次轮询（默认 5 分钟）会收到提示并可在托盘确认安装。
 
 ## 构建与运行
 
@@ -119,10 +118,11 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Release 产物拆为两个包：
+Release 产物为客户端包：
 
 - **客户端包** `deepseek-harness-launcher-client-windows-x64.zip`：主程序 exe + `launcher-brand/` + 配置示例 + 使用说明（面向同事，见 `client-README.md`）
-- **服务端包** `deepseek-harness-launcher-server.zip`：中心服务端（`server.js` + `admin.js`）+ 部署文档（面向管理员，见 `server/README.md`）
+
+> 中心服务端已拆到独立仓库 [`dsh-launcher-center`](https://github.com/evlon/dsh-launcher-center)，不再随本仓库发布。
 
 运行单元测试：
 
