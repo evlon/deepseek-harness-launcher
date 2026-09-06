@@ -310,7 +310,20 @@ async function setBridgePort(){
 function refreshAll(){ loadConfig(); loadStatus(); toast("已刷新","ok"); }
 
 // ── 插件策略 ──
-const pluginMetaCache = {}; // name -> meta
+const pluginMetaCache = {}; // name -> meta（npmjs 上游元信息）
+let lastSyncStates = {};    // name -> 内网 registry 同步状态（上次渲染结果，供汇总提示）
+// 语义化版本比较（支持 v 前缀 / x.y.z；不带 .patch 的按 .0 补全；异常返回 null 交由调用方降级）
+function cmpVer(a,b){
+  if(a==null||b==null) return null;
+  const pa=String(a).replace(/^v/,"").split("-")[0].split(".").map(n=>parseInt(n,10));
+  const pb=String(b).replace(/^v/,"").split("-")[0].split(".").map(n=>parseInt(n,10));
+  if(pa.some(x=>Number.isNaN(x))||pb.some(x=>Number.isNaN(x))) return null;
+  for(let i=0;i<3;i++){
+    const x=pa[i]||0, y=pb[i]||0;
+    if(x!==y) return x<y?-1:1;
+  }
+  return 0;
+}
 // 管理员本机管理能力端口：从 localStorage 恢复（刷新不丢），无则 null 交给自动探测
 let bridgePort = (()=>{
   const saved=parseInt(localStorage.getItem("bridgePort")||"0",10);
@@ -331,7 +344,11 @@ if(bridgePort){
   if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",fill);
   else fill();
 }
-async function fetchPluginMetas(names){
+async function fetchPluginMetas(names, force){
+  if(force){
+    // 强制刷新：清掉这批的缓存，上游/内网都重查（用户点「刷新同步状态」= 最新事实）
+    names.forEach(n=>delete pluginMetaCache[n]);
+  }
   const need = names.filter(n=>!pluginMetaCache[n]);
   if(need.length){
     // 优先走管理员本机管理能力（外网代理网关）：服务端不直接出外网
@@ -350,7 +367,7 @@ async function fetchPluginMetas(names){
     if(!got){
       // 降级：服务端直查（若服务端有网）
       try{
-        const r=await fetch("/api/plugins/meta?names="+encodeURIComponent(need.join(",")),{headers:headers(false)});
+        const r=await fetch("/api/plugins/meta?names="+encodeURIComponent(need.join(","))+(force?"&force=1":""),{headers:headers(false)});
         const j=await r.json();
         (j.plugins||[]).forEach(m=>{ pluginMetaCache[m.name]=m; });
       }catch(e){ /* 拉取失败：卡片显示占位 */ }
@@ -358,7 +375,7 @@ async function fetchPluginMetas(names){
   }
   return names.map(n=>pluginMetaCache[n]).filter(Boolean);
 }
-async function renderPlugins(){
+async function renderPlugins(force){
   const el=document.getElementById("pluginList");
   const names=current.plugins||[];
   if(!names.length){ el.innerHTML='<div class="empty">暂无应装插件 —— 所有客户端视为插件齐全</div>'; return; }
@@ -368,26 +385,32 @@ async function renderPlugins(){
     +'<div class="pdesc">正在查询…</div>'
     +'<div class="pfoot"><button class="btn sm danger" onclick="removePlugin('+i+')">移除</button></div>'
     +'</div>').join("");
-  const metas=await fetchPluginMetas(names);
+  const metas=await fetchPluginMetas(names,force);
   // 查询内网 registry 同步状态（浏览器直查，registry CORS *）
   const syncStates=await checkRegistryStatus(names);
+  lastSyncStates=syncStates; // 供 checkAllSyncStatus 汇总提示
   names.forEach((p,i)=>{
     const card=document.getElementById("pcard-"+i);
     if(!card) return;
     const m=metas.find(x=>x.name===p);
     const ss=syncStates[p]||{state:"checking"};
-    const ver=m&&m.latest?'<span class="pver">v'+esc(m.latest)+'</span>':'<span class="pver">?</span>';
+    const upstream=(m&&m.latest)||"";
+    // 是否有 npmjs 新版本可同步：内网已同步该版本号，且 内网版本 < npmjs latest
+    const hasNew = ss.state==="synced" && upstream && cmpVer(ss.version,upstream)<0;
+    const ver='<span class="pver">npmjs v'+esc(upstream||"?")+'</span>';
     const src=m&&m.registry?'<span class="src">'+esc(m.registry)+'</span>':'';
     const desc=m&&m.description?esc(m.description):'<span class="missing">（无描述）</span>';
     const home=m&&m.homepage?'<a href="'+esc(m.homepage)+'" target="_blank" rel="noopener">主页 ↗</a>':'';
-    // 同步状态徽章
+    // 同步状态徽章（有新版时最醒目）
     let badge='';
-    if(ss.state==="synced") badge='<span class="sync-badge synced">✓ 已同步 v'+esc(ss.version)+'</span>';
+    if(hasNew) badge='<span class="sync-badge update" title="内网 registry 已同步 v'+esc(ss.version)+'，npmjs 已有 v'+esc(upstream)+'">⬆ npmjs 有新版 v'+esc(upstream)+'</span>';
+    else if(ss.state==="synced") badge='<span class="sync-badge synced">✓ 已同步 v'+esc(ss.version)+'</span>';
     else if(ss.state==="unsynced") badge='<span class="sync-badge unsynced">⚠ 未同步</span>';
     else badge='<span class="sync-badge checking">查询中…</span>';
-    // 同步按钮（未同步或已同步都可点，重新同步）
-    const syncBtn='<button class="btn sm primary sync-btn" id="syncbtn-'+i+'" onclick="syncOnePlugin('+i+')">同步此插件</button>';
-    card.className="pcard";
+    // 同步按钮：有新版时橙色高亮 + 行动文案
+    const syncBtn='<button class="btn sm primary sync-btn'+(hasNew?' up':'')+'" id="syncbtn-'+i+'" onclick="syncOnePlugin('+i+')">'
+      +(hasNew?'⬆ 同步到 v'+esc(upstream):'同步此插件')+'</button>';
+    card.className="pcard"+(hasNew?" update":"");
     card.innerHTML='<div class="phead"><span class="pname">'+esc(p)+'</span>'+ver+'</div>'
       +'<div class="pdesc">'+desc+'</div>'
       +'<div class="pmeta">'+src+(home||'')+'</div>'
@@ -424,8 +447,19 @@ async function checkRegistryStatus(names){
 async function checkAllSyncStatus(){
   const names=current.plugins||[];
   if(!names.length){ toast("无应装插件","warn"); return; }
-  toast("正在检查同步状态…","ok");
-  renderPlugins();
+  // 强制：清 npmjs 元信息缓存 + 重查内网 registry，让「npmjs 有新版」反映最新事实
+  names.forEach(n=>delete pluginMetaCache[n]);
+  document.getElementById("syncState").innerHTML='<span style="color:var(--amber)">检查中…</span>';
+  toast("正在检查同步状态（含 npmjs 最新版本）…","ok");
+  try{
+    await renderPlugins(true);
+    const upd = current.plugins.filter(n=>{ const ss=lastSyncStates[n]; return ss&&ss.state==="synced"&&pluginMetaCache[n]&&cmpVer(ss.version,pluginMetaCache[n].latest)<0; });
+    document.getElementById("syncState").innerHTML = upd.length
+      ? '<span style="color:var(--amber)"><b>'+upd.length+'</b> 个插件 npmjs 有新版可同步</span>'
+      : '<span style="color:var(--green)">✓ 均已同步到 npmjs 最新版</span>';
+  }catch(e){
+    document.getElementById("syncState").innerHTML='';
+  }
 }
 async function syncOnePlugin(i){
   const btn=document.getElementById("syncbtn-"+i);

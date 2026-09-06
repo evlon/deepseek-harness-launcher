@@ -263,6 +263,17 @@ async function fetchPluginsMeta(names) {
   return out;
 }
 
+/** 强制刷新：绕过 META_CACHE，重新查上游（管理页「刷新同步状态」按钮调用）。 */
+async function fetchPluginsMetaNoCache(names) {
+  const out = [];
+  for (const name of names) {
+    const meta = await fetchPluginMeta(name);
+    if (meta && meta.latest) META_CACHE.set(name, { meta, fetchedAt: Date.now() });
+    out.push(meta);
+  }
+  return out;
+}
+
 // ---------- 路由 ----------
 async function route(req, res) {
   const url = new URL(req.url, "http://localhost");
@@ -462,9 +473,10 @@ async function route(req, res) {
   // 插件元信息查询（管理页展示应装清单详情用；名称来自 /api/config 的 plugins，免鉴权）
   if (p === "/api/plugins/meta" && req.method === "GET") {
     const namesParam = url.searchParams.get("names") || "";
+    const force = url.searchParams.get("force") === "1";
     const names = namesParam.split(",").map((s) => s.trim()).filter((s) => s && validPackageName(s));
     if (!names.length) return send(res, 200, { plugins: [] });
-    const plugins = await fetchPluginsMeta(names);
+    const plugins = force ? await fetchPluginsMetaNoCache(names) : await fetchPluginsMeta(names);
     return send(res, 200, { plugins });
   }
 
@@ -615,7 +627,16 @@ function adminPageHtml() {
   .sync-badge.synced{background:var(--green-bg);color:var(--green)}
   .sync-badge.unsynced{background:var(--amber-bg);color:var(--amber)}
   .sync-badge.checking{background:#eef0f6;color:var(--muted)}
+  /* npmjs 有新版本（内网落后）——醒目橙色 */
+  .sync-badge.update{background:#d97706;color:#fff}
   .pcard .sync-btn{margin-left:auto}
+  /* 有新版本可同步：整卡橙色高亮（左边条 + 边框 + 阴影） */
+  .pcard.update{position:relative;border-color:#ecc58a;box-shadow:0 0 0 1px #f2d6a8,0 4px 16px rgba(217,119,6,.14)}
+  .pcard.update::before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:4px;border-radius:0 3px 3px 0;background:linear-gradient(180deg,#f59e0b,#d97706)}
+  .pcard.update .pver{background:var(--amber-bg);color:var(--amber)}
+  .pcard .update-arrow{color:var(--amber);font-weight:700;font-size:11px;white-space:nowrap}
+  .sync-btn.up{background:var(--amber);border-color:var(--amber);color:#fff}
+  .sync-btn.up:hover{background:#b45309;border-color:#b45309}
   .sync-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 
   /* ── 状态点 ── */
