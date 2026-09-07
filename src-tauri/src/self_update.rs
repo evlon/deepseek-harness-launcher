@@ -274,13 +274,31 @@ pub async fn check_and_update<R: Runtime>(app: &AppHandle<R>) -> Result<(), Stri
         log::info!("launcher 自更新：镜像上传进行中，跳过本轮（下轮再试）");
         return Ok(());
     }
-    log::info!("发现 launcher 新版 v{}（当前 v{}），开始下载…", meta.version, current_version());
-    crate::notify::notify(app, "DeepSeek Harness Launcher", &format!("发现新版本 v{}，正在自动更新…", meta.version));
+    log::info!(
+        "发现 launcher 新版 v{}（当前 v{}，{} MB{}），开始下载…",
+        meta.version,
+        current_version(),
+        meta.size / 1024 / 1024,
+        if meta.notes.is_empty() { String::new() } else { format!("，说明：{}", meta.notes) }
+    );
+    let notify_msg = if meta.notes.is_empty() {
+        format!("发现新版本 v{}，正在自动更新…", meta.version)
+    } else {
+        format!("发现新版本 v{}（{}），正在自动更新…", meta.version, meta.notes)
+    };
+    crate::notify::notify(app, "DeepSeek Harness Launcher", &notify_msg);
 
     // 下载到 exe 同目录的临时名（同文件系统，rename 原子）
     let exe_dir = current_exe().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
     let tmp = exe_dir.join(format!("launcher-{}.new.exe", meta.version));
     download_release(app, &meta, &tmp).await?;
+    log::info!(
+        "下载完成：v{} {} MB（发布 {}{}）",
+        meta.version,
+        meta.size / 1024 / 1024,
+        meta.published_at.as_deref().unwrap_or("未知"),
+        if meta.notes.is_empty() { String::new() } else { format!("，说明：{}", meta.notes) }
+    );
 
     // 防呆：若发布物与本机 exe 内容相同（sha256 一致，如误发布同二进制），跳过更新，
     // 避免「换汤不换药」导致无限下载-替换循环
