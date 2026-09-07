@@ -894,6 +894,20 @@ pub fn apply_server_overrides(
             local.use_system_node = Some(v);
         }
     }
+    // dshRegistry：内网 dsh 安装源（装/更新 dsh 时走内网 npm registry）。
+    // 服务端下发的值强制写入 mirror_settings.registry（dsh_npm::npm_registry_for_install
+    // 读到非空即用内网）。属企业统一管理项（同 dshMirrorUrl 语义，不遵循「用户显式
+    // 设置不覆盖」——同事端一般不手配镜像源；管理员端镜像目标与服务端同源无冲突）。
+    // 空串 = 清除，回退地域源。
+    if server.get("dshRegistry").is_some() {
+        let v = server.get("dshRegistry").and_then(|x| x.as_str()).unwrap_or("");
+        let ms = local.mirror_settings.get_or_insert_with(Default::default);
+        if v.trim().is_empty() {
+            ms.registry = None;
+        } else {
+            ms.registry = Some(v.trim().to_string());
+        }
+    }
 }
 
 /// 记录用户 launcher-config.json 里显式设置的字段名（用于服务器合并时跳过）。
@@ -1226,6 +1240,65 @@ mod tests {
         assert_eq!(local.port, Some(3180), "非法端口被忽略");
         assert_eq!(local.sync_interval_secs, Some(300), "过小同步间隔被忽略");
         assert_eq!(local.profile.as_deref(), Some("matrix"), "非法 profile 被忽略，保留内置默认 matrix");
+    }
+
+    #[test]
+    fn server_dsh_registry_written_to_mirror_settings() {
+        // 服务端下发 dshRegistry → 写入 mirror_settings.registry（dsh 安装走内网）
+        let mut local = builtin_default_config();
+        let server = serde_json::json!({ "dshRegistry": "http://registry.ict.cmcc" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert_eq!(
+            local.mirror_settings.as_ref().and_then(|m| m.registry.as_deref()),
+            Some("http://registry.ict.cmcc")
+        );
+    }
+
+    #[test]
+    fn server_dsh_registry_force_overrides_local() {
+        // dshRegistry 属企业统一管理项（强制覆盖）：服务端 URL 覆盖本地已有 registry
+        let mut local = builtin_default_config();
+        local.mirror_settings = Some(MirrorSettings {
+            registry: Some("http://local-registry.example".to_string()),
+            dsh_mirror_url: None,
+        });
+        let server = serde_json::json!({ "dshRegistry": "http://registry.ict.cmcc" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert_eq!(
+            local.mirror_settings.as_ref().and_then(|m| m.registry.as_deref()),
+            Some("http://registry.ict.cmcc"),
+            "服务端 dshRegistry 强制覆盖本地"
+        );
+    }
+
+    #[test]
+    fn server_dsh_registry_empty_clears() {
+        // 服务端 dshRegistry 空串 → 清除本地 registry（回退地域源）
+        let mut local = builtin_default_config();
+        local.mirror_settings = Some(MirrorSettings {
+            registry: Some("http://registry.ict.cmcc".to_string()),
+            dsh_mirror_url: None,
+        });
+        let server = serde_json::json!({ "dshRegistry": "" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert!(local.mirror_settings.as_ref().and_then(|m| m.registry.as_ref()).is_none());
+    }
+
+    #[test]
+    fn server_without_dsh_registry_keeps_local() {
+        // 服务端未下发 dshRegistry 字段 → 本地 registry 保持不变
+        let mut local = builtin_default_config();
+        local.mirror_settings = Some(MirrorSettings {
+            registry: Some("http://local-registry.example".to_string()),
+            dsh_mirror_url: None,
+        });
+        let server = serde_json::json!({ "npmRegistry": "https://registry.npmmirror.com/" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert_eq!(
+            local.mirror_settings.as_ref().and_then(|m| m.registry.as_deref()),
+            Some("http://local-registry.example"),
+            "未下发 dshRegistry 时本地不动"
+        );
     }
 
     #[test]

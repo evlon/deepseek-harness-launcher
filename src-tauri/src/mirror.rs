@@ -585,6 +585,8 @@ fn upload_one_pkg(name: &str, version: &str, registry: &str, token: &str) -> Res
         registry.to_string(),
         "--access".to_string(),
         "public".to_string(),
+        // 内网 Verdaccio 不支持 provenance（npm 11 默认开启 → EUSAGE 失败）
+        "--no-provenance".to_string(),
     ];
     if is_prerelease(version) {
         publish_args.push("--tag".to_string());
@@ -615,9 +617,20 @@ const NPM_TIMEOUT_SECS: u64 = 120;
 /// env 里的 PATH 覆盖不生效——所以这里显式解析 npm 可执行文件路径。
 /// 超时后 kill 子进程树并报错，避免上传永久挂起。
 fn run_npm(cwd: &PathBuf, args: &[&str], envs: &[(String, String)]) -> Result<String, String> {
-    let npm_exe = resolve_npm_path();
-    let mut cmd = Command::new(npm_exe);
-    cmd.args(args).current_dir(cwd);
+    #[cfg(windows)]
+    let (program, prefix_args) = resolve_npm_invocation();
+    #[cfg(not(windows))]
+    let (program, prefix_args) = (resolve_npm_path(), Vec::new());
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&prefix_args).args(args).current_dir(cwd);
+    // Windows 兜底：若仍落到 .cmd/.bat（未解析出 node+npm-cli.js），
+    // 必须隐藏控制台窗口，避免每次 pack/publish 都闪一个新 shell 窗口。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -717,6 +730,22 @@ fn resolve_npm_path() -> PathBuf {
         }
     }
     PathBuf::from("npm")
+}
+
+/// Windows 上 npm.cmd 本质是 `node.exe npm-cli.js`。spawn .cmd 会新起 cmd.exe 会话，
+/// 即使带 CREATE_NO_WINDOW 仍可能闪控制台窗口。这里优先解析成 (node.exe, npm-cli.js)
+/// 直跑（完全绕开 cmd.exe，无窗口）；解析不到再回退原 .cmd 路径。
+/// 返回 (可执行文件, 需前置到 args 开头的参数)。
+#[cfg(windows)]
+fn resolve_npm_invocation() -> (PathBuf, Vec<String>) {
+    if let Some(dir) = system_node_dir() {
+        let node = dir.join("node.exe");
+        let cli = dir.join("node_modules").join("npm").join("bin").join("npm-cli.js");
+        if node.is_file() && cli.is_file() {
+            return (node, vec![cli.to_string_lossy().to_string()]);
+        }
+    }
+    (resolve_npm_path(), Vec::new())
 }
 
 /// 系统 node 所在目录（npm 同目录）。

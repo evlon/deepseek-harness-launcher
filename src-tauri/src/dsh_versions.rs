@@ -240,8 +240,11 @@ pub async fn switch_version<R: Runtime>(
     // junction 对应用透明（dsh 通过链接路径访问 node_modules 无感知）。
     #[cfg(windows)]
     {
-        // cmd mklink /J <link> <target>（junction 无需管理员权限）
+        // cmd mklink /J <link> <target>（junction 无需管理员权限）——
+        // 隐藏控制台窗口（CREATE_NO_WINDOW），避免切换版本时闪窗
+        use std::os::windows::process::CommandExt;
         let status = std::process::Command::new("cmd")
+            .creation_flags(0x08000000)
             .args(["/C", "mklink", "/J"])
             .arg(&dest)
             .arg(&src)

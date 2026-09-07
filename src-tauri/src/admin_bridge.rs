@@ -471,6 +471,12 @@ fn exec_script(body: &serde_json::Value) -> Result<String, String> {
     let out = std::thread::spawn(move || {
         let mut cmd = if cfg!(windows) {
             let mut c = std::process::Command::new("cmd");
+            // 隐藏控制台窗口，避免脚本执行闪窗
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x08000000);
+            }
             c.args(["/C", &script_clone]);
             c
         } else {
