@@ -30,6 +30,7 @@ pub struct CliArgs {
     pub registry: String,
     pub token: String,
     pub tag: String,
+    pub update_file: String,
 }
 
 pub fn parse_args() -> CliArgs {
@@ -39,6 +40,7 @@ pub fn parse_args() -> CliArgs {
         registry: String::new(),
         token: String::new(),
         tag: String::new(),
+        update_file: String::new(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
@@ -48,6 +50,7 @@ pub fn parse_args() -> CliArgs {
             "--registry" => args.registry = iter.next().unwrap_or_default(),
             "--token" => args.token = iter.next().unwrap_or_default(),
             "--tag" => args.tag = iter.next().unwrap_or_default(),
+            "--update-file" => args.update_file = iter.next().unwrap_or_default(),
             _ => {}
         }
     }
@@ -134,9 +137,32 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
         "test" => {
             run_selftest(app)
         }
+        "update-self" => {
+            // 自更新助手：替换 exe + 重启（不依赖 Tauri，纯文件操作）
+            if args.update_file.is_empty() {
+                println!("[update-self] 缺少 --update-file <新exe路径>");
+                2
+            } else {
+                crate::self_update::run_update_self(&args.update_file)
+            }
+        }
+        "update-check" => {
+            // 手动检查 launcher 更新（发现新版即下载并替换重启）
+            let r = tauri_async_block(app, crate::self_update::check_and_update(app));
+            match r {
+                Ok(()) => {
+                    println!("[update-check] 检查完成（无更新或已触发更新流程）");
+                    0
+                }
+                Err(e) => {
+                    println!("[update-check] 失败：{e}");
+                    1
+                }
+            }
+        }
         _ => {
             println!("未知命令：{cmd}");
-            println!("可用命令：install / launch / stop / sync / speedtest / mirror / status / open-console / dsh-versions / dsh-install(--tag) / dsh-switch(--tag) / test");
+            println!("可用命令：install / launch / stop / sync / speedtest / mirror / status / open-console / dsh-versions / dsh-install(--tag) / dsh-switch(--tag) / update-self(--update-file) / update-check / test");
             2
         }
     }
@@ -205,6 +231,7 @@ mod tests {
             registry: String::new(),
             token: String::new(),
             tag: String::new(),
+            update_file: String::new(),
         };
         assert_eq!(args.cmd.as_deref(), Some("install"));
         assert!(args.json);
@@ -219,8 +246,22 @@ mod tests {
             registry: String::new(),
             token: String::new(),
             tag: String::new(),
+            update_file: String::new(),
         };
         assert!(!is_cli_mode(&args));
+    }
+
+    #[test]
+    fn parse_update_file_arg() {
+        let args = CliArgs {
+            cmd: Some("update-self".to_string()),
+            json: false,
+            registry: String::new(),
+            token: String::new(),
+            tag: String::new(),
+            update_file: "C:\\tmp\\new.exe".to_string(),
+        };
+        assert_eq!(args.update_file, "C:\\tmp\\new.exe");
     }
 
     #[test]

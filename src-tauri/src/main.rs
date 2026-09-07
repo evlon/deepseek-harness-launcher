@@ -14,6 +14,7 @@ mod mirror;
 mod notify;
 mod ops;
 mod plugin;
+mod self_update;
 mod speedtest;
 mod sync;
 mod tray;
@@ -153,6 +154,15 @@ fn main() {
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     sync::spawn_sync_loop(&h).await;
+                });
+            }
+
+            // launcher 自身自动更新检查：周期轮询服务端 /api/launcher/latest，
+            // 发现新版自动下载替换（内网自托管）。失败仅日志，不打扰。
+            if !config::resolve_server_url(&cfg).is_empty() {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    self_update::spawn_self_update_loop(&h).await;
                 });
             }
 

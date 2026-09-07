@@ -847,6 +847,13 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
     }
 }
 
+/// 请求应用退出（供自更新等内部流程调用：停 Harness + 真退出）。
+pub fn request_quit<R: Runtime>(app: &AppHandle<R>) {
+    QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::workflow::stop();
+    app.exit(0);
+}
+
 /// 应用加速预设：写入配置并重应用 npmrc。
 fn apply_accel<R: Runtime>(app: &AppHandle<R>, kind: &str, value: &str) {
     let result = if kind == "npm" {
