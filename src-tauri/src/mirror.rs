@@ -6,8 +6,11 @@
 //! - 无用户脚本输入，杜绝注入
 //! - 进度实时落盘 `<dsh_home>/mirror-progress.json`，admin_bridge 提供查询路由
 //! - 认证：管理员机环境变量（NODE_AUTH_TOKEN 或 tokenEnv 指定），token 不落盘不上报
+//! - 幂等：目标 registry 已存在同版本包 → npm publish 报错 → 视为已同步，跳过继续。
 //!
-//! 幂等：目标 registry 已存在同版本包 → npm publish 报错 → 视为已同步，跳过继续。
+//! 同步目标支持 `name`（= dist-tags.latest）或 `name@spec`（spec 可为精确版本 /
+//! dist-tag / semver 范围，如 `@deepseek-ai/dsh@0.1.2-rc.1`），供中心管理页的
+//! 「npm 包同步」把 dsh 核心等非插件 npm 包（含依赖树）镜像进内网加速安装。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -179,29 +182,93 @@ async fn fetch_meta(client: &reqwest::Client, name: &str) -> Result<serde_json::
 }
 
 /// 解析具体版本：精确匹配 → dist-tags.latest → 最高版本（简化）。
+/// 支持 npm OR 范围（如 "^3.25 || ^4.0"）：拆分分支，取整体最高的满足版本。
 fn resolve_version(meta: &serde_json::Value, spec: &str) -> Result<String, String> {
     let versions = meta.get("versions").and_then(|v| v.as_object()).ok_or("no versions")?;
+    // npm OR 组合（a || b || c）：各分支取最高满足版本，再整体取最高
+    if spec.contains("||") {
+        let mut best: Option<(semver::Version, String)> = None;
+        for branch in spec.split("||").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            match match_single(meta, versions, branch) {
+                Ok(Some((pv, v))) => {
+                    let better = match &best {
+                        Some((bv, _)) => pv > *bv,
+                        None => true,
+                    };
+                    if better { best = Some((pv, v)); }
+                }
+                Ok(None) => { /* 该分支无满足版本，尝试下一分支 */ }
+                Err(e) => { /* 单分支解析异常（理论上不发生）不阻断 */ log::debug!("resolve_version OR 分支 {branch} 异常：{e}"); }
+            }
+        }
+        return best.map(|(_, v)| v).ok_or_else(|| format!("no version for {spec}"));
+    }
+    match match_single(meta, versions, spec) {
+        Ok(Some((_, v))) => Ok(v),
+        _ => Err(format!("no version for {spec}")),
+    }
+}
+
+/// 解析单个 spec（无 OR）：精确匹配 → dist-tags → semver 范围最高满足。
+/// 返回 Option<(版本号, 版本字符串)>；None = 无满足版本。
+fn match_single(
+    meta: &serde_json::Value,
+    versions: &serde_json::Map<String, serde_json::Value>,
+    spec: &str,
+) -> Result<Option<(semver::Version, String)>, String> {
     // 精确版本
     if versions.contains_key(spec) {
-        return Ok(spec.to_string());
+        return semver::Version::parse(spec.trim_start_matches('v'))
+            .ok()
+            .map(|v| Some((v, spec.to_string())))
+            .ok_or_else(|| format!("bad version {spec}"));
     }
-    // dist-tags（如 "latest"）
+    // dist-tags（如 "latest" / "next"）
     if let Some(v) = meta
         .get("dist-tags")
         .and_then(|d| d.get(spec))
         .and_then(|v| v.as_str())
     {
         if versions.contains_key(v) {
-            return Ok(v.to_string());
+            return semver::Version::parse(v.trim_start_matches('v'))
+                .ok()
+                .map(|pv| Some((pv, v.to_string())))
+                .ok_or_else(|| format!("bad version {v}"));
         }
     }
     // semver 范围：取满足范围/标签的最高版本
     let mut best: Option<(semver::Version, String)> = None;
     let parse = |v: &str| semver::Version::parse(v.trim_start_matches('v')).ok();
+    // npm 依赖范围可能用空格分隔多个比较符（如 ">=1.43.0 <2"），而 Rust semver
+    // 只认逗号（>=1.43.0, <2）——解析失败时先做空格→逗号规范化再试。
+    let parse_req = |s: &str| {
+        if let Ok(r) = semver::VersionReq::parse(s) {
+            return Some(r);
+        }
+        // npm 范围可能是空格分隔多个比较符（">=1.43.0 <2"）或比较符后带空格
+        // （">= 1.0.0 < 3"）——Rust semver 只认逗号，这里合并比较符与版本后
+        // 再用逗号连接。仅在含比较符+空格时处理，避免误伤普通输入。
+        if s.contains(' ') && (s.contains('>') || s.contains('<') || s.contains('~') || s.contains('^')) {
+            let normalized = s
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",")
+                // 合并 ">=,1.0.0" → ">=1.0.0"、"<,3" → "<3"
+                .replace(">=,", ">=")
+                .replace("<=,", "<=")
+                .replace(">,", ">")
+                .replace("<,", "<")
+                .replace("~,", "~")
+                .replace("^,", "^");
+            semver::VersionReq::parse(&normalized).ok()
+        } else {
+            None
+        }
+    };
     for v in versions.keys() {
         let matches = if spec == "*" || spec == "latest" || spec.is_empty() {
             true
-        } else if let Ok(req) = semver::VersionReq::parse(spec) {
+        } else if let Some(req) = parse_req(spec) {
             // 兼容无 v 前缀的版本
             req.matches(&semver::Version::parse(v.trim_start_matches('v')).unwrap_or(semver::Version::new(0, 0, 0)))
         } else {
@@ -221,7 +288,7 @@ fn resolve_version(meta: &serde_json::Value, spec: &str) -> Result<String, Strin
             }
         }
     }
-    best.map(|(_, v)| v).ok_or_else(|| format!("no version for {spec}"))
+    Ok(best)
 }
 
 /// 简单版本比较（忽略 semver 语义，仅数字比较；仅测试用）。
@@ -245,6 +312,31 @@ fn version_greater(a: &str, b: &str) -> bool {
         }
     }
     false
+}
+
+/// 把一个「可能带 spec」的输入拆成 (name, spec)：
+/// - `"dsh-matrix-agent"`            → ("dsh-matrix-agent", "latest")
+/// - `"zod@4.4.3"`                   → ("zod", "4.4.3")
+/// - `"@deepseek-ai/dsh"`            → ("@deepseek-ai/dsh", "latest")   // scoped：@ 是包名一部分
+/// - `"@deepseek-ai/dsh@0.1.2-rc.1"` → ("@deepseek-ai/dsh", "0.1.2-rc.1")
+/// - `"pkg@next"`                    → ("pkg", "next")                  // dist-tag
+/// 规则：按**最后一个** `@` 拆分；拆出的 name 为空则整串当作裸包名（spec=latest）。
+fn split_spec(input: &str) -> (String, String) {
+    let s = input.trim();
+    if s.is_empty() {
+        return (String::new(), "latest".to_string());
+    }
+    // scoped 包名本身以 @ 开头：`@scope/name@ver` 的最后一个 @ 才是 spec 分隔符
+    if let Some(idx) = s.rfind('@') {
+        if idx > 0 {
+            let (n, v) = (&s[..idx], &s[idx + 1..]);
+            // name 非空即可拆；spec 为空（如 "pkg@"）等价于裸包名 latest
+            if !n.is_empty() {
+                return (n.to_string(), if v.is_empty() { "latest".to_string() } else { v.to_string() });
+            }
+        }
+    }
+    (s.to_string(), "latest".to_string())
 }
 
 /// 提取指定版本的直接依赖（name -> semver range）。
@@ -409,8 +501,11 @@ async fn run_mirror<R: Runtime>(
     let mut all_pkgs: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for plugin in &plugins {
-        // 插件自身（latest）
-        let tree = match resolve_dependency_tree(plugin, "latest").await {
+        // 插件自身：支持 "pkg@ver|tag" 指定版本/标签（不指定 = latest）；
+        // 拆出 (name, spec) 传给依赖树解析，spec 恒为 resolve_version 可识别的
+        // 精确版本 / dist-tag / semver 范围（dist-tags.latest 等语义不变）。
+        let (pkg_name, spec) = split_spec(plugin);
+        let tree = match resolve_dependency_tree(&pkg_name, &spec).await {
             Ok(t) => t,
             Err(e) => {
                 p.state = "error".to_string();
@@ -692,6 +787,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_version_npm_space_separated_and_range() {
+        // npm 风格空格分隔 AND（>=1.43.0 <2）——Rust semver 只认逗号，需规范化
+        let meta = serde_json::json!({
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": { "1.42.0": {}, "1.43.0": {}, "1.43.5": {}, "1.99.0": {}, "2.0.0": {} }
+        });
+        assert_eq!(resolve_version(&meta, ">=1.43.0 <2").unwrap(), "1.99.0");
+        // 带空格（比较符后空格）
+        let meta2 = serde_json::json!({
+            "dist-tags": { "latest": "3.0.0" },
+            "versions": { "1.0.0": {}, "2.5.0": {}, "3.0.0": {} }
+        });
+        assert_eq!(resolve_version(&meta2, ">= 1.0.0 < 3").unwrap(), "2.5.0");
+    }
+
+    #[test]
+    fn resolve_version_npm_or_range() {
+        // npm OR 组合：取整体最高满足版本（^3.25 与 ^4.0 都满足 → 选 4.x 最高）
+        let meta = serde_json::json!({
+            "dist-tags": { "latest": "5.0.0" },
+            "versions": { "3.25.0": {}, "3.30.1": {}, "4.0.0": {}, "4.2.3": {}, "5.0.0": {} }
+        });
+        assert_eq!(resolve_version(&meta, "^3.25 || ^4.0").unwrap(), "4.2.3");
+        // 只有低分支满足（^3.25 命中 3.30.1；^4.0 无满足 → 选 3.30.1）
+        let meta2 = serde_json::json!({
+            "dist-tags": { "latest": "5.0.0" },
+            "versions": { "2.0.0": {}, "3.25.0": {}, "3.30.1": {}, "5.0.0": {} }
+        });
+        assert_eq!(resolve_version(&meta2, "^3.25 || ^4.0").unwrap(), "3.30.1");
+        // 精确版本 OR
+        let meta3 = serde_json::json!({
+            "dist-tags": { "latest": "9.0.0" },
+            "versions": { "1.0.0": {}, "1.2.0": {}, "9.0.0": {} }
+        });
+        assert_eq!(resolve_version(&meta3, "1.0.0 || 1.2.0").unwrap(), "1.2.0");
+    }
+
+    #[test]
     fn extract_deps_reads_dependencies() {
         let meta = serde_json::json!({
             "versions": {
@@ -730,5 +863,38 @@ mod tests {
         assert!(!is_prerelease("0.2.2"));
         assert!(!is_prerelease("1.0.0"));
         assert!(!is_prerelease("0.1.0"));
+    }
+
+    #[test]
+    fn split_spec_basic() {
+        assert_eq!(split_spec("dsh-matrix-agent"), ("dsh-matrix-agent".to_string(), "latest".to_string()));
+        assert_eq!(split_spec("zod@4.4.3"), ("zod".to_string(), "4.4.3".to_string()));
+        assert_eq!(split_spec("pkg@next"), ("pkg".to_string(), "next".to_string()));
+        assert_eq!(split_spec("react@18.2.0"), ("react".to_string(), "18.2.0".to_string()));
+    }
+
+    #[test]
+    fn split_spec_scoped() {
+        // scoped 包名本身以 @ 开头：@ 不是 spec 分隔符
+        assert_eq!(split_spec("@deepseek-ai/dsh"), ("@deepseek-ai/dsh".to_string(), "latest".to_string()));
+        // scoped + spec：最后一个 @ 才是分隔符
+        assert_eq!(split_spec("@deepseek-ai/dsh@0.1.2-rc.1"), ("@deepseek-ai/dsh".to_string(), "0.1.2-rc.1".to_string()));
+        assert_eq!(split_spec("@deepseek-ai/dsh@next"), ("@deepseek-ai/dsh".to_string(), "next".to_string()));
+        assert_eq!(split_spec("@deepseek-ai/dsh@0.1.1"), ("@deepseek-ai/dsh".to_string(), "0.1.1".to_string()));
+    }
+
+    #[test]
+    fn split_spec_edge_cases() {
+        // 空/畸形输入不 panic，回退裸包名 + latest
+        assert_eq!(split_spec(""), ("".to_string(), "latest".to_string()));
+        assert_eq!(split_spec("   "), ("".to_string(), "latest".to_string()));
+        // 尾部 @（无 spec）→ 裸包名
+        assert_eq!(split_spec("pkg@"), ("pkg".to_string(), "latest".to_string()));
+        // 纯 @（畸形）
+        assert_eq!(split_spec("@"), ("@".to_string(), "latest".to_string()));
+        // 多个 @：拆最后一个
+        assert_eq!(split_spec("a@b@1.0.0"), ("a@b".to_string(), "1.0.0".to_string()));
+        // 前后空白 trim
+        assert_eq!(split_spec("  zod@4.4.3  "), ("zod".to_string(), "4.4.3".to_string()));
     }
 }
