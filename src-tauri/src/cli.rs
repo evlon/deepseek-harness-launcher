@@ -253,18 +253,49 @@ fn print_result(cmd: &str, r: &Result<serde_json::Value, String>) {
 
 /// mirror 上传在异步线程执行（start 立即返回）；CLI 在此轮询进度直到 done/error，
 /// 全部完成才退出——避免进程提前退出把上传线程杀掉（半途而废）。
+///
+/// 注意：进度文件可能残留上次运行的 error/done 状态，必须等本次上传真正开始
+/// （state 进入 running 且 started_at 晚于本进程启动）才算数；否则把旧残留当结果误报。
 /// 返回退出码：0=全部成功（含单包失败但已跳过）；1=整体失败/超时。
 fn wait_mirror_done<R: Runtime>(app: &AppHandle<R>) -> i32 {
     use std::time::{Duration, Instant};
     let cfg = crate::config::load_cached();
-    let started = Instant::now();
+    let wall_started = Instant::now();
+    // 本次进程启动时刻（进度 started_at 必须晚于它，才是本次运行）
+    let proc_started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
     const POLL_SECS: u64 = 2;
     // 整体超时上限：mirror.rs 内部为 30 分钟，CLI 等同一上限即可（多给 60s 余量兜底）
     const WAIT_MAX_SECS: u64 = 31 * 60;
+    const START_WAIT_MAX_SECS: u64 = 15; // 等 running 出现的最长秒数（start 后线程应很快置进度）
 
     let mut last_reported = String::new();
+    let mut saw_running = false; // 本次上传是否已真正开始
     loop {
         let p = crate::mirror::load_progress(app, &cfg);
+        let started_at = chrono::DateTime::parse_from_rfc3339(&p.started_at)
+            .map(|t| t.timestamp())
+            .unwrap_or(0);
+        let is_this_run = started_at >= proc_started - 5; // 5s 容差（时钟/文件写入延迟）
+
+        if !saw_running {
+            if p.state == "running" && is_this_run {
+                saw_running = true; // 本次上传真正开始，进入正式等待
+            } else if p.state != "running" {
+                // 还没 running（idle / 残留 error/done）：等它开始
+                if wall_started.elapsed().as_secs() > START_WAIT_MAX_SECS {
+                    let st = if p.state.is_empty() { "idle" } else { &p.state };
+                    println!("[mirror] ❌ 上传未在 {START_WAIT_MAX_SECS}s 内开始（进度 state={st}）——请检查是否已有上传在运行");
+                    return 1;
+                }
+                std::thread::sleep(Duration::from_secs(POLL_SECS));
+                continue;
+            }
+            // running + 本次：落入下面统一处理
+        }
+
         // 进度变更时打印（当前包 + 完成数），避免刷屏
         let cur = format!("{} {} / {}", p.current_pkg, p.done_pkgs, p.total_pkgs);
         if cur != last_reported && !p.current_pkg.is_empty() {
@@ -281,12 +312,9 @@ fn wait_mirror_done<R: Runtime>(app: &AppHandle<R>) -> i32 {
                 println!("[mirror] ❌ 失败：{}", crate::config::truncate_utf8(&msg, 800));
                 return 1;
             }
-            "idle" => {
-                // 尚未写入 running（极端情况：start 刚返回但线程还没置进度）→ 继续等
-            }
             _ => {} // running：继续轮询
         }
-        if started.elapsed().as_secs() > WAIT_MAX_SECS {
+        if wall_started.elapsed().as_secs() > WAIT_MAX_SECS {
             println!("[mirror] ❌ 等待超时（{} 分钟），上传仍在进行中——请稍后用托盘/管理页查看进度", WAIT_MAX_SECS / 60);
             return 1;
         }
@@ -329,9 +357,9 @@ fn tauri_async_block<R: Runtime, F: std::future::Future>(_app: &AppHandle<R>, fu
     tauri::async_runtime::block_on(fut)
 }
 
-/// CLI 模式是否需要初始化（有 --cmd 才走 CLI，否则常驻）。
+/// CLI 模式是否需要初始化（有 --cmd 或 --help 才走 CLI，否则常驻）。
 pub fn is_cli_mode(args: &CliArgs) -> bool {
-    args.cmd.is_some()
+    args.cmd.is_some() || args.help
 }
 
 #[cfg(test)]
