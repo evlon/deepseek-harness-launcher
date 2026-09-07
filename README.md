@@ -48,7 +48,12 @@
   预发布版本自动加 `--tag next`，上传进度实时显示在操作进度窗口；
   目标 registry 已存在同版本视为已同步（幂等，E409 不再报错）；
   进度轮询带超时与失败重试，管理页刷新后自动恢复显示。
-- **CLI / IPC 双通道控制**：`--cmd` 一次性执行（install/launch/stop/sync/speedtest/mirror/status/open-console/test），
+- **launcher 自身自动更新（内网自托管）**：管理员把新版 exe 发布到中心服务端
+  （`data/launcher-releases/`，管理页「Launcher 发布」tab 上传），launcher 周期
+  （6 小时）轮询 `GET {serverUrl}/api/launcher/latest` 发现新版（版本严格更大）→
+  自动下载 → sha256 校验 → 替换自身 exe → 重启。绿色版分发无需重装；
+  同内容发布（sha256 一致）自动跳过防循环。`--cmd update-check` 手动检查。
+- **CLI / IPC 双通道控制**：`--cmd` 一次性执行（install/launch/stop/sync/speedtest/mirror/status/open-console/test/update-check/update-self），
   IPC 命令供常驻实例调用——自动化测试闭环（`--cmd test` 全流程自测）。
 - **数据隔离**：依赖装在自身 AppData 下，`$DSH_HOME` 默认 `~/.dsh-launcher`，与桌面端 `~/.dsh` 互不影响。
 
