@@ -1,7 +1,8 @@
 //! 插件镜像上传引擎：把「应装插件 + 全部依赖」异步上传（publish）到内网 registry。
 //!
 //! 设计（替代危险的任意脚本执行）：
-//! - 内置固定逻辑：从外网 npm registry 解析依赖树 → npm pack 拉 tarball → npm publish 到内网
+//! - 内置固定逻辑：从**外网** npm registry（npmmirror → npmjs）解析依赖树 →
+//!   npm pack 拉 tarball → npm publish 到**内网** registry（源与目标分离，杜绝自环）
 //! - 无用户脚本输入，杜绝注入
 //! - 进度实时落盘 `<dsh_home>/mirror-progress.json`，admin_bridge 提供查询路由
 //! - 认证：管理员机环境变量（NODE_AUTH_TOKEN 或 tokenEnv 指定），token 不落盘不上报
@@ -133,23 +134,22 @@ pub async fn resolve_dependency_tree(
     Ok(all)
 }
 
-/// 拉取包元信息（多 registry 按序尝试：内网 → npmmirror → npmjs）。
+/// 拉取包元信息（仅外网 registry：npmmirror → npmjs）。
+///
+/// ⚠️ 刻意**不查内网 mirror registry**：本函数服务于「镜像上传」——把外网 npm 的
+/// 应装插件 + 依赖同步进内网。若以「内网 registry」为解析源，内网对已镜像过的包
+/// 返回 200 → 永远命中内网旧版本（如 dsh-matrix-agent 内网停在 0.2.3，npmjs 已发
+/// 0.3.0 也拉不进来），形成自环。上传目标 registry 只在 publish 阶段作为 `--registry`
+/// 传入，与解析源完全分离。
+///
 /// 国内环境 npmjs 直连慢且易截断（zod 元信息 1MB+，`res.json()` 流式解析
 /// 中途断流报 "error decoding response body"）——用 `res.bytes()` 整包读取再解析。
 async fn fetch_meta(client: &reqwest::Client, name: &str) -> Result<serde_json::Value, String> {
     let encoded = name.replace('/', "%2F");
-    // registry 候选：内网（配置的 mirror registry）→ npmmirror → npmjs
-    let cfg = load_cached();
-    let mut registries: Vec<String> = Vec::new();
-    if let Some(ms) = &cfg.mirror_settings {
-        if let Some(reg) = &ms.registry {
-            if !reg.is_empty() {
-                registries.push(reg.trim_end_matches('/').to_string());
-            }
-        }
-    }
-    registries.push("https://registry.npmmirror.com".to_string());
-    registries.push("https://registry.npmjs.org".to_string());
+    let registries = vec![
+        "https://registry.npmmirror.com".to_string(),
+        "https://registry.npmjs.org".to_string(),
+    ];
 
     let mut last_err = String::new();
     for reg in registries {
