@@ -97,20 +97,26 @@ cargo build --release  # 发布版
 
 ## CLI 与 IPC（测试/自动化）
 
-程序支持命令行控制（执行后退出）与 IPC 命令（常驻实例可调用），共享执行核心，便于自动化测试：
+程序支持命令行控制（执行完成后退出）与 IPC 命令（常驻实例可调用），共享执行核心，便于自动化测试：
 
 ```bash
-# CLI：一次性执行后退出
+# 帮助：-h / --help / help
+./deepseek-harness-launcher.exe --help
+
+# CLI：执行命令，全部完成才退出
 ./deepseek-harness-launcher.exe --cmd status --json   # 查询状态
 ./deepseek-harness-launcher.exe --cmd install          # 安装/修复
 ./deepseek-harness-launcher.exe --cmd launch           # 启动 Harness
 ./deepseek-harness-launcher.exe --cmd stop             # 停止
 ./deepseek-harness-launcher.exe --cmd sync             # 立即同步
 ./deepseek-harness-launcher.exe --cmd speedtest        # 测速
-./deepseek-harness-launcher.exe --cmd mirror --registry http://registry.ict.cmcc --token xxx
+./deepseek-harness-launcher.exe --cmd mirror --registry http://registry.ict.cmcc --token xxx   # 镜像上传（等待全部上传完成才退出）
 ./deepseek-harness-launcher.exe --cmd open-console     # 打开进度窗口
 ./deepseek-harness-launcher.exe --cmd test             # 全流程自测
 ```
+
+> `--cmd mirror` 上传在后台线程执行，CLI 会**实时打印进度并等待全部完成才退出**（避免进程提前退出中断上传）。
+> 中途 Ctrl+C 可中止；超时上限 31 分钟。
 
 IPC 命令（`invoke('cmd_status')` 等，与 CLI 一一对应）：`cmd_install` / `cmd_launch` / `cmd_stop` / `cmd_sync` / `cmd_speedtest` / `cmd_mirror` / `cmd_status` / `cmd_open_console`。
 
