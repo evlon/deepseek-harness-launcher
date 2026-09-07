@@ -578,7 +578,48 @@ fn upload_one_pkg(name: &str, version: &str, registry: &str, token: &str) -> Res
 
     // 2. npm publish（认证：NODE_AUTH_TOKEN 环境变量，token 由管理页传递，不落盘）
     // 预发布版本（含 - 后缀，如 0.1.1-rc.2）必须显式 --tag（npm 规则）
-    let mut publish_args = vec![
+    let mut envs: Vec<(String, String)> = Vec::new();
+    if !token.is_empty() {
+        envs.push(("NODE_AUTH_TOKEN".to_string(), token.to_string()));
+    }
+    let _ = pack_out;
+
+    // 首次尝试：默认隐式 latest（预发布 → --tag next）
+    let mut publish_args = base_publish_args(&tarball, registry);
+    if is_prerelease(version) {
+        publish_args.push("--tag".to_string());
+        publish_args.push("next".to_string());
+    }
+    match run_npm(&tmp, &publish_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &envs) {
+        Ok(_) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Ok(());
+        }
+        Err(e) => {
+            // 版本回退冲突：内网已有更高版本（如 negotiator 已有 1.1.0，依赖树要 0.6.4），
+            // npm 拒绝用低版本隐式覆盖 latest tag（Cannot implicitly apply ...）。
+            // 用显式 `--tag legacy` 重试：低版本以独立 tag 发布，latest 不受影响，两版本并存。
+            if !is_version_rollback_err(&e) {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+            log::warn!(
+                "npm publish {}@{} 撞版本回退（内网已有更高版本），改用 --tag legacy 重试",
+                name, version
+            );
+            let mut retry_args = base_publish_args(&tarball, registry);
+            retry_args.push("--tag".to_string());
+            retry_args.push("legacy".to_string());
+            run_npm(&tmp, &retry_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &envs)?;
+            let _ = std::fs::remove_dir_all(&tmp);
+            Ok(())
+        }
+    }
+}
+
+/// publish 基础参数（registry + public access + 关 provenance）。
+fn base_publish_args(tarball: &PathBuf, registry: &str) -> Vec<String> {
+    vec![
         "publish".to_string(),
         tarball.to_string_lossy().to_string(),
         "--registry".to_string(),
@@ -587,25 +628,19 @@ fn upload_one_pkg(name: &str, version: &str, registry: &str, token: &str) -> Res
         "public".to_string(),
         // 内网 Verdaccio 不支持 provenance（npm 11 默认开启 → EUSAGE 失败）
         "--no-provenance".to_string(),
-    ];
-    if is_prerelease(version) {
-        publish_args.push("--tag".to_string());
-        publish_args.push("next".to_string());
-    }
-    let mut envs: Vec<(String, String)> = Vec::new();
-    if !token.is_empty() {
-        envs.push(("NODE_AUTH_TOKEN".to_string(), token.to_string()));
-    }
-    let _ = pack_out;
-    run_npm(&tmp, &publish_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &envs)?;
-
-    let _ = std::fs::remove_dir_all(&tmp);
-    Ok(())
+    ]
 }
 
 /// 是否预发布版本（含 `-` 后缀，如 0.1.1-rc.2 / 1.0.0-beta.1）。
 fn is_prerelease(version: &str) -> bool {
     version.contains('-')
+}
+
+/// 是否「版本回退冲突」错误：目标包在内网已有更高版本，npm 拒绝用低版本隐式覆盖
+/// latest tag（`Cannot implicitly apply the "latest" tag because previously published
+/// version X is higher than the new version Y`）。命中后用 `--tag legacy` 重试发布。
+fn is_version_rollback_err(err: &str) -> bool {
+    err.contains("Cannot implicitly apply")
 }
 
 /// npm 单次命令超时（秒）：pack / publish 网络慢或卡死时防止永久挂起。
@@ -892,6 +927,19 @@ mod tests {
         assert!(!is_prerelease("0.2.2"));
         assert!(!is_prerelease("1.0.0"));
         assert!(!is_prerelease("0.1.0"));
+    }
+
+    #[test]
+    fn version_rollback_err_detection() {
+        // 版本回退冲突（npm 11 文案）→ 命中，需 --tag legacy 重试
+        assert!(is_version_rollback_err(
+            "npm error Cannot implicitly apply the \"latest\" tag because previously published version 1.1.0 is higher than the new version 0.6.4. You must specify a tag using --tag."
+        ));
+        // 其他错误 → 不命中
+        assert!(!is_version_rollback_err("npm error code E409"));
+        assert!(!is_version_rollback_err("npm error EPUBLISHCONFLICT"));
+        assert!(!is_version_rollback_err("npm error code EUSAGE"));
+        assert!(!is_version_rollback_err(""));
     }
 
     #[test]
