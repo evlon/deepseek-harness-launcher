@@ -10,6 +10,7 @@ mod dsh_npm;
 mod dsh_versions;
 mod install;
 mod logging;
+mod matrix_setup;
 mod mirror;
 mod notify;
 mod ops;
@@ -104,6 +105,10 @@ fn main() {
                 )
                 .body(html.into_bytes())
                 .unwrap_or_default()
+        })
+        // 数字分身配置向导窗口协议（matrix-setup://localhost/index.html）
+        .register_uri_scheme_protocol("matrix-setup", |ctx, request| {
+            crate::matrix_setup::handle_scheme_request(&ctx, request)
         })
         .setup(|app| {
             let handle = app.handle().clone();
