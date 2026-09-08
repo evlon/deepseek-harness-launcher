@@ -20,8 +20,8 @@
 ## 二、成功标准（小白视角）
 
 ```
-启动 launcher（未配置 matrix）→ 托盘出现「⚠️ 数字分身待配置」
-  → 点「配置数字分身」打开向导
+双击 launcher（首次/未配置 matrix）
+  → 程序检测未配置 → 自动弹出「配置数字分身」向导窗口（无需找菜单）
   → 表单：服务器地址 / 分身账号 / accessToken（或 账号+密码自动获取）
   → 点「开始配置」→ 弹出进度窗口，分步走：
        ① 写入配置（settings.yaml dsh-matrix section）
@@ -30,7 +30,7 @@
        ④ 完成 ✓（通知：数字分身已可用，在 Matrix 客户端 @ 它试试）
 ```
 
-1. 未配置时启动 → 托盘有明确状态 + 向导入口
+1. **双击启动即弹窗**：检测到未配置 → 自动弹出配置窗口（小白零学习成本，不用找托盘菜单）；配置期间关窗不重复骚扰（本次会话只弹一次，托盘保留「配置数字分身」入口可随时重开）
 2. 表单字段与 dsh-matrix-agent 设置 UI 同字段同语义；每字段有小白能懂的说明
 3. 提交后**一步步可见进度**（复用操作进度窗口），每步成功/失败明确；失败可重试/回看
 4. 完成后 matrix 数字分身真正可用（日志无 pending-config / disabled / incomplete config，Matrix 桥已连）
@@ -56,7 +56,14 @@
   - `MatrixUnconfigured`：homeserverUrl/userId/accessToken 任一缺失/空/pending-config
   - `MatrixConfigured`：三要素齐全（已激活）
 - 托盘：未配置 → 顶部状态行 `⚠️ 数字分身待配置` + 菜单项「配置数字分身」；已配置 → 菜单项变「数字分身设置」（可改）
-- 首次启动（MatrixUnconfigured）→ 自动弹向导窗口 + 通知
+
+**自动弹出（小白第一入口，核心行为）**：
+- setup 阶段（main.rs 的 setup 钩子，install/auto-start 等初始动作之后）检测 `MatrixUnconfigured`：
+  - 若 matrix profile 已预置（dsh-matrix-agent 已装）→ **自动弹出配置向导窗口** `matrix_setup::open(app)`（同 install.rs 45 行 open_console 的模式；窗口创建需在 Tauri 就绪后，可用 async spawn 稍延迟确保 Webview 可用）
+  - 若还没装（首次连 install 都没跑）→ 先走 install（用户点安装/修复），装完预置 matrix 后再弹配置向导
+- **与 auto_start 的交互**：配置了 auto_start 且未配置 matrix 时，**不自动 launch matrix profile**（未配置启动无意义、还会报"配置不完整"），改为弹向导；用户完成配置后由向导的分步执行负责启动
+- **防骚扰**：本次进程生命周期内只自动弹一次（进程内存标志 / 窗口已存在则聚焦不重复建）；用户关闭窗口后本次不再自动弹，托盘「配置数字分身」随时可重开；下次启动若仍未配置再弹
+- 已配置（MatrixConfigured）→ 不弹，按 auto_start 正常启动
 
 ### 4.2 表单（复用 console 同款自定义协议窗口）
 窗口：`matrix-setup`，~480×520，标题「配置数字分身」
