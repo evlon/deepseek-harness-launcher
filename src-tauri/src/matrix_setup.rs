@@ -59,9 +59,14 @@ impl MatrixAccount {
     }
 }
 
-/// token 是否「可用」：非空且非占位；空时允许环境变量 DSH_MATRIX_TOKEN 兜底。
+/// token 是否「可用」：非空且非占位；access_token 空时允许环境变量 DSH_MATRIX_TOKEN 兜底
+/// （dsh-matrix-agent 的 config 也支持 accessToken 空 → 回退 process.env.DSH_MATRIX_TOKEN）。
 fn token_ready(token: &str) -> bool {
-    !token.trim().is_empty() && token.trim() != PENDING_CONFIG
+    if !token.trim().is_empty() && token.trim() != PENDING_CONFIG {
+        return true;
+    }
+    // 空/占位时：环境变量兜底（与 dsh-matrix-agent 行为一致）
+    std::env::var("DSH_MATRIX_TOKEN").map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
 
 /// 向导状态。
@@ -492,12 +497,13 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                 serde_json::json!({"ok": false, "error": format!("配置不完整，缺：{}", acc.missing().join(", "))}),
             );
         }
-        // 后台线程跑分步执行（写配置→重启→等连接）；进度走 ops + console 窗口
+        // 后台跑分步执行（写配置→重启→等连接，含最长 ~50s 轮询）；进度走 ops + console 窗口。
+        // 用 spawn_blocking 避免阻塞 async runtime（run_setup_steps 是同步阻塞函数）。
         let h = app.clone();
-        std::thread::spawn(move || {
+        let cfg_bg = load_cached();
+        tauri::async_runtime::spawn_blocking(move || {
             crate::ops::start_op(&h, "matrix-setup", "配置数字分身", &["写入配置", "重启数字分身", "等待连接"]);
-            let cfg2 = load_cached();
-            match run_setup_steps(&h, &cfg2, acc) {
+            match run_setup_steps(&h, &cfg_bg, acc) {
                 Ok(msg) => {
                     crate::ops::finish_op(&h, &msg);
                     crate::notify::notify(&h, "数字分身已配置完成", &msg);
@@ -509,9 +515,9 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                 }
             }
         });
-        // 弹进度窗口（后台线程里弹，等窗口线程就绪）
+        // 弹进度窗口（稍延迟等窗口线程就绪）
         let h = app.clone();
-        std::thread::spawn(move || {
+        tauri::async_runtime::spawn(async move {
             std::thread::sleep(std::time::Duration::from_millis(300));
             let _ = crate::console::open_console(&h);
         });
