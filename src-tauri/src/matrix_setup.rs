@@ -515,11 +515,19 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                 }
             }
         });
-        // 弹进度窗口（稍延迟等窗口线程就绪）
+        // 弹进度窗口 + 关闭向导窗口（向导任务已移交后台，白屏窗口不应残留）。
+        // 注意：JS window.close() 对 Tauri WebView 无效（非脚本打开的窗口不能自关），
+        // 必须由 Rust 主动关——否则向导窗口持续残留（曾现白屏）。
         let h = app.clone();
         tauri::async_runtime::spawn(async move {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            // 先弹进度窗口（让用户看到分步），再关向导
             let _ = crate::console::open_console(&h);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if let Some(win) = h.get_webview_window("matrix-setup") {
+                let _ = win.close();
+                log::info!("[matrix-setup] 向导窗口已关闭，进度移交操作窗口");
+            }
         });
         return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始配置"}));
     }
@@ -699,6 +707,8 @@ pub fn wizard_html() -> String {
     };
     if(!body.homeserverUrl||!body.userId){ st.className="status err"; st.textContent="✗ 请填写服务器地址和分身账号"; return; }
     if(!body.accessToken){ st.className="status err"; st.textContent="✗ 请粘贴 access token，或用账号密码获取"; return; }
+    // 防重复提交 + 防提交后页面异常（窗口会由本机服务自动关闭）
+    $("submit").disabled=true;
     try{
       const r=await fetch("http://matrix-setup.localhost/submit",{
         method:"POST",headers:{"Content-Type":"application/json"},
@@ -706,10 +716,9 @@ pub fn wizard_html() -> String {
       });
       const j=await r.json();
       if(j.ok){
-        st.innerHTML='<span class="ok">✓ 已提交！正在后台配置（进度窗口会显示步骤）… 本窗口可关闭。</span>';
-        setTimeout(()=>{ try{ window.close(); }catch(e){} },1500);
-      } else { st.className="status err"; st.textContent="✗ "+(j.error||"提交失败"); }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; }
+        st.innerHTML='<span class="ok">✓ 已提交！正在后台配置——进度窗口即将弹出，本窗口会自动关闭。</span>';
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"提交失败"); $("submit").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("submit").disabled=false; }
   };
 })();
 </script>
