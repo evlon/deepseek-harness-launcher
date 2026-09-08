@@ -21,6 +21,9 @@ mod sync;
 mod tray;
 mod workflow;
 
+/// 本次进程是否已自动弹过数字分身配置向导（防骚扰：只弹一次）。
+static AUTO_SETUP_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() {
     // 解析 CLI 参数（--cmd 等）
     let cli_args = cli::parse_args();
@@ -128,8 +131,40 @@ fn main() {
             // 恢复上次操作状态（重启后托盘/窗口可见上次结果）
             ops::load_from_disk(&handle);
 
+            // 数字分身未配置检测：自动弹配置向导（小白第一入口，仅未配置时一次）。
+            // 放在 auto_start 之前：未配置时不自动启动数字分身（无意义），改弹向导引导。
+            {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    // 稍延迟确保 Tauri Webview 就绪（窗口可正常创建）
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    let cfg = config::load_cached();
+                    let needs_setup = crate::matrix_setup::matrix_agent_installed(&h, &cfg)
+                        && matches!(
+                            crate::matrix_setup::status(&h, &cfg),
+                            crate::matrix_setup::MatrixStatus::Unconfigured { .. }
+                        );
+                    if needs_setup && AUTO_SETUP_SHOWN.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                        log::info!("检测到数字分身未配置，自动弹出配置向导");
+                        match crate::matrix_setup::open_window(&h) {
+                            Ok(()) => {
+                                crate::notify::notify(&h, "配置数字分身", "首次使用请先配置数字分身（填账号后即可用）");
+                            }
+                            Err(e) => log::warn!("自动弹配置向导失败：{e}"),
+                        }
+                    }
+                });
+            }
+
             // 自动启动 Harness（若配置开启且已安装）
-            if cfg.auto_start.unwrap_or(false) && config::dsh_binary_path(&handle).exists() {
+            if cfg.auto_start.unwrap_or(false)
+                && config::dsh_binary_path(&handle).exists()
+                && !(crate::matrix_setup::matrix_agent_installed(&handle, &cfg)
+                    && matches!(
+                        crate::matrix_setup::status(&handle, &cfg),
+                        crate::matrix_setup::MatrixStatus::Unconfigured { .. }
+                    ))
+            {
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     match workflow::launch(&h) {

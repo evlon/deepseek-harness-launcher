@@ -184,6 +184,20 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             owned.push(MenuItem::with_id(app, "op-view", "📋 查看进度 / 日志", true, None::<&str>)?);
         }
     }
+    // 数字分身配置状态提示（未配置时顶部提示 + 入口；已配置隐藏提示）
+    let cfg0 = load_cached();
+    if crate::matrix_setup::matrix_agent_installed(app, &cfg0) {
+        match crate::matrix_setup::status(app, &cfg0) {
+            crate::matrix_setup::MatrixStatus::Unconfigured { .. } => {
+                owned.push(MenuItem::with_id(app, "ms-warn", "⚠️ 数字分身待配置（点击下方「配置数字分身」）", false, None::<&str>)?);
+                owned.push(MenuItem::with_id(app, "ms-open", "🛠 配置数字分身", true, None::<&str>)?);
+            }
+            crate::matrix_setup::MatrixStatus::NotInstalled => {}
+            crate::matrix_setup::MatrixStatus::Configured => {
+                owned.push(MenuItem::with_id(app, "ms-open", "🛠 数字分身设置", true, None::<&str>)?);
+            }
+        }
+    }
     // Harness 运行状态：菜单项按状态动态可用
     // 运行中 → 只能「停止」「打开页面」；未运行 → 只能「启动」
     let running = crate::workflow::is_running();
@@ -477,6 +491,15 @@ fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<Str
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
+        "ms-open" => {
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                match crate::matrix_setup::open_window(&h) {
+                    Ok(()) => {}
+                    Err(e) => notify(&h, "无法打开配置向导", &e),
+                }
+            });
+        }
         "install" => {
             // 防重复安装：已有进行中的长操作则拒绝
             if crate::ops::has_running() {

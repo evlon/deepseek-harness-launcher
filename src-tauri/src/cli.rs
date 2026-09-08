@@ -80,6 +80,9 @@ fn print_help() {
     println!("  mirror        镜像上传到内网 registry（需 --registry --token）");
     println!("  status        查询状态（运行中/端口/上次操作/测速结果）");
     println!("  open-console  打开进度窗口");
+    println!("  matrix-setup-status  查询数字分身配置状态（unconfigured/configured + 缺哪些字段）");
+    println!("  matrix-setup-reset   清除数字分身配置（回未配置态，可重走向导）");
+    println!("  matrix-setup-open    打开数字分身配置向导窗口");
     println!("  dsh-versions  查询 dsh 版本状态（当前/已装/最新）");
     println!("  dsh-install   下载安装指定 dsh 版本（需 --tag <版本>）");
     println!("  dsh-switch    切换 dsh 版本（需 --tag <版本>，停→换→重启）");
@@ -174,6 +177,31 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
             let r = crate::commands::cmd_status(app.clone());
             print_result("status", &r);
             0
+        }
+        "matrix-setup-status" => {
+            let cfg = crate::config::load_cached();
+            let st = crate::matrix_setup::status(app, &cfg);
+            let (state, missing) = match &st {
+                crate::matrix_setup::MatrixStatus::Configured => ("configured".to_string(), Vec::new()),
+                crate::matrix_setup::MatrixStatus::NotInstalled => ("not-installed".to_string(), Vec::new()),
+                crate::matrix_setup::MatrixStatus::Unconfigured { missing } => ("unconfigured".to_string(), missing.clone()),
+            };
+            let json = serde_json::json!({ "status": state, "missing": missing });
+            println!("[matrix-setup-status] {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+            0
+        }
+        "matrix-setup-reset" => {
+            let cfg = crate::config::load_cached();
+            let r = crate::matrix_setup::clear_account(app, &cfg);
+            let out: Result<serde_json::Value, String> = r.map(|_| serde_json::json!({"ok": true, "message": "数字分身配置已清除，可重新走向导"}));
+            print_result("matrix-setup-reset", &out);
+            if out.is_ok() { 0 } else { 1 }
+        }
+        "matrix-setup-open" => {
+            let r = crate::matrix_setup::open_window(app);
+            let out: Result<serde_json::Value, String> = r.map(|_| serde_json::json!({"ok": true}));
+            print_result("matrix-setup-open", &out);
+            if out.is_ok() { 0 } else { 1 }
         }
         "open-console" => {
             let r = crate::commands::cmd_open_console(app.clone());
