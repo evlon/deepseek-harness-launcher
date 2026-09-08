@@ -1,5 +1,10 @@
 # Launcher 首次引导激活数字人：填 2 个账号 + 清理重测功能（方案设计）
 
+> ⚠️ **已被 `docs/matrix-setup-wizard.md` 取代**（2026-09-07 第 2 版）。
+> 用户澄清：向导是 dsh-matrix-agent 的「Matrix 配置引导层」（非独立认证）；
+> 本期范围收敛为**只做 Matrix 配置引导 + 进度 + 清理**。本文保留作历史参考
+> （含 HiMarket 账号与 Matrix 统一认证的未来扩展设计）。
+>
 > 状态：已评审通过（2026-09-07）。本期**只做设计**，实施另立项。
 > 适用仓库：deepseek-harness-launcher（客户端托盘）+ 关联 dsh-himarket / dsh-himarket-gateway / dsh-matrix-agent（dsh-bridge）。
 
