@@ -8,8 +8,10 @@ mod console;
 mod download;
 mod dsh_npm;
 mod dsh_versions;
+mod first_run;
 mod install;
 mod logging;
+mod logpack;
 mod matrix_setup;
 mod mirror;
 mod notify;
@@ -23,6 +25,9 @@ mod workflow;
 
 /// 本次进程是否已自动弹过数字分身配置向导（防骚扰：只弹一次）。
 static AUTO_SETUP_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 本次进程是否已自动弹过「首次使用」欢迎窗口（防骚扰：只弹一次）。
+static FIRST_RUN_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() {
     // 解析 CLI 参数（--cmd 等）
@@ -113,6 +118,10 @@ fn main() {
         .register_uri_scheme_protocol("matrix-setup", |ctx, request| {
             crate::matrix_setup::handle_scheme_request(&ctx, request)
         })
+        // 首次运行欢迎窗口协议（first-run://localhost/index.html）
+        .register_uri_scheme_protocol("first-run", |ctx, request| {
+            crate::first_run::handle_scheme_request(&ctx, request)
+        })
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -131,7 +140,10 @@ fn main() {
             // 恢复上次操作状态（重启后托盘/窗口可见上次结果）
             ops::load_from_disk(&handle);
 
-            // 数字分身未配置检测：自动弹配置向导（小白第一入口，仅未配置时一次）。
+            // 首次运行 / 未配置引导（小白第一入口，仅一次）：
+            // ① dsh 未安装（全新机器）→ 弹「首次使用」欢迎窗口（说明程序已在托盘 + 一键安装），
+            //    解决「双击后没反应」（托盘图标被 Windows 折叠进 ^，用户看不到）。
+            // ② dsh 已装但数字分身未配置 → 弹配置向导。
             // 放在 auto_start 之前：未配置时不自动启动数字分身（无意义），改弹向导引导。
             {
                 let h = handle.clone();
@@ -139,6 +151,23 @@ fn main() {
                     // 稍延迟确保 Tauri Webview 就绪（窗口可正常创建）
                     std::thread::sleep(std::time::Duration::from_millis(1200));
                     let cfg = config::load_cached();
+                    // 首次运行：dsh 未装 → 欢迎窗口
+                    if crate::first_run::is_first_run(&h) {
+                        if FIRST_RUN_SHOWN.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                            log::info!("检测到首次运行（dsh 未安装），弹出首次使用窗口");
+                            crate::notify::notify(
+                                &h,
+                                "数字分身启动器已运行",
+                                "它在右下角托盘区（点 ^ 展开可见）。点此窗口完成首次安装。",
+                            );
+                            match crate::first_run::open_window(&h) {
+                                Ok(()) => {}
+                                Err(e) => log::warn!("弹首次使用窗口失败：{e}"),
+                            }
+                        }
+                        return; // 首次运行不做后续配置检测（装完再引导）
+                    }
+                    // 已安装但数字分身未配置 → 配置向导
                     let needs_setup = crate::matrix_setup::matrix_agent_installed(&h, &cfg)
                         && matches!(
                             crate::matrix_setup::status(&h, &cfg),

@@ -184,6 +184,13 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             owned.push(MenuItem::with_id(app, "op-view", "📋 查看进度 / 日志", true, None::<&str>)?);
         }
     }
+    // 首次运行（dsh 未安装）：顶部提示 + 「首次使用向导」入口
+    // （小白关掉欢迎窗口后仍能从托盘找回引导）
+    if crate::first_run::is_first_run(app) {
+        owned.push(MenuItem::with_id(app, "fr-warn", "👋 首次使用：请点下方「首次使用向导」", false, None::<&str>)?);
+        owned.push(MenuItem::with_id(app, "fr-open", "🚀 首次使用向导（安装）", true, None::<&str>)?);
+    }
+
     // 数字分身配置状态提示（未配置时顶部提示 + 入口；已配置隐藏提示）
     let cfg0 = load_cached();
     if crate::matrix_setup::matrix_agent_installed(app, &cfg0) {
@@ -241,10 +248,12 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     items.push(&dsh_submenu);
     items.push(&bridge_submenu);
 
-    // 收尾：查看日志 / 退出
+    // 收尾：查看日志 / 收集日志（排障回传） / 退出
     let log_item = MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?;
+    let logpack_item = MenuItem::with_id(app, "logpack", "📦 收集日志（发给管理员排障）", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     items.push(&log_item);
+    items.push(&logpack_item);
     items.push(&quit_item);
 
     let menu = Menu::with_items(app, &items)?;
@@ -491,6 +500,15 @@ fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<Str
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
+        "fr-open" => {
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                match crate::first_run::open_window(&h) {
+                    Ok(()) => {}
+                    Err(e) => notify(&h, "无法打开首次使用向导", &e),
+                }
+            });
+        }
         "ms-open" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -525,7 +543,13 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     }
                     Err(e) => {
                         crate::ops::fail_op(&h, &e);
-                        notify(&h, "启动失败", &e);
+                        // 失败时引导排障：提示可一键收集日志发给管理员（小白友好）
+                        crate::ops::append_log(&h, "提示：可在托盘菜单点「📦 收集日志（发给管理员排障）」导出诊断包");
+                        notify(
+                            &h,
+                            "启动失败",
+                            &format!("{e}\n\n可在托盘菜单点「📦 收集日志」导出诊断包发给管理员"),
+                        );
                         refresh_sync_menu(&h);
                     }
                 }
@@ -850,6 +874,32 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
         "log" => {
             let path = log_file(app);
             let _ = app.opener().open_path(path.to_string_lossy().to_string(), None::<&str>);
+        }
+        "logpack" => {
+            // 收集日志到桌面 zip，并打开所在目录（小白可直接拖给管理员）
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "logpack", "收集日志", &[]);
+                match crate::logpack::collect(&h) {
+                    Ok(r) => {
+                        let msg = format!(
+                            "已收集 {} 个文件 → {}",
+                            r.file_count,
+                            r.zip_path.display()
+                        );
+                        crate::ops::finish_op(&h, &msg);
+                        notify(&h, "日志已收集", &format!("已保存到桌面：{}", r.zip_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
+                        // 打开桌面目录，方便直接拖给管理员
+                        if let Some(parent) = r.zip_path.parent() {
+                            let _ = h.opener().open_path(parent.to_string_lossy().to_string(), None::<&str>);
+                        }
+                    }
+                    Err(e) => {
+                        crate::ops::fail_op(&h, &format!("收集日志失败：{e}"));
+                        notify(&h, "收集日志失败", &e);
+                    }
+                }
+            });
         }
         id if id.starts_with("link-") => {
             if let Some(idx_str) = id.strip_prefix("link-") {

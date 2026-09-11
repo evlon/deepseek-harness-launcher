@@ -155,18 +155,21 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
     }
     let cwd = dsh_install_path(app);
 
-    // stderr 重定向到日志文件：dsh 启动失败（缺插件 patch/配置等）时，
-    // 用户能在 launcher.log 里看到真实错误（此前 Stdio::null 吞掉错误，
-    // 表现为「提示成功但打不开网页」且无处查错）。
+    // stdout + stderr 都重定向到同一个日志文件：dsh 的启动日志/错误大多走
+    // stdout（Node console.log），此前 stdout 被 Stdio::null() 丢弃 → 日志文件 0 字节、
+    // 「端口未就绪」查不到根因（同事实测踩坑）。现在两个流都落盘，便于诊断与收集。
     let cfg2 = load_cached();
-    let stderr_log = crate::config::dsh_home(app, &cfg2)
+    let launch_log = crate::config::dsh_home(app, &cfg2)
         .join("logs")
         .join(format!("dsh-launch-{}.log", std::process::id()));
-    if let Some(parent) = stderr_log.parent() {
+    if let Some(parent) = launch_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let stderr_file = std::fs::File::create(&stderr_log)
-        .map_err(|e| format!("STDERR_LOG_CREATE_FAILED: {e}"))?;
+    let stdout_file = std::fs::File::create(&launch_log)
+        .map_err(|e| format!("STDOUT_LOG_CREATE_FAILED: {e}"))?;
+    let stderr_file = stdout_file
+        .try_clone()
+        .map_err(|e| format!("STDERR_LOG_CLONE_FAILED: {e}"))?;
 
     let mut cmd = Command::new(&node);
     cmd.arg(&dsh_bin)
@@ -178,9 +181,9 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
         .arg(port.to_string())
         .current_dir(&cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
-    log::info!("Harness stderr 日志：{}", stderr_log.display());
+    log::info!("Harness 启动日志（stdout+stderr）：{}", launch_log.display());
 
     // rc.8+ 支持 --no-open（启动不弹系统浏览器）；更早版本无此标志。
     if version_supports_no_open(app) {
