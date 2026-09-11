@@ -213,11 +213,15 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
     );
     let ready = wait_for_port(port, pid, Duration::from_secs(LAUNCH_READY_TIMEOUT_SECS));
     if !ready {
-        // 启动失败：杀进程树 + 清理状态
+        // 启动失败：先判断进程是否已自行退出（区分「崩溃」与「卡住未监听」），
+        // 再杀进程树 + 清理状态。带上日志路径，便于用户/管理员直接查看。
+        let exited = !pid_alive(pid);
         kill_pid_tree(pid);
         *RUNNING.lock().unwrap() = None;
         return Err(format!(
-            "HARNESS_NOT_READY: 进程已启动但 {LAUNCH_READY_TIMEOUT_SECS}s 内端口 {port} 未就绪（可能初始化失败/崩溃）"
+            "HARNESS_NOT_READY: {LAUNCH_READY_TIMEOUT_SECS}s 内端口 {port} 未就绪（{}）\n启动日志：{}",
+            if exited { "进程已退出" } else { "进程仍在运行但未监听端口" },
+            launch_log.display()
         ));
     }
     log::info!(
@@ -230,8 +234,11 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
     Ok(port)
 }
 
-/// 启动后等待端口就绪的最大时长（秒）。dsh 冷启动（插件加载 + HTTP 起服务）一般 5-20s。
-const LAUNCH_READY_TIMEOUT_SECS: u64 = 40;
+/// 启动后等待端口就绪的最大时长（秒）。
+/// dsh 冷启动（插件加载 + HTTP 起服务）一般 5-20s，但首次安装后插件多、
+/// 磁盘冷、企业安全软件扫描时可能显著更久——留足 90s 避免误报失败
+/// （同事实测 40s 不够；超时后仍会 kill 并报错，不会假成功）。
+const LAUNCH_READY_TIMEOUT_SECS: u64 = 90;
 
 /// 轮询等待端口被监听；同时检测进程是否提前退出。
 fn wait_for_port(port: u16, pid: u32, timeout: Duration) -> bool {

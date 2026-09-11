@@ -87,6 +87,51 @@ pub fn collect<R: Runtime>(app: &AppHandle<R>) -> Result<PackResult, String> {
     if let Ok(text) = std::fs::read_to_string(&ops_path) {
         summary.push_str(&redact(&text));
     }
+
+    // ④ profile 关键文件（判断 bundles 是否完整——缺 @deepseek-ai/dsh-web-app
+    //    会导致 dsh 起不了 HTTP 服务 → 端口不就绪。同事实测排查刚需）
+    let profile = resolve_profile(&cfg);
+    let profile_dir = home.join("profiles").join(&profile);
+    summary.push_str(&format!("\n--- profiles/{profile}/package.json（bundles）---\n"));
+    let pkg = profile_dir.join("package.json");
+    if let Ok(text) = std::fs::read_to_string(&pkg) {
+        summary.push_str(&text);
+        summary.push('\n');
+    } else {
+        summary.push_str("（缺失！profile 未创建）\n");
+    }
+    summary.push_str(&format!("\n--- profiles/{profile}/cordis.patch.yml ---\n"));
+    let ppatch = profile_dir.join("cordis.patch.yml");
+    if let Ok(text) = std::fs::read_to_string(&ppatch) {
+        summary.push_str(&text);
+        summary.push('\n');
+    } else {
+        summary.push_str("（无）\n");
+    }
+    // 已装插件清单（node_modules 顶层 + @scope）
+    summary.push_str(&format!("\n--- profiles/{profile}/node_modules 已装包 ---\n"));
+    let nm = profile_dir.join("node_modules");
+    let mut installed: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&nm) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.starts_with('@') {
+                if let Ok(inner) = std::fs::read_dir(e.path()) {
+                    for i in inner.flatten() {
+                        installed.push(format!("{}/{}", name, i.file_name().to_string_lossy()));
+                    }
+                }
+            } else {
+                installed.push(name);
+            }
+        }
+    }
+    installed.sort();
+    summary.push_str(&installed.join("\n"));
+    summary.push('\n');
     zip.start_file("summary.txt", opts).map_err(|e| e.to_string())?;
     zip.write_all(summary.as_bytes()).map_err(|e| e.to_string())?;
     count += 1;
