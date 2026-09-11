@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-launcher",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Tray-resident launcher for installing/launching DeepSeek Harness (headless, no webview).",
   "scripts": {
