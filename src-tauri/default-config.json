@@ -2,7 +2,7 @@
   "port": 3180,
   "profile": "matrix",
   "syncIntervalSecs": 300,
-  "serverUrl": "http://ai-conf.ict.cmcc",
+  "serverUrl": "http://conf.ai.ict.cmcc",
   "geoDetection": {
     "enabled": true,
     "provider": "https://ipinfo.io/json"

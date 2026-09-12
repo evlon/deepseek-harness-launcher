@@ -129,8 +129,17 @@ pub fn stop() {
 
 // ---------- 请求处理（tiny_http） ----------
 
+/// 内置放行的管理页 Origin（新旧环境并存，两个都放行）。
+/// 新 K8S 环境 conf.ai.ict.cmcc；旧环境 ai-conf.ict.cmcc。
+/// 还可经环境变量 ADMIN_ORIGIN（逗号分隔）追加任意来源（测试/内网别名）。
+const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
+    "http://conf.ai.ict.cmcc",
+    "https://conf.ai.ict.cmcc",
+    "http://ai-conf.ict.cmcc",
+    "https://ai-conf.ict.cmcc",
+];
+
 /// 允许的管理页 Origin（服务端管理页域名；浏览器同源请求无 Origin 头时放行）。
-/// 默认放行 ai-conf.ict.cmcc；可经环境变量 ADMIN_ORIGIN 覆盖（测试/内网别名）。
 fn origin_allowed(origin: &str) -> bool {
     if let Ok(extra) = std::env::var("ADMIN_ORIGIN") {
         for e in extra.split(',') {
@@ -140,7 +149,7 @@ fn origin_allowed(origin: &str) -> bool {
             }
         }
     }
-    origin == "http://ai-conf.ict.cmcc" || origin == "https://ai-conf.ict.cmcc"
+    DEFAULT_ALLOWED_ORIGINS.contains(&origin)
 }
 
 /// 处理单个请求：CORS → token → 路由。
@@ -326,7 +335,7 @@ fn respond_json(request: tiny_http::Request, code: u16, obj: serde_json::Value, 
     let allow_origin = if origin_allowed(origin) && !origin.is_empty() {
         origin.to_string()
     } else {
-        "http://ai-conf.ict.cmcc".to_string()
+        DEFAULT_ALLOWED_ORIGINS[0].to_string()
     };
     let response = tiny_http::Response::from_string(body)
         .with_status_code(status)
@@ -342,7 +351,7 @@ fn respond_options(request: tiny_http::Request, origin: &str) {
     let allow_origin = if origin_allowed(origin) && !origin.is_empty() {
         origin.to_string()
     } else {
-        "http://ai-conf.ict.cmcc".to_string()
+        DEFAULT_ALLOWED_ORIGINS[0].to_string()
     };
     let response = tiny_http::Response::empty(204)
         .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], allow_origin.as_bytes()).unwrap())

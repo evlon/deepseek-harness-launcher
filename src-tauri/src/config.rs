@@ -1183,7 +1183,7 @@ mod tests {
         let cfg = builtin_default_config();
         assert_eq!(cfg.port, Some(3180), "默认端口应避开 3080");
         assert_eq!(cfg.profile.as_deref(), Some("matrix"), "默认 profile 为 matrix（与 web 区分）");
-        assert_eq!(cfg.server_url.as_deref(), Some("http://ai-conf.ict.cmcc"), "默认同步服务端");
+        assert_eq!(cfg.server_url.as_deref(), Some("http://conf.ai.ict.cmcc"), "默认同步服务端（新 K8S 环境）");
         assert!(cfg.geo_detection.as_ref().map(|g| g.enabled).unwrap_or(false), "IP 检测默认开启");
         assert_eq!(geo_provider(&cfg), DEFAULT_GEO_PROVIDER);
     }

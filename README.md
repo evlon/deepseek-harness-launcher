@@ -86,6 +86,25 @@ node server.js --port 8080 --token 你的管理口令
 客户端侧：在 `launcher-config.json` 配置 `serverUrl`（如 `http://10.0.0.5:8080`）即可启用同步；
 管理员在中心服务端添加推荐插件后，各客户端下一次轮询（默认 5 分钟）会收到提示并可在托盘确认安装。
 
+### 内网域名配置（新旧环境并存）
+
+内网原有 `*.ict.cmcc`，新部署的 K8S 环境改用 `*.ai.ict.cmcc`。**两套环境并存**，
+故内置默认已切到新环境，但可随时切回：
+
+| 项 | 默认（新环境） | 旧环境 |
+|---|---|---|
+| 中心服务端 `serverUrl` | `http://conf.ai.ict.cmcc` | `http://ai-conf.ict.cmcc` |
+| 管理能力 bridge CORS 放行 Origin | `http://conf.ai.ict.cmcc` | `http://ai-conf.ict.cmcc` |
+
+- **切回旧环境**：在
+  `%APPDATA%\io.github.hairyf.deepseek-harness-launcher\launcher-config.json`
+  里把 `serverUrl` 改成 `http://ai-conf.ict.cmcc`（用户配置覆盖内置默认，改完重启生效）。
+- **CORS 白名单**：bridge 默认**同时放行新旧两个** `conf` 域名（`http`/`https` 各一），
+  无需配置；如需追加其他来源，用环境变量 `ADMIN_ORIGIN`（逗号分隔）。
+- 其他服务域名对应关系：门户 `ai-market.ict.cmcc` → `market.ai.ict.cmcc`；
+  岗位网关 `ai-job.ict.cmcc` → `gateway.ai.ict.cmcc`；
+  花名册 `ai-roster.ict.cmcc` → `roster.ai.ict.cmcc`。
+
 ## 构建与运行
 
 ```bash
