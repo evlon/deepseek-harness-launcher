@@ -453,6 +453,21 @@ pub async fn preset_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &Launche
 
     // 写品牌 patch（配置品牌名称）
     write_matrix_brand_patch(app, cfg)?;
+
+    // 下发环境默认配置（各内网服务地址等统一值）到 settings.yaml。
+    // 遵循「只填空缺」：用户已显式设置过的不覆盖（详见 env_defaults 模块文档）。
+    // 失败不阻断预置——插件缺地址时保持存活并在设置页可补填。
+    match crate::env_defaults::apply_env_defaults_to_file(
+        &crate::matrix_setup::settings_yaml_path(app, cfg),
+    ) {
+        Ok((filled, skipped)) => {
+            if filled > 0 {
+                log::info!("已下发环境默认配置：填充 {filled} 项，保留用户已设 {skipped} 项");
+            }
+        }
+        Err(e) => log::warn!("下发环境默认配置失败（不阻断）：{e}"),
+    }
+
     Ok(())
 }
 

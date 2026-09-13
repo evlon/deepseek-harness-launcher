@@ -49,6 +49,12 @@ pub struct ServerConfig {
     /// 镜像相关设置（服务端统一管理：registry / dsh 分发源）。
     #[serde(default, rename = "mirrorSettings")]
     pub mirror_settings: Option<serde_json::Value>,
+    /// 环境默认配置（服务端统一管理）：`{ "<namespace>": { "<key>": "<value>" } }`。
+    ///
+    /// 落到 `$DSH_HOME/settings.yaml`，供各插件读取内网服务地址等统一值。
+    /// 遵循「只填空缺」——用户已显式设置过的不覆盖（同 clientDefaults 语义）。
+    #[serde(default, rename = "envDefaults")]
+    pub env_defaults: Option<serde_json::Value>,
 }
 
 /// 客户端已装插件详情（跨所有 profile，上报给服务端）。
@@ -821,6 +827,27 @@ fn apply_server_defaults<R: Runtime>(app: &AppHandle<R>, server: &ServerConfig) 
                 mirror_settings.dsh_mirror_url = None;
             } else {
                 mirror_settings.dsh_mirror_url = Some(trimmed.to_string());
+            }
+        }
+    }
+
+    // 3) envDefaults：环境默认配置（内网服务地址等统一值）→ settings.yaml
+    //    服务端下发优先于代码内置的 ENV_DEFAULTS（管理员可在配置中心改一处、全员生效）。
+    //    仍是「只填空缺」：用户在设置页显式改过的值不被覆盖。
+    if let Some(env_defaults) = &server.env_defaults {
+        if env_defaults.is_object()
+            && !env_defaults.as_object().map(|o| o.is_empty()).unwrap_or(true)
+        {
+            let settings_path = crate::matrix_setup::settings_yaml_path(app, &local);
+            match crate::env_defaults::apply_env_defaults_map_to_file(&settings_path, env_defaults) {
+                Ok((filled, skipped)) => {
+                    if filled > 0 {
+                        log::info!(
+                            "已应用服务端环境默认配置：填充 {filled} 项，保留用户已设 {skipped} 项"
+                        );
+                    }
+                }
+                Err(e) => log::warn!("应用服务端环境默认配置失败（不阻断）：{e}"),
             }
         }
     }

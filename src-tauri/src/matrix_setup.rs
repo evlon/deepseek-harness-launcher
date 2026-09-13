@@ -283,6 +283,13 @@ fn clear_account_in_file(path: &Path) -> Result<(), String> {
 
 /// tmp + rename 原子写。
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_public(path, bytes)
+}
+
+/// tmp + rename 原子写（供 `env_defaults` 等模块复用）。
+///
+/// 防 dsh 进程并发读到半截文件：先写 `.yaml.tmp` 再 rename（同分区 rename 原子）。
+pub fn atomic_write_public(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("MKDIR_FAILED: {e}"))?;
     }

@@ -260,9 +260,10 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     Ok(menu)
 }
 
-/// 构建「dsh 版本」子菜单：当前版本 + 检查更新 + 已装版本切换 + 远程可安装版本。
+/// 构建「dsh 版本」子菜单：当前版本 + 检查更新 + 版本通道 + 已装版本切换 + 远程可安装版本。
 fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R>> {
-    let mut rows: Vec<MenuItem<R>> = Vec::new();
+    // 用 IsMenuItem 而非 MenuItem：需要混排普通项与勾选项（CheckMenuItem）。
+    let mut rows: Vec<Box<dyn tauri::menu::IsMenuItem<R>>> = Vec::new();
     let active = crate::dsh_versions::active_version(app);
     let installed = crate::dsh_versions::list_installed(app);
     let active_tag = crate::dsh_versions::active_tag(app);
@@ -273,9 +274,33 @@ fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Su
     } else {
         format!("当前 dsh：{active}")
     };
-    rows.push(MenuItem::with_id(app, "dsh-status", status_text, false, None::<&str>)?);
+    rows.push(Box::new(MenuItem::with_id(app, "dsh-status", status_text, false, None::<&str>)?));
     // 检查更新（点击触发异步查询）
-    rows.push(MenuItem::with_id(app, "dsh-check-update", "🔍 检查更新", true, None::<&str>)?);
+    rows.push(Box::new(MenuItem::with_id(app, "dsh-check-update", "🔍 检查更新", true, None::<&str>)?));
+
+    // 版本通道开关：默认只列 RC/正式版；勾选后列出 Alpha 等预发布。
+    // 安全默认——DSH 发版快，Alpha 不该被无意间装到（见 config::DshChannel 文档）。
+    {
+        use tauri::menu::CheckMenuItem;
+        let cfg = crate::config::load_cached();
+        let ch = crate::config::DshChannel::parse(cfg.dsh_channel.as_deref());
+        let show_alpha = ch == crate::config::DshChannel::Alpha;
+        rows.push(Box::new(MenuItem::with_id(
+            app,
+            "dsh-channel-sep",
+            "─ 版本通道 ─",
+            false,
+            None::<&str>,
+        )?));
+        rows.push(Box::new(CheckMenuItem::with_id(
+            app,
+            "dsh-channel-alpha",
+            "显示 Alpha 版本（默认关闭）",
+            true,
+            show_alpha,
+            None::<&str>,
+        )?));
+    }
 
     // 远程可安装版本（「检查更新」后缓存；点击即下载安装；已装的自动过滤）
     let remote = crate::dsh_versions::installable_remote_releases(app);
@@ -285,8 +310,9 @@ fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Su
         .map(|(i, r)| {
             let version = r["version"].as_str().unwrap_or("").to_string();
             let prerelease = r["prerelease"].as_bool().unwrap_or(false);
+            // 预发布醒目标注，降低误装风险
             let label = if prerelease {
-                format!("📥 安装 {version}（预发布）")
+                format!("⚠ 安装 {version}（预发布）")
             } else {
                 format!("📥 安装 {version}")
             };
@@ -294,13 +320,25 @@ fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Su
         })
         .collect::<Result<Vec<_>, _>>()?;
     if !remote_rows.is_empty() {
-        rows.push(MenuItem::with_id(app, "dsh-remote-sep", "─ 远程可用版本 ─", false, None::<&str>)?);
-        rows.extend(remote_rows);
+        rows.push(Box::new(MenuItem::with_id(
+            app,
+            "dsh-remote-sep",
+            "─ 远程可用版本 ─",
+            false,
+            None::<&str>,
+        )?));
+        rows.extend(remote_rows.into_iter().map(|m| Box::new(m) as Box<dyn tauri::menu::IsMenuItem<R>>));
     }
 
     // 已装版本列表
     if installed.is_empty() {
-        rows.push(MenuItem::with_id(app, "dsh-none", "（无已装版本，请先安装 / 修复）", false, None::<&str>)?);
+        rows.push(Box::new(MenuItem::with_id(
+            app,
+            "dsh-none",
+            "（无已装版本，请先安装 / 修复）",
+            false,
+            None::<&str>,
+        )?));
     } else {
         for (i, v) in installed.iter().enumerate() {
             let tag = v["tag"].as_str().unwrap_or("").to_string();
@@ -312,19 +350,19 @@ fn build_dsh_version_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Su
                 format!("{ver}")
             };
             // 当前版本不可切换；其他版本可切换
-            rows.push(MenuItem::with_id(
+            rows.push(Box::new(MenuItem::with_id(
                 app,
                 format!("dsh-switch-{i}"),
                 label,
                 !is_active,
                 None::<&str>,
-            )?);
+            )?));
         }
     }
 
     let refs: Vec<&dyn tauri::menu::IsMenuItem<R>> = rows
         .iter()
-        .map(|m| m as &dyn tauri::menu::IsMenuItem<R>)
+        .map(|m| m.as_ref() as &dyn tauri::menu::IsMenuItem<R>)
         .collect();
     Submenu::with_id_and_items(app, "dsh", "dsh 版本", true, &refs)
 }
@@ -621,6 +659,43 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     }
                     Err(e) => notify(app, "复制失败", &e),
                 }
+            }
+        }
+        // 版本通道开关：切换 rc ⇄ alpha 并刷新菜单。
+        // 打开 Alpha 时给明确提示（预发布版本可能不稳定）。
+        "dsh-channel-alpha" => {
+            let cfg = crate::config::load_cached();
+            let cur = crate::config::DshChannel::parse(cfg.dsh_channel.as_deref());
+            let next = if cur == crate::config::DshChannel::Alpha {
+                crate::config::DshChannel::Rc
+            } else {
+                crate::config::DshChannel::Alpha
+            };
+            let next_str = match next {
+                crate::config::DshChannel::Rc => "rc",
+                crate::config::DshChannel::Alpha => "alpha",
+            };
+            let mut c = crate::config::load_cached();
+            c.dsh_channel = Some(next_str.to_string());
+            match crate::config::save_config(app, &c) {
+                Ok(()) => {
+                    let msg = match next {
+                        crate::config::DshChannel::Rc => {
+                            "已切回 RC 通道：只列出 RC / 正式版".to_string()
+                        }
+                        crate::config::DshChannel::Alpha => {
+                            "已开启 Alpha 通道：将列出预发布版本\n⚠️ Alpha 可能不稳定，请谨慎安装".to_string()
+                        }
+                    };
+                    notify(app, "dsh 版本通道", &msg);
+                    // 重查远程版本（新通道下候选集变了）
+                    let h = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = crate::dsh_versions::check_update(&h).await;
+                        refresh_sync_menu(&h);
+                    });
+                }
+                Err(e) => notify(app, "切换失败", &e),
             }
         }
         "dsh-check-update" => {

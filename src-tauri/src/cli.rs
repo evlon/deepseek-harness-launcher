@@ -204,6 +204,25 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
             print_result("matrix-setup-open", &out);
             if out.is_ok() { 0 } else { 1 }
         }
+        // 下发环境默认配置（各内网服务地址等统一值）到 settings.yaml。
+        // 遵循「只填空缺」：用户已显式设置过的不覆盖。
+        // 用于诊断「插件为何没拿到地址」以及管理员批量修复。
+        "env-defaults" => {
+            let cfg = crate::config::load_cached();
+            let path = crate::matrix_setup::settings_yaml_path(app, &cfg);
+            let r = crate::env_defaults::apply_env_defaults_to_file(&path);
+            let out: Result<serde_json::Value, String> = r.map(|(filled, skipped)| {
+                serde_json::json!({
+                    "ok": true,
+                    "filled": filled,
+                    "skipped": skipped,
+                    "settingsPath": path.to_string_lossy(),
+                    "defaults": crate::env_defaults::env_defaults_table(),
+                })
+            });
+            print_result("env-defaults", &out);
+            if out.is_ok() { 0 } else { 1 }
+        }
         "collect-logs" => {
             // 排障日志收集（打包到桌面 zip）——托盘菜单同款，CLI 便于远程指导/自动化
             match crate::logpack::collect(app) {

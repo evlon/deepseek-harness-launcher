@@ -30,8 +30,14 @@ const ALLOWED_BUILDS: &[&str] = &[
 
 // ---------- npm registry 查询 ----------
 
-/// 查询 @deepseek-ai/dsh 的 dist-tags 与版本列表（按序尝试 npmmirror → npmjs）。
+/// 查询 @deepseek-ai/dsh 的 dist-tags 与版本列表。
 /// 返回 { distTags: {...}, versions: [...] }。
+///
+/// registry 候选：显式配置的内网 registry → npmmirror → npmjs。
+///
+/// **`allowUpstreamRegistry=false` 时禁用公网回退**（内网环境建议）：
+/// 能出外网的同事会绕过内网源看到官方全量（含 Alpha），让「内网只放 RC」的双保险失效。
+/// 设为 false 后内网 registry 成为唯一版本来源，官方发 Alpha 也影响不到同事。
 pub async fn fetch_npm_meta() -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
         .user_agent("dsh-harness-launcher-npm")
@@ -52,8 +58,15 @@ pub async fn fetch_npm_meta() -> Result<serde_json::Value, String> {
             }
         }
     }
-    registries.push("https://registry.npmmirror.com".to_string());
-    registries.push("https://registry.npmjs.org".to_string());
+    // 公网回退开关：缺省 true（保持旧行为）；显式 false 则只用内网源。
+    // 注意：只有「配了内网 registry」时禁用回退才有意义——否则会变成无源可用。
+    let allow_upstream = cfg.allow_upstream_registry.unwrap_or(true);
+    if allow_upstream || registries.is_empty() {
+        registries.push("https://registry.npmmirror.com".to_string());
+        registries.push("https://registry.npmjs.org".to_string());
+    } else {
+        log::info!("已禁用公网 registry 回退（allowUpstreamRegistry=false），仅用内网源");
+    }
     for reg in registries {
         let url = format!("{reg}/{encoded}");
         match client.get(&url).send().await {
@@ -94,6 +107,10 @@ pub async fn latest_version() -> Result<String, String> {
 
 /// 远程版本列表（用于「检查更新 / 安装指定版本」）。
 /// 返回每项 { version, prerelease, distTag }；按版本号倒序（最新在前）。
+///
+/// **按配置的版本通道过滤**（`dshChannel`，缺省 `rc`）：
+/// `rc` 通道排除 alpha/beta/dev 预发布，避免自动升到 Alpha
+/// （semver 里 `0.1.6-alpha.1 > 0.1.5-rc.2`，全量降序取首个会选中 Alpha）。
 pub async fn fetch_remote_versions() -> Result<Vec<serde_json::Value>, String> {
     let meta = fetch_npm_meta().await?;
     let dist_tags = meta.get("distTags").cloned().unwrap_or_default();
@@ -106,6 +123,23 @@ pub async fn fetch_remote_versions() -> Result<Vec<serde_json::Value>, String> {
                 .collect()
         })
         .unwrap_or_default();
+
+    // 版本通道筛选（配置 → 缺省 rc）
+    let cfg = load_cached();
+    let channel = crate::config::DshChannel::parse(cfg.dsh_channel.as_deref());
+    let total = versions.len();
+    let versions: Vec<String> = versions
+        .into_iter()
+        .filter(|v| channel.allows(v))
+        .collect();
+    if versions.len() < total {
+        log::info!(
+            "dsh 版本通道={:?}：过滤掉 {} 个预发布版本（保留 {} 个）",
+            channel,
+            total - versions.len(),
+            versions.len()
+        );
+    }
 
     // 标记 dist-tag（latest/alpha/next）
     let mut out: Vec<serde_json::Value> = versions

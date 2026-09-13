@@ -96,6 +96,64 @@ pub struct LauncherConfig {
     pub use_system_node: Option<bool>,
     /// 镜像上传设置（应装插件 + 依赖上传到内网 registry）。
     pub mirror_settings: Option<MirrorSettings>,
+    /// dsh 版本通道：`"rc"`（默认，只启用 RC/正式版）或 `"alpha"`（允许预发布）。
+    ///
+    /// 背景：DSH 发版快，同时存在 Alpha / RC。semver 里 `0.1.6-alpha.1 > 0.1.5-rc.2`
+    /// （主版本高者大，预发布标签不参与主次比较），而版本选择原先按全量降序取第一个
+    /// ——**一旦官方发了更高主版本的 Alpha，所有同事会被自动升到 Alpha**。
+    ///
+    /// 本字段决定候选集：`rc` 排除 alpha/beta/dev；`alpha` 用全量。
+    /// 缺省 `rc`（安全默认）；可由服务端 `clientDefaults.dshChannel` 统一下发。
+    pub dsh_channel: Option<String>,
+    /// 是否允许公网 registry 回退（缺省 true 保持旧行为）。
+    ///
+    /// 背景：查 dsh 版本时 registry 候选是「内网 registry → npmmirror → npmjs」。
+    /// 能出外网的同事会绕过内网源看到官方全量（含 Alpha），让「内网只放 RC」的双保险失效。
+    /// 内网环境建议设 false，使内网 registry 成为唯一版本来源。
+    pub allow_upstream_registry: Option<bool>,
+}
+
+/// dsh 版本通道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DshChannel {
+    /// 只启用 RC 与正式版（排除 alpha/beta/dev）。默认。
+    Rc,
+    /// 允许一切版本（含 Alpha）。
+    Alpha,
+}
+
+impl DshChannel {
+    /// 从配置字符串解析（未知值回落 `Rc`，安全优先）。
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("alpha") => DshChannel::Alpha,
+            _ => DshChannel::Rc,
+        }
+    }
+
+    /// 该版本号在此通道下是否可选。
+    ///
+    /// 判定依据是**预发布标签**而非 dist-tag：`0.1.5-rc.2` 的标签是 `rc.2`，
+    /// `0.1.6-alpha.1` 是 `alpha.1`。无预发布后缀（如 `0.1.2`）视为正式版，始终可选。
+    pub fn allows(self, version: &str) -> bool {
+        match self {
+            DshChannel::Alpha => true,
+            DshChannel::Rc => !is_alpha_like(version),
+        }
+    }
+}
+
+/// 版本号是否为 alpha/beta/dev 类预发布（RC 通道要排除的）。
+///
+/// semver 预发布段形如 `<major>.<minor>.<patch>-<pre>`；取 `-` 后第一段判断前缀。
+/// 注意 `rc` **不算** alpha 类——它正是 RC 通道要保留的。
+pub fn is_alpha_like(version: &str) -> bool {
+    let v = version.trim().trim_start_matches('v');
+    let Some((_, pre)) = v.split_once('-') else {
+        return false; // 无预发布后缀 = 正式版
+    };
+    let tag = pre.split('.').next().unwrap_or("").to_ascii_lowercase();
+    tag.starts_with("alpha") || tag.starts_with("beta") || tag.starts_with("dev")
 }
 
 /// 镜像上传设置。
@@ -385,11 +443,22 @@ pub fn git_binary_path<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     git_install_path(app).join("cmd/git.exe")
 }
 
-/// Harness 用户数据目录（`$DSH_HOME`）。缺省 `~/.dsh-launcher`，可被配置覆盖。
+/// Harness 用户数据目录（`$DSH_HOME`）。
+///
+/// 优先级：`launcher-config.json` 的 `dshHome` → 环境变量 `DSH_HOME` → `~/.dsh-launcher`。
+///
+/// 为什么支持环境变量：便于自动化测试与多实例隔离（dsh 本体也用 `DSH_HOME`，
+/// 语义一致）。注意**配置优先于环境变量**——用户显式在配置文件里指定的值最权威。
 pub fn dsh_home<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> PathBuf {
     if let Some(home) = &cfg.dsh_home {
         if !home.is_empty() {
             return PathBuf::from(home);
+        }
+    }
+    if let Ok(env_home) = std::env::var("DSH_HOME") {
+        let t = env_home.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
         }
     }
     dirs::home_dir()
@@ -835,6 +904,10 @@ fn merge_user_into_builtin(builtin: &mut LauncherConfig, user: LauncherConfig) {
     if user.geo_detection.is_some() { builtin.geo_detection = user.geo_detection; }
     if user.use_system_node.is_some() { builtin.use_system_node = user.use_system_node; }
     if user.mirror_settings.is_some() { builtin.mirror_settings = user.mirror_settings; }
+    // ⚠️ 新增字段必须在这里接线，否则用户 launcher-config.json 里的值会被静默丢弃
+    //    （此函数是显式字段列表，不是反射式合并）。
+    if user.dsh_channel.is_some() { builtin.dsh_channel = user.dsh_channel; }
+    if user.allow_upstream_registry.is_some() { builtin.allow_upstream_registry = user.allow_upstream_registry; }
 }
 
 /// 服务器配置覆盖本地（遵循「用户显式设置过的不被覆盖」）：
@@ -893,6 +966,22 @@ pub fn apply_server_overrides(
         if let Some(v) = server.get("useSystemNode").and_then(|v| v.as_bool()) {
             local.use_system_node = Some(v);
         }
+    }
+    // dshChannel：dsh 版本通道（`rc` 默认 / `alpha`）。
+    // 企业统一管理项——管理员决定同事能否用到 Alpha，故不遵循「用户显式设置不覆盖」。
+    // 非法值忽略（保持本地值），避免把配置写坏。
+    if let Some(v) = server.get("dshChannel").and_then(|v| v.as_str()) {
+        let t = v.trim().to_ascii_lowercase();
+        if t == "rc" || t == "alpha" {
+            local.dsh_channel = Some(t);
+        } else if !t.is_empty() {
+            log::warn!("服务端 dshChannel 值非法（{v}），忽略（应为 rc / alpha）");
+        }
+    }
+    // allowUpstreamRegistry：是否允许公网 registry 回退。内网环境设 false
+    // 可让「内网只放 RC」的双保险生效（否则能出网的同事会看到官方全量含 Alpha）。
+    if let Some(v) = server.get("allowUpstreamRegistry").and_then(|v| v.as_bool()) {
+        local.allow_upstream_registry = Some(v);
     }
     // dshRegistry：内网 dsh 安装源（装/更新 dsh 时走内网 npm registry）。
     // 服务端下发的值强制写入 mirror_settings.registry（dsh_npm::npm_registry_for_install
@@ -993,6 +1082,74 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- dsh 版本通道 ----------
+
+    #[test]
+    fn channel_defaults_to_rc_on_unknown_or_missing() {
+        assert_eq!(DshChannel::parse(None), DshChannel::Rc);
+        assert_eq!(DshChannel::parse(Some("")), DshChannel::Rc);
+        assert_eq!(DshChannel::parse(Some("garbage")), DshChannel::Rc);
+        assert_eq!(DshChannel::parse(Some("RC")), DshChannel::Rc);
+        assert_eq!(DshChannel::parse(Some(" alpha ")), DshChannel::Alpha);
+    }
+
+    #[test]
+    fn rc_channel_excludes_alpha_beta_dev() {
+        let c = DshChannel::Rc;
+        // 正式版与 RC 可选
+        assert!(c.allows("0.1.2"));
+        assert!(c.allows("0.1.5-rc.1"));
+        assert!(c.allows("0.1.5-rc.2"));
+        assert!(c.allows("v0.1.5-rc.1"));
+        // Alpha/Beta/Dev 排除
+        assert!(!c.allows("0.1.6-alpha.1"));
+        assert!(!c.allows("0.1.2-alpha.4"));
+        assert!(!c.allows("0.1.3-beta.2"));
+        assert!(!c.allows("0.1.3-dev.1"));
+        assert!(!c.allows("v0.1.6-alpha.1"));
+    }
+
+    #[test]
+    fn alpha_channel_allows_everything() {
+        let c = DshChannel::Alpha;
+        assert!(c.allows("0.1.6-alpha.1"));
+        assert!(c.allows("0.1.5-rc.2"));
+        assert!(c.allows("0.1.2"));
+    }
+
+    /// 回归测试：这正是原始缺陷。
+    /// semver 里 `0.1.6-alpha.1 > 0.1.5-rc.2`，全量降序取首个会选中 Alpha。
+    #[test]
+    fn rc_channel_does_not_pick_higher_major_alpha() {
+        let all = [
+            "0.1.5-rc.1",
+            "0.1.5-rc.2",
+            "0.1.5-alpha.1",
+            "0.1.5-alpha.2",
+            "0.1.6-alpha.1", // 主版本更高 → 全量排序时会排最前
+        ];
+        let c = DshChannel::Rc;
+        let candidates: Vec<&str> = all.iter().copied().filter(|v| c.allows(v)).collect();
+        assert_eq!(candidates, vec!["0.1.5-rc.1", "0.1.5-rc.2"]);
+        // 候选里最大的应是 RC（而非 alpha）
+        let top = candidates
+            .iter()
+            .max_by(|a, b| crate::dsh_versions::semver_compare_public(a, b))
+            .copied();
+        assert_eq!(top, Some("0.1.5-rc.2"));
+        assert!(!top.unwrap().contains("alpha"));
+    }
+
+    #[test]
+    fn is_alpha_like_recognizes_prerelease_tags() {
+        assert!(is_alpha_like("0.1.6-alpha.1"));
+        assert!(is_alpha_like("0.1.6-beta.1"));
+        assert!(is_alpha_like("0.1.6-dev.1"));
+        assert!(!is_alpha_like("0.1.6-rc.1"));
+        assert!(!is_alpha_like("0.1.6"));
+        assert!(!is_alpha_like("v0.1.6"));
+    }
 
     #[test]
     fn locale_matching_only_matches_mainland_chinese() {

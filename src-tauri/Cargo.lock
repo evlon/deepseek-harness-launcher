@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "deepseek-harness-launcher"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "arboard",
  "chrono",
