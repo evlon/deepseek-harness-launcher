@@ -84,6 +84,7 @@ fn print_help() {
     println!("  matrix-setup-reset   清除数字分身配置（回未配置态，可重走向导）");
     println!("  matrix-setup-open    打开数字分身配置向导窗口");
     println!("  collect-logs         收集排障日志到桌面 zip（发给管理员）");
+    println!("  env-defaults         下发环境默认配置到 settings.yaml（只填空缺，不覆盖用户已设值）");
     println!("  dsh-versions  查询 dsh 版本状态（当前/已装/最新）");
     println!("  dsh-install   下载安装指定 dsh 版本（需 --tag <版本>）");
     println!("  dsh-switch    切换 dsh 版本（需 --tag <版本>，停→换→重启）");
