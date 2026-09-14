@@ -187,6 +187,12 @@ fn add_file_tail(
 }
 
 /// 敏感值脱敏：accessToken / password / token 的值只留前 4 位。
+/// 脱敏敏感值。
+///
+/// ⚠️ 必须覆盖 `?token=`：dsh 0.1.2+ 启动时会往 `dsh-launch-*.log` 打印
+/// `dsh web: http://127.0.0.1:3197/?token=xxx`，而本日志包会被发给管理员。
+/// 该 token 是**进程级访问凭据**（拿到即可打开并操作同事的 Web GUI），
+/// 因此必须掩码。保留前 4 位便于比对"是不是同一个 token"。
 fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
@@ -204,9 +210,37 @@ fn redact(text: &str) -> String {
                 continue;
             }
         }
-        out.push_str(line);
+        out.push_str(&redact_url_tokens(line));
         out.push('\n');
     }
+    out
+}
+
+/// 掩码 URL 查询参数里的 `token=`（保留前 4 位）。
+///
+/// 单独处理是因为这类值嵌在 URL 中间（`...?token=abc123 (LAN: ...)`），
+/// 无法用上面「按 `:` 切分整行」的规则覆盖。
+fn redact_url_tokens(line: &str) -> String {
+    const MARKER: &str = "token=";
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(idx) = rest.find(MARKER) {
+        out.push_str(&rest[..idx + MARKER.len()]);
+        let after = &rest[idx + MARKER.len()..];
+        // token 是 base64url 字符集
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(after.len());
+        let val = &after[..end];
+        if val.len() > 4 {
+            out.push_str(&val[..4]);
+            out.push_str("****");
+        } else {
+            out.push_str("****");
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -241,6 +275,40 @@ mod tests {
         assert!(out.contains("LZk2****"), "应保留前 4 位并掩码：{out}");
         assert!(!out.contains("LZk2VBXIYZTrrzn4"), "完整 token 不应出现");
         assert!(out.contains("userId: '@ai-x:s'"), "非敏感字段应原样保留");
+    }
+
+    /// dsh 0.1.2+ 会把访问 token 打进 dsh-launch 日志，日志包要发给管理员，
+    /// 所以必须掩码（该 token 拿到即可打开并操作同事的 Web GUI）。
+    #[test]
+    fn redact_hides_url_token() {
+        let text = "dsh web: http://127.0.0.1:3197/?token=xJJIaaYvmVJDnOMAO5h8IZvvYfXa-xY0wI8cVignoQQ\n";
+        let out = redact(text);
+        assert!(!out.contains("xJJIaaYvmVJDnOMAO5h8IZvvYfXa"), "完整 token 不应出现：{out}");
+        assert!(out.contains("xJJI****"), "应保留前 4 位：{out}");
+        assert!(out.contains("http://127.0.0.1:3197/?token="), "URL 主体应保留：{out}");
+    }
+
+    #[test]
+    fn redact_hides_all_url_tokens_in_lan_line() {
+        // dsh 带 LAN 地址时会打印两个 token
+        let text = "dsh web: http://127.0.0.1:3197/?token=AAAA1111bbbb (LAN: http://10.0.0.5:3197/?token=CCCC2222dddd)\n";
+        let out = redact(text);
+        assert!(!out.contains("AAAA1111bbbb"), "本机 token 应掩码：{out}");
+        assert!(!out.contains("CCCC2222dddd"), "LAN token 应掩码：{out}");
+        assert!(out.contains("AAAA****"), "{out}");
+        assert!(out.contains("CCCC****"), "{out}");
+    }
+
+    #[test]
+    fn redact_leaves_normal_lines_intact() {
+        let text = "INFO: 端口 3180 已就绪（耗时 3.2s）\nINFO: dsh web: opening the default browser\n";
+        assert_eq!(redact(text), text);
+    }
+
+    #[test]
+    fn redact_handles_short_and_empty_tokens() {
+        assert!(redact("?token=ab\n").contains("****"));
+        assert!(redact("?token=\n").contains("****"));
     }
 
     #[test]

@@ -202,7 +202,7 @@ fn main() {
                         Ok(port) => notify::notify(
                             &h,
                             "DeepSeek Harness",
-                            &format!("已启动：http://127.0.0.1:{port}"),
+                            &format!("已启动：{}", workflow::access_url(port)),
                         ),
                         Err(e) => notify::notify(&h, "启动失败", &e),
                     }

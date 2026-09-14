@@ -562,7 +562,11 @@ fn run_setup_steps<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfi
         std::thread::sleep(std::time::Duration::from_millis(800)); // 等端口释放
     }
     let port = crate::workflow::launch_with_profile(app, MATRIX_PROFILE)?;
-    crate::ops::append_log(app, &format!("✓ 数字分身已启动：http://127.0.0.1:{port}"));
+    // 用带 token 的 URL（dsh 0.1.2+ 缺 ?token= 会 401）；此处仅记录到进度日志
+    crate::ops::append_log(
+        app,
+        &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)),
+    );
 
     // ③ 等待 Matrix 连接
     crate::ops::mark_step_running(app, 2);

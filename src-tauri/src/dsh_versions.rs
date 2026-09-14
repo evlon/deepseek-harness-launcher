@@ -269,7 +269,8 @@ pub async fn switch_version<R: Runtime>(
     // 3. 重启 Harness（若之前在运行）
     if was_running {
         match crate::workflow::launch(app) {
-            Ok(port) => log::info!("切换后 Harness 已重启：http://127.0.0.1:{port}"),
+            // 用带 token 的 URL（dsh 0.1.2+ 缺 ?token= 会 401）
+            Ok(port) => log::info!("切换后 Harness 已重启：{}", crate::workflow::access_url(port)),
             Err(e) => log::warn!("切换后 Harness 重启失败：{e}"),
         }
     }

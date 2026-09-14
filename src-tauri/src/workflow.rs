@@ -22,6 +22,15 @@ struct Running {
     pid: u32,
     port: u16,
     profile: String,
+    /// 浏览器访问令牌（`?token=` 查询参数值）。
+    ///
+    /// 为什么需要：dsh 0.1.2+ 给 Web UI 加了**进程启动令牌**校验——
+    /// 首次访问必须带 `?token=<随机值>`（由 dsh 启动时打印，形如
+    /// `dsh web: http://127.0.0.1:3197/?token=xxx`），校验通过后种下签名 cookie
+    /// 并 302 到干净的 `/`。不带 token 直接访问根路径会拿到 **401**。
+    ///
+    /// 旧版 dsh（0.1.1-rc.x 及更早）没有该机制，此时为 `None`，URL 不带参数。
+    token: Option<String>,
 }
 
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
@@ -29,6 +38,32 @@ static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 /// 最近一次成功启动的端口（供「打开 Harness 页面」）。
 pub fn last_port() -> Option<u16> {
     RUNNING.lock().unwrap().as_ref().map(|r| r.port)
+}
+
+/// 可访问的 Harness Web URL（**带 token**，可直接在浏览器打开）。
+///
+/// 修复 2026-09-14：此前各处都拼 `http://127.0.0.1:{port}`（干净 URL），
+/// 在 dsh 0.1.2+ 上会因缺 `?token=` 而 **401 打不开**——用户看到的就是
+/// 「浏览器地址后面有一个 token，而我们系统里没加这个参数，所以打不开」。
+///
+/// 有 token 时拼 `http://127.0.0.1:{port}/?token=xxx`（与 dsh 自己
+/// `authenticatedUrl()` 的产出一致：pathname 固定 `/`，token 作为唯一查询参数）。
+pub fn access_url(port: u16) -> String {
+    let token = RUNNING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|r| r.port == port)
+        .and_then(|r| r.token.clone());
+    match token {
+        Some(t) if !t.is_empty() => format!("http://127.0.0.1:{port}/?token={t}"),
+        _ => format!("http://127.0.0.1:{port}"),
+    }
+}
+
+/// 当前运行实例的可访问 URL（未运行时返回 None）。
+pub fn current_access_url() -> Option<String> {
+    last_port().map(access_url)
 }
 
 /// 当前运行中的 profile 名（未运行时返回 None）。
@@ -204,7 +239,12 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
     let pid = child.id();
     // 等待端口就绪：spawn 成功 ≠ 服务可用（dsh 冷启动需加载插件/起 HTTP）。
     // 轮询端口监听，就绪才算真正启动成功；超时/进程退出则报失败并清理。
-    *RUNNING.lock().unwrap() = Some(Running { pid, port, profile: profile.to_string() });
+    *RUNNING.lock().unwrap() = Some(Running {
+        pid,
+        port,
+        profile: profile.to_string(),
+        token: None, // 端口就绪后从日志里补
+    });
     log::info!(
         "Harness 进程已 spawn：PID={}, 端口={}, profile={}，等待端口就绪…",
         pid,
@@ -224,6 +264,25 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
             launch_log.display()
         ));
     }
+
+    // 抓取浏览器访问 token（dsh 0.1.2+ 必需，见 Running.token 的说明）。
+    //
+    // 时机：dsh 的 `dsh web: …?token=…` 是在**端口 bind 之后**打印的
+    // （announceReady 在 loader 就绪回调里），所以端口就绪后再读日志。
+    // 但两者几乎同时发生，日志刷盘可能有毫秒级延迟 → 小步重试几次。
+    // 旧版 dsh 没有这一行，重试耗尽后保持 None（URL 不带参数，行为不变）。
+    let token = read_launch_token(&launch_log, Duration::from_secs(5));
+    if let Some(t) = &token {
+        log::info!("已获取浏览器访问 token（长度 {}），打开页面时会自动带上", t.len());
+    } else {
+        log::info!("启动日志中无 token（旧版 dsh 无该机制），按干净 URL 处理");
+    }
+    if let Some(r) = RUNNING.lock().unwrap().as_mut() {
+        if r.pid == pid {
+            r.token = token;
+        }
+    }
+
     log::info!(
         "Harness 已启动：PID={}, 端口={}, profile={}, 数据目录={}",
         pid,
@@ -239,6 +298,55 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
 /// 磁盘冷、企业安全软件扫描时可能显著更久——留足 90s 避免误报失败
 /// （同事实测 40s 不够；超时后仍会 kill 并报错，不会假成功）。
 const LAUNCH_READY_TIMEOUT_SECS: u64 = 90;
+
+/// 从 dsh 启动日志里提取浏览器访问 token。
+///
+/// dsh 0.1.2+ 启动时会往 stdout 打印一行（见 `dsh-web-app` 的 `announceReady`）：
+///
+/// ```text
+/// dsh web: http://127.0.0.1:3197/?token=xJJIaaYvmVJDnOMAO5h8IZvvYfXa-xY0wI8cVignoQQ
+/// dsh web: http://127.0.0.1:3197/?token=xxx (LAN: http://10.0.0.5:3197/?token=xxx)
+/// ```
+///
+/// 本函数从日志文本里找出第一个 `?token=` 的值。取不到（旧版 dsh 无该行）
+/// 返回 `None` —— 此时 URL 不带参数，行为与旧版一致。
+///
+/// 注意：**不能**只认 `dsh web:` 前缀。dsh 的这行是 console.log 输出，
+/// 经 launcher 重定向后可能与其他输出交错；按 `?token=` 直接扫更稳。
+fn extract_token_from_log(text: &str) -> Option<String> {
+    const MARKER: &str = "?token=";
+    let idx = text.find(MARKER)?;
+    let rest = &text[idx + MARKER.len()..];
+    // token 是 base64url（A-Za-z0-9-_），取到第一个非该字符集为止
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    let token = &rest[..end];
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// 从启动日志文件里读取浏览器访问 token（带小步重试）。
+///
+/// dsh 打印该行的时机紧跟在端口 bind 之后，但日志写盘可能有毫秒级延迟，
+/// 因此重试若干次；拿不到就返回 None（旧版 dsh 没有这一行）。
+fn read_launch_token(log_path: &std::path::Path, budget: Duration) -> Option<String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(log_path) {
+            if let Some(t) = extract_token_from_log(&text) {
+                return Some(t);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
 
 /// 轮询等待端口被监听；同时检测进程是否提前退出。
 fn wait_for_port(port: u16, pid: u32, timeout: Duration) -> bool {
@@ -420,6 +528,80 @@ fn version_supports_no_open<R: Runtime>(app: &AppHandle<R>) -> bool {
 mod tests {
     use super::*;
 
+    // ---------- 浏览器访问 token（dsh 0.1.2+ 必需） ----------
+
+    #[test]
+    fn extracts_token_from_real_dsh_line() {
+        // 实测格式（dsh 0.1.2-rc.1 真实输出）
+        let line = "dsh web: http://127.0.0.1:3197/?token=xJJIaaYvmVJDnOMAO5h8IZvvYfXa-xY0wI8cVignoQQ\n";
+        assert_eq!(
+            extract_token_from_log(line).as_deref(),
+            Some("xJJIaaYvmVJDnOMAO5h8IZvvYfXa-xY0wI8cVignoQQ")
+        );
+    }
+
+    #[test]
+    fn extracts_first_token_when_lan_address_present() {
+        // 有 LAN 时 dsh 会打印两个 token；取第一个（本机回环）
+        let line = "dsh web: http://127.0.0.1:3197/?token=AAAA1111 (LAN: http://10.0.0.5:3197/?token=BBBB2222)\n";
+        assert_eq!(extract_token_from_log(line).as_deref(), Some("AAAA1111"));
+    }
+
+    #[test]
+    fn extracts_token_from_noisy_log() {
+        // 真实日志里该行与其它输出交错
+        let log = "[INFO] loading plugins...\n[INFO] web server listening\n\
+                   dsh web: http://127.0.0.1:3180/?token=abc-DEF_123\n[INFO] done\n";
+        assert_eq!(extract_token_from_log(log).as_deref(), Some("abc-DEF_123"));
+    }
+
+    #[test]
+    fn returns_none_for_legacy_dsh_without_token() {
+        // 旧版 dsh（0.1.1-rc.2）只打印干净 URL
+        let line = "dsh web: http://127.0.0.1:3180\n";
+        assert_eq!(extract_token_from_log(line), None);
+        assert_eq!(extract_token_from_log(""), None);
+        assert_eq!(extract_token_from_log("no url here"), None);
+    }
+
+    #[test]
+    fn ignores_empty_token_value() {
+        assert_eq!(extract_token_from_log("?token=\n"), None);
+        assert_eq!(extract_token_from_log("?token= (LAN: x)\n"), None);
+    }
+
+    #[test]
+    fn access_url_includes_token_when_present() {
+        // 无运行实例 → 干净 URL（保持旧行为）
+        assert_eq!(access_url(3180), "http://127.0.0.1:3180");
+    }
+
+    #[test]
+    fn access_url_uses_token_for_matching_port() {
+        *RUNNING.lock().unwrap() = Some(Running {
+            pid: 0,
+            port: 3199,
+            profile: "web".to_string(),
+            token: Some("tok-abc".to_string()),
+        });
+        assert_eq!(access_url(3199), "http://127.0.0.1:3199/?token=tok-abc");
+        // 端口不匹配时不套用（避免把 A 实例的 token 用到 B 实例）
+        assert_eq!(access_url(3180), "http://127.0.0.1:3180");
+        *RUNNING.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn access_url_clean_when_token_absent() {
+        *RUNNING.lock().unwrap() = Some(Running {
+            pid: 0,
+            port: 3198,
+            profile: "web".to_string(),
+            token: None,
+        });
+        assert_eq!(access_url(3198), "http://127.0.0.1:3198");
+        *RUNNING.lock().unwrap() = None;
+    }
+
     #[test]
     fn port_probe_detects_in_use() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -454,7 +636,12 @@ mod tests {
         assert!(!is_running());
         // 模拟运行中（用当前测试进程自己的 PID，必定存活）
         let test_port = crate::config::DEFAULT_PORT;
-        *RUNNING.lock().unwrap() = Some(Running { pid: std::process::id(), port: test_port, profile: "web".to_string() });
+        *RUNNING.lock().unwrap() = Some(Running {
+            pid: std::process::id(),
+            port: test_port,
+            profile: "web".to_string(),
+            token: None,
+        });
         assert_eq!(last_port(), Some(test_port));
         assert!(is_running());
         assert_eq!(current_profile(), Some("web".to_string()));

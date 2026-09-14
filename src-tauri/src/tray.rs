@@ -42,11 +42,9 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             {
                 // 左键点击打开 Harness 页面（仅在服务运行时）
                 if crate::workflow::is_running() {
-                    if let Some(port) = crate::workflow::last_port() {
-                        let _ = tray.app_handle().opener().open_url(
-                            format!("http://127.0.0.1:{port}"),
-                            None::<&str>,
-                        );
+                    // ⚠️ 必须用带 token 的 URL：dsh 0.1.2+ 缺 ?token= 会 401
+                    if let Some(url) = crate::workflow::current_access_url() {
+                        let _ = tray.app_handle().opener().open_url(url, None::<&str>);
                     }
                 }
             }
@@ -575,8 +573,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 crate::ops::start_op(&h, "launch", "启动 Harness", &[]);
                 match crate::workflow::launch(&h) {
                     Ok(port) => {
-                        crate::ops::finish_op(&h, &format!("已启动，访问 http://127.0.0.1:{port}"));
-                        notify(&h, "Harness 已启动", &format!("访问 http://127.0.0.1:{port}"));
+                        // 提示与打开都用带 token 的 URL（否则用户手点会 401）
+                        let url = crate::workflow::access_url(port);
+                        crate::ops::finish_op(&h, &format!("已启动，访问 {url}"));
+                        notify(&h, "Harness 已启动", &format!("访问 {url}"));
                         refresh_sync_menu(&h);
                     }
                     Err(e) => {
@@ -594,10 +594,13 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             });
         }
         "open-page" => {
-            // 以实际运行端口为准；未运行则尝试配置端口（可能尚未拉起，保持原行为）
-            let port = crate::workflow::last_port()
-                .unwrap_or_else(|| resolve_port(&load_cached()));
-            let _ = app.opener().open_url(format!("http://127.0.0.1:{port}"), None::<&str>);
+            // 以实际运行端口为准；未运行则尝试配置端口（可能尚未拉起，保持原行为）。
+            // ⚠️ 运行中时必须带 token（dsh 0.1.2+ 缺 ?token= 会 401 打不开）。
+            let url = match crate::workflow::current_access_url() {
+                Some(u) => u,
+                None => format!("http://127.0.0.1:{}", resolve_port(&load_cached())),
+            };
+            let _ = app.opener().open_url(url, None::<&str>);
         }
         "stop" => {
             crate::workflow::stop();
@@ -623,8 +626,9 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                         let _ = set_profile(&h, &name);
                         match crate::workflow::launch_with_profile(&h, &name) {
                             Ok(port) => {
-                                crate::ops::finish_op(&h, &format!("{name}：http://127.0.0.1:{port}"));
-                                notify(&h, "Profile 已切换", &format!("{name}：http://127.0.0.1:{port}"));
+                                let url = crate::workflow::access_url(port);
+                                crate::ops::finish_op(&h, &format!("{name}：{url}"));
+                                notify(&h, "Profile 已切换", &format!("{name}：{url}"));
                                 refresh_sync_menu(&h);
                             }
                             Err(e) => {
