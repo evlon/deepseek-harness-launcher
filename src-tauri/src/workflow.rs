@@ -31,6 +31,13 @@ struct Running {
     ///
     /// 旧版 dsh（0.1.1-rc.x 及更早）没有该机制，此时为 `None`，URL 不带参数。
     token: Option<String>,
+    /// 本次启动的 dsh 日志路径（用于**惰性补抓** token）。
+    ///
+    /// 为什么需要：dsh 打印 `dsh web: …?token=…` 的时机受 Node stdout 缓冲影响，
+    /// 实测可能晚于「端口就绪 + 5s 重试」窗口（日志一度为 0 字节）。
+    /// 若只在启动时抓一次，用户点「打开页面」时就拿不到 token → 仍然 401。
+    /// 因此保留日志路径，在 `access_url` 里发现 token 缺失时**再读一次**。
+    log_path: PathBuf,
 }
 
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
@@ -48,13 +55,27 @@ pub fn last_port() -> Option<u16> {
 ///
 /// 有 token 时拼 `http://127.0.0.1:{port}/?token=xxx`（与 dsh 自己
 /// `authenticatedUrl()` 的产出一致：pathname 固定 `/`，token 作为唯一查询参数）。
+///
+/// **惰性补抓**：若当前未持有 token，先尝试再读一次启动日志——
+/// dsh 打印该行可能晚于启动时的抓取窗口（见 `Running::log_path` 说明）。
 pub fn access_url(port: u16) -> String {
-    let token = RUNNING
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|r| r.port == port)
-        .and_then(|r| r.token.clone());
+    let mut guard = RUNNING.lock().unwrap();
+    let token = match guard.as_mut() {
+        Some(r) if r.port == port => {
+            if r.token.is_none() {
+                // 惰性补抓：不阻塞（单次读文件），拿不到就维持干净 URL
+                if let Some(t) = extract_token_from_log(
+                    &std::fs::read_to_string(&r.log_path).unwrap_or_default(),
+                ) {
+                    log::info!("补抓到浏览器访问 token（长度 {}）", t.len());
+                    r.token = Some(t);
+                }
+            }
+            r.token.clone()
+        }
+        _ => None,
+    };
+    drop(guard);
     match token {
         Some(t) if !t.is_empty() => format!("http://127.0.0.1:{port}/?token={t}"),
         _ => format!("http://127.0.0.1:{port}"),
@@ -244,6 +265,7 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
         port,
         profile: profile.to_string(),
         token: None, // 端口就绪后从日志里补
+        log_path: launch_log.clone(),
     });
     log::info!(
         "Harness 进程已 spawn：PID={}, 端口={}, profile={}，等待端口就绪…",
@@ -269,9 +291,10 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
     //
     // 时机：dsh 的 `dsh web: …?token=…` 是在**端口 bind 之后**打印的
     // （announceReady 在 loader 就绪回调里），所以端口就绪后再读日志。
-    // 但两者几乎同时发生，日志刷盘可能有毫秒级延迟 → 小步重试几次。
+    // Node 的 stdout 有缓冲，该行可能晚几秒才落盘 → 重试最多 20s。
+    // 即便这里没抓到也不必担心：`access_url` 会在用户点「打开页面」时惰性补抓。
     // 旧版 dsh 没有这一行，重试耗尽后保持 None（URL 不带参数，行为不变）。
-    let token = read_launch_token(&launch_log, Duration::from_secs(5));
+    let token = read_launch_token(&launch_log, Duration::from_secs(20));
     if let Some(t) = &token {
         log::info!("已获取浏览器访问 token（长度 {}），打开页面时会自动带上", t.len());
     } else {
@@ -528,6 +551,19 @@ fn version_supports_no_open<R: Runtime>(app: &AppHandle<R>) -> bool {
 mod tests {
     use super::*;
 
+    /// 串行化所有会读写全局 `RUNNING` 的测试。
+    ///
+    /// cargo test 默认多线程并行跑测试，而 `RUNNING` 是进程级单例——
+    /// 多个测试同时 set/clear 会互相看到对方的状态（曾导致
+    /// `running_state_tracks_port` 偶发失败：它断言初始为 None，
+    /// 却看到别的测试留下的端口）。取同一把锁即可消除竞态。
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 取测试串行锁（返回 guard，测试结束自动释放）。
+    fn serialize() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // ---------- 浏览器访问 token（dsh 0.1.2+ 必需） ----------
 
     #[test]
@@ -572,17 +608,20 @@ mod tests {
 
     #[test]
     fn access_url_includes_token_when_present() {
+        let _g = serialize();
         // 无运行实例 → 干净 URL（保持旧行为）
         assert_eq!(access_url(3180), "http://127.0.0.1:3180");
     }
 
     #[test]
     fn access_url_uses_token_for_matching_port() {
+        let _g = serialize();
         *RUNNING.lock().unwrap() = Some(Running {
             pid: 0,
             port: 3199,
             profile: "web".to_string(),
             token: Some("tok-abc".to_string()),
+            log_path: PathBuf::from("nonexistent-test.log"),
         });
         assert_eq!(access_url(3199), "http://127.0.0.1:3199/?token=tok-abc");
         // 端口不匹配时不套用（避免把 A 实例的 token 用到 B 实例）
@@ -592,14 +631,45 @@ mod tests {
 
     #[test]
     fn access_url_clean_when_token_absent() {
+        let _g = serialize();
         *RUNNING.lock().unwrap() = Some(Running {
             pid: 0,
             port: 3198,
             profile: "web".to_string(),
             token: None,
+            log_path: PathBuf::from("nonexistent-test.log"),
         });
         assert_eq!(access_url(3198), "http://127.0.0.1:3198");
         *RUNNING.lock().unwrap() = None;
+    }
+
+    /// 惰性补抓：启动时没抓到 token，但日志后来写了 → access_url 应补上。
+    #[test]
+    fn access_url_lazily_recovers_token_from_log() {
+        let _g = serialize();
+        let dir = std::env::temp_dir().join("dsh-token-lazy-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("late.log");
+        // 先写"无 token"的日志（模拟启动时的状态）
+        std::fs::write(&log, "INFO: listening...\n").unwrap();
+
+        *RUNNING.lock().unwrap() = Some(Running {
+            pid: 0,
+            port: 3197,
+            profile: "web".to_string(),
+            token: None,
+            log_path: log.clone(),
+        });
+        // 此刻应回落到干净 URL
+        assert_eq!(access_url(3197), "http://127.0.0.1:3197");
+
+        // dsh 随后才打印 token 行（Node stdout 缓冲导致的延迟）
+        std::fs::write(&log, "INFO: listening...\ndsh web: http://127.0.0.1:3197/?token=LATEtok123\n").unwrap();
+
+        // 再次取 URL → 惰性补抓生效
+        assert_eq!(access_url(3197), "http://127.0.0.1:3197/?token=LATEtok123");
+        *RUNNING.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -631,6 +701,7 @@ mod tests {
 
     #[test]
     fn running_state_tracks_port() {
+        let _g = serialize();
         // 初始无状态
         assert_eq!(last_port(), None);
         assert!(!is_running());
@@ -641,6 +712,7 @@ mod tests {
             port: test_port,
             profile: "web".to_string(),
             token: None,
+            log_path: PathBuf::from("nonexistent-test.log"),
         });
         assert_eq!(last_port(), Some(test_port));
         assert!(is_running());

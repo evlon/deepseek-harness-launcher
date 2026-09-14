@@ -171,9 +171,23 @@ pub async fn install_version<R: Runtime>(
     let version = tag.trim_start_matches('v');
     let dir_name = format!("v{version}");
     let dest = version_dir(app, &dir_name);
+
+    // 判断"已装"必须验证**真实可用**（bin.js 可达），不能只看 package.json 存在。
+    //
+    // 2026-09-14 实测踩坑：0.3.6 之前的 staging+rename bug 会让版本目录里的
+    // node_modules 链接指向已不存在的 `.installing-*` 路径——此时 package.json
+    // 还在，但 bin.js 不可达。旧判断只看 package.json → 判定"已存在，跳过安装"
+    // → **损坏的安装永远修不好**（`dsh-switch` 切过去直接起不来）。
+    // 现在发现损坏就删掉重装。
     if dest.join("package.json").exists() {
-        log::info!("dsh 版本 {version} 已存在，跳过安装");
-        return Ok(());
+        if crate::dsh_npm::is_npm_installed(&dest) {
+            log::info!("dsh 版本 {version} 已存在且可用，跳过安装");
+            return Ok(());
+        }
+        log::warn!(
+            "dsh 版本 {version} 目录存在但不可用（bin.js 不可达，可能是旧版 staging+rename 遗留），删除后重装"
+        );
+        safe_remove_dir(&dest).map_err(|e| format!("DSH_BROKEN_VERSION_CLEAN_FAILED: {e}"))?;
     }
 
     // 首次启用版本管理：把当前激活 dsh 备份进版本目录，避免旧版本"消失"
@@ -197,6 +211,14 @@ pub async fn switch_version<R: Runtime>(
     let src = version_dir(app, &dir_name);
     if !src.join("package.json").exists() {
         return Err(format!("DSH_VERSION_NOT_INSTALLED: 版本 {tag} 未安装"));
+    }
+    // 同样要验证真实可用：损坏的版本目录（bin.js 不可达）切过去会起不来，
+    // 这里提前报明确错误，而不是让用户在 launch 阶段看到 DSH_NOT_FOUND。
+    if !crate::dsh_npm::is_npm_installed(&src) {
+        return Err(format!(
+            "DSH_VERSION_BROKEN: 版本 {tag} 目录存在但不可用（bin.js 不可达）。\
+             请重新执行该版本的安装（托盘「dsh 版本」→ 安装）以修复"
+        ));
     }
 
     // 1. 停 Harness（若在运行）
