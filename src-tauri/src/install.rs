@@ -314,23 +314,125 @@ fn repair_missing_bundle_patches<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherC
 }
 
 /// 把 launcher-brand 插件目录复制到 `<dsh_home>/launcher-brand`。
-fn copy_launcher_brand<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fallback = PathBuf::from(".");
-    let src = manifest_dir
-        .parent()
-        .unwrap_or(&fallback)
-        .join("launcher-brand");
+///
+/// ⚠️ 2026-09-14 修复：此前用 `env!("CARGO_MANIFEST_DIR")` 定位源目录——
+/// 那是**编译期**路径，会被烧进二进制。本机开发时指向 `E:\ai-works\...`，
+/// 同事机器上该路径根本不存在 → 日志出现
+/// `launcher-brand 插件源缺失：E:\ai-works\deepseek-harness-launcher\launcher-brand`，
+/// 进而跳过 matrix profile 预置（数字分身 profile 建不起来）。
+///
+/// 现在按**运行时**顺序找，第一个命中的即用：
+/// 1. exe 同级 `launcher-brand/`（发布包结构：zip 里 exe 与 launcher-brand 同级）
+/// 2. exe 同级 `resources/launcher-brand/`（Tauri bundle 结构）
+/// 3. `<dsh_home>/launcher-brand`（已复制过，幂等直接跳过复制）
+/// 4. 编译期路径（仅本机 `cargo run`/开发调试时有效，放最后兜底）
+fn launcher_brand_src<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1/2. 以 exe 位置为基准（发布包内 exe 与 launcher-brand 同级）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("launcher-brand"));
+            candidates.push(dir.join("resources").join("launcher-brand"));
+        }
+    }
+    // 3. 已经落到 dsh_home 的副本
+    candidates.push(dsh_home(app, cfg).join("launcher-brand"));
+    // 4. 开发期兜底（编译期路径）
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("launcher-brand"))
+            .unwrap_or_else(|| PathBuf::from("launcher-brand")),
+    );
+
+    candidates
+        .into_iter()
+        .find(|p| p.join("package.json").exists())
+}
+
+/// launcher-brand 插件：**内嵌进二进制**（编译期 include_str!）。
+///
+/// 为什么内嵌而不是随包分发：launcher 支持**自动更新**，而更新下载的是
+/// **单个 exe**（`launcher-<ver>.exe` 替换自身）。若 launcher-brand 只放在
+/// zip 里 exe 旁边，自动更新后该目录不存在 → 插件预置被跳过
+/// （同事机器日志：`launcher-brand 插件源缺失：E:\ai-works\...`，2026-09-14）。
+/// 内嵌后无论 exe 怎么被替换/搬移，都能自解压出插件，彻底消除该故障。
+///
+/// 体积代价：约 4KB（4 个小文件）。
+const LAUNCHER_BRAND_FILES: &[(&str, &str)] = &[
+    (
+        "package.json",
+        include_str!("../../launcher-brand/package.json"),
+    ),
+    (
+        "cordis.patch.yml",
+        include_str!("../../launcher-brand/cordis.patch.yml"),
+    ),
+    ("lib/index.js", include_str!("../../launcher-brand/lib/index.js")),
+    (
+        "lib/client.js",
+        include_str!("../../launcher-brand/lib/client.js"),
+    ),
+];
+
+/// 把内嵌的 launcher-brand 释放到 `<dsh_home>/launcher-brand`。
+///
+/// 幂等：内容有变化才重写（用「全部存在且内容一致」判断，避免每次都写盘）。
+/// 返回 true 表示目标目录可用。
+fn materialize_launcher_brand<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> bool {
     let dest = dsh_home(app, cfg).join("launcher-brand");
-    if !src.join("package.json").exists() {
-        log::warn!("launcher-brand 插件源缺失：{}", src.display());
+    for (rel, content) in LAUNCHER_BRAND_FILES {
+        let path = dest.join(rel);
+        // 内容已一致 → 跳过写入（幂等，减少磁盘操作）
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            if existing == *content {
+                continue;
+            }
+        }
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("创建 launcher-brand 目录失败：{e}");
+                return false;
+            }
+        }
+        if let Err(e) = std::fs::write(&path, content) {
+            log::warn!("写出 launcher-brand 文件失败（{}）：{e}", path.display());
+            return false;
+        }
+    }
+    dest.join("package.json").exists()
+}
+
+/// 把 launcher-brand 插件目录准备到 `<dsh_home>/launcher-brand`。
+///
+/// 优先级：
+/// 1. **内嵌内容**（首选——自动更新后仍然可用，见上方说明）
+/// 2. 磁盘上的 launcher-brand（exe 同级 / resources / 编译期路径）——
+///    仅在 dsh_home 副本已存在且内嵌释放失败时兜底
+fn copy_launcher_brand<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) {
+    let dest = dsh_home(app, cfg).join("launcher-brand");
+
+    // 首选：从二进制内嵌内容释放（不依赖任何外部文件）
+    if materialize_launcher_brand(app, cfg) {
+        log::info!("launcher-brand 已就绪（内嵌释放）：{}", dest.display());
+        return;
+    }
+
+    // 兜底：从磁盘上的源目录复制
+    let Some(src) = launcher_brand_src(app, cfg) else {
+        log::warn!("launcher-brand 释放失败且磁盘无源目录，跳过");
+        return;
+    };
+    if src == dest {
+        log::warn!("launcher-brand 内嵌释放失败（目标目录不完整）：{}", dest.display());
         return;
     }
     if let Err(e) = copy_dir_recursive(&src, &dest) {
         log::warn!("复制 launcher-brand 失败：{e}");
         return;
     }
-    log::info!("launcher-brand 已就绪：{}", dest.display());
+    log::info!("launcher-brand 已就绪：{}（源 {}）", dest.display(), src.display());
 }
 
 /// 递归复制目录（覆盖）。
@@ -530,4 +632,49 @@ fn write_matrix_brand_patch<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig
     std::fs::write(&patch_path, content).map_err(|e| format!("MATRIX_PATCH_WRITE_FAILED: {e}"))?;
     log::info!("已写入 matrix profile 品牌 patch：{}", patch_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归测试：launcher-brand 必须**内嵌在二进制里**。
+    ///
+    /// 2026-09-14 同事故障：该插件原以 `env!("CARGO_MANIFEST_DIR")` 定位磁盘目录，
+    /// 编译期路径被烧进 exe（指向开发者机器的 `E:\ai-works\...`），
+    /// 同事机器上不存在 → 日志「launcher-brand 插件源缺失」→ 跳过 profile 预置。
+    /// 且 launcher 自动更新只替换单个 exe，磁盘目录方案在更新后必然失效。
+    #[test]
+    fn launcher_brand_is_embedded() {
+        // 4 个必需文件全部内嵌
+        let names: Vec<&str> = LAUNCHER_BRAND_FILES.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"package.json"), "缺 package.json");
+        assert!(names.contains(&"cordis.patch.yml"), "缺 cordis.patch.yml");
+        assert!(names.contains(&"lib/index.js"), "缺 lib/index.js");
+        assert!(names.contains(&"lib/client.js"), "缺 lib/client.js");
+
+        // 内容非空且是有效 JSON / YAML 形态
+        for (name, content) in LAUNCHER_BRAND_FILES {
+            assert!(!content.trim().is_empty(), "{name} 内容为空");
+        }
+        let (_, pkg) = LAUNCHER_BRAND_FILES
+            .iter()
+            .find(|(n, _)| *n == "package.json")
+            .expect("package.json 应存在");
+        let json: serde_json::Value = serde_json::from_str(pkg).expect("package.json 应是合法 JSON");
+        assert_eq!(json["name"], "launcher-brand");
+        // dsh bundle patch 声明（dsh 靠它找 cordis.patch.yml）
+        assert_eq!(json["dsh"]["bundle"]["patch"], "./cordis.patch.yml");
+    }
+
+    /// 内嵌文件不应包含编译期绝对路径（防止再次把开发机路径带进发布物）。
+    #[test]
+    fn launcher_brand_has_no_compiled_paths() {
+        for (name, content) in LAUNCHER_BRAND_FILES {
+            assert!(
+                !content.contains("ai-works"),
+                "{name} 含开发机路径 ai-works，发布物会带出本机路径"
+            );
+        }
+    }
 }

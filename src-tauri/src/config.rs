@@ -449,6 +449,17 @@ pub fn git_binary_path<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
 ///
 /// 为什么支持环境变量：便于自动化测试与多实例隔离（dsh 本体也用 `DSH_HOME`，
 /// 语义一致）。注意**配置优先于环境变量**——用户显式在配置文件里指定的值最权威。
+///
+/// ⚠️ 安全护栏（2026-09-14 实测踩坑）：**若环境变量指向桌面端默认目录 `~/.dsh`，
+/// 则忽略它**，回落到 `~/.dsh-launcher`。
+///
+/// 原因：launcher 进程会**继承父进程环境**。当 launcher 从某个已设
+/// `DSH_HOME=~/.dsh` 的会话（如 dsh 自身的终端/工具壳）里启动时，
+/// 会把 `~/.dsh` 当成自己的数据目录，往用户的**桌面端/开发环境**里写
+/// profile、launcher-brand、settings.yaml（本人实测污染过自己的 `~/.dsh`）。
+/// launcher 的设计前提是「与桌面端 `~/.dsh` 隔离」，故该值必须拒绝。
+///
+/// 显式指定其它路径（如 `D:\test-home`）仍照常生效——多实例隔离/自动化测试不受影响。
 pub fn dsh_home<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> PathBuf {
     if let Some(home) = &cfg.dsh_home {
         if !home.is_empty() {
@@ -458,12 +469,39 @@ pub fn dsh_home<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> PathBuf
     if let Ok(env_home) = std::env::var("DSH_HOME") {
         let t = env_home.trim();
         if !t.is_empty() {
-            return PathBuf::from(t);
+            let p = PathBuf::from(t);
+            if is_desktop_dsh_home(&p) {
+                log::warn!(
+                    "环境变量 DSH_HOME={} 指向桌面端目录，已忽略（launcher 须与桌面端隔离）；\
+                     改用 ~/.dsh-launcher",
+                    p.display()
+                );
+            } else {
+                return p;
+            }
         }
     }
     dirs::home_dir()
         .unwrap_or_else(|| base_dir(app))
         .join(".dsh-launcher")
+}
+
+/// 该路径是否是「桌面端 dsh 默认目录」（`~/.dsh`）。
+///
+/// 只认精确的 `~/.dsh`（规范化后比较，忽略大小写与尾部分隔符），
+/// 不误伤 `~/.dsh-launcher`、`~/.dsh-matrix-dev` 等其它以 `.dsh` 开头的目录。
+fn is_desktop_dsh_home(p: &std::path::Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let target = home.join(".dsh");
+    // 规范化：去尾部斜杠、统一小写比较（Windows 路径不区分大小写）
+    let norm = |x: &std::path::Path| -> String {
+        x.to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_ascii_lowercase()
+    };
+    norm(p) == norm(&target)
 }
 
 pub fn resolve_port(cfg: &LauncherConfig) -> u16 {
@@ -873,7 +911,37 @@ pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> LauncherConfig {
     let mut cfg = builtin_default_config();
     match fs::read_to_string(&path) {
         Ok(s) => {
-            match serde_json::from_str::<LauncherConfig>(&s) {
+            // 先做**旧域名迁移**（`*.ict.cmcc` → `*.ai.ict.cmcc`）。
+            //
+            // 为什么必须在反序列化前、且在 JSON 层做：存量同事的用户文件里存着
+            // 已下线的旧域名（如 `serverUrl: http://ai-conf.ict.cmcc`），
+            // 而「用户显式设置」的字段不会被内置默认覆盖 → 升级 launcher 也救不回来。
+            // 迁移只改用户真正写过的字段并立即落盘，避免每次启动重复迁移，
+            // 同时不把内置默认值固化进用户文件（否则以后改默认值再也覆盖不进来）。
+            let mut json: serde_json::Value = match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("launcher-config.json 解析失败，使用内置默认：{e}");
+                    serde_json::Value::Null
+                }
+            };
+            if !json.is_null() && crate::domain_migrate::migrate_json(&mut json) {
+                match serde_json::to_string_pretty(&json) {
+                    Ok(out) => {
+                        // 原子写（tmp + rename），防断电/并发读到半截文件
+                        let tmp = path.with_extension("json.migrating");
+                        match fs::write(&tmp, &out).and_then(|_| fs::rename(&tmp, &path)) {
+                            Ok(()) => log::info!("旧域名已迁移并写回：{}", path.display()),
+                            Err(e) => {
+                                let _ = fs::remove_file(&tmp);
+                                log::warn!("域名迁移写回失败（本次仍用迁移后的内存值）：{e}");
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("域名迁移序列化失败：{e}"),
+                }
+            }
+            match serde_json::from_value::<LauncherConfig>(json) {
                 Ok(user_cfg) => merge_user_into_builtin(&mut cfg, user_cfg),
                 Err(e) => log::warn!("launcher-config.json 解析失败，使用内置默认：{e}"),
             }
@@ -884,6 +952,7 @@ pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> LauncherConfig {
         "Launcher config loaded: port={:?}, npm_registry={:?}, gh_prefix={:?}, dsh_home={:?}, profile={:?}",
         cfg.port, cfg.npm_registry, cfg.gh_mirror_prefix, cfg.dsh_home, cfg.profile
     );
+    log::info!("同步服务端：{}", resolve_server_url(&cfg));
     cache(cfg.clone());
     cfg
 }
@@ -1082,6 +1151,34 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- 桌面端目录护栏 ----------
+
+    #[test]
+    fn detects_desktop_dsh_home() {
+        // ~/.dsh 应被识别（各种写法）
+        let home = dirs::home_dir().expect("应有 home");
+        let dsh = home.join(".dsh");
+        assert!(is_desktop_dsh_home(&dsh));
+        // 尾部分隔符 / 大小写差异也要认
+        assert!(is_desktop_dsh_home(&PathBuf::from(format!("{}\\", dsh.display()))));
+        assert!(is_desktop_dsh_home(&PathBuf::from(format!("{}/", dsh.display()))));
+        assert!(is_desktop_dsh_home(&PathBuf::from(
+            dsh.to_string_lossy().to_uppercase()
+        )));
+    }
+
+    #[test]
+    fn does_not_flag_other_dsh_dirs() {
+        let home = dirs::home_dir().expect("应有 home");
+        // launcher 自己的目录、matrix-dev 隔离目录都不该被误判
+        assert!(!is_desktop_dsh_home(&home.join(".dsh-launcher")));
+        assert!(!is_desktop_dsh_home(&home.join(".dsh-matrix-dev")));
+        assert!(!is_desktop_dsh_home(&home.join(".dsh-anything")));
+        // 任意自定义测试目录也不该被误判（多实例隔离要能用）
+        assert!(!is_desktop_dsh_home(&PathBuf::from("D:\\test-home")));
+        assert!(!is_desktop_dsh_home(&PathBuf::from("C:\\tmp\\dsh-home")));
+    }
 
     // ---------- dsh 版本通道 ----------
 

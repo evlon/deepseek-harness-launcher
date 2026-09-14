@@ -8,6 +8,7 @@ mod console;
 mod download;
 mod dsh_npm;
 mod dsh_versions;
+mod domain_migrate;
 mod env_defaults;
 mod first_run;
 mod install;

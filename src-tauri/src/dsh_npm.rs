@@ -181,21 +181,46 @@ pub async fn install_to<R: Runtime>(
         return Err("PNPM_OR_NODE_NOT_FOUND: 请先安装 Node.js / pnpm".to_string());
     }
 
-    // 重建目标目录（原子：先装 staging，成功后再替换）
+    // ⚠️ 必须「原地安装」，不能先装到 staging 再 rename。
+    //
+    // 2026-09-14 同事机器实测踩坑（本机已端到端复现）：
+    // pnpm 在 node_modules 里建的是 **junction/symlink**，且目标写的是**绝对路径**
+    // （如 `<staging>/node_modules/.pnpm/@deepseek-ai+dsh@x/node_modules/@deepseek-ai/dsh`）。
+    // 把 staging rename 成正式名后，这些链接仍指向**旧路径**，而旧路径已不存在
+    // → bin.js 校验是在 rename **之前**做的，所以日志显示"安装完成"，
+    //   但 rename 之后 `<dest>/node_modules/@deepseek-ai/dsh/lib/bin.js` 全部不可达
+    // → 启动报 DSH_NOT_FOUND「尚未安装 Harness 核心」，用户看到"提示安装成功但不能启动"。
+    //
+    // 改法：旧目录先挪走当备份 → 在正式路径原地安装 → 成功后删备份；失败回滚。
     let parent = dest.parent().unwrap_or(Path::new(".")).to_path_buf();
     let leaf = dest.file_name().and_then(|v| v.to_str()).unwrap_or("dsh").to_string();
-    let staging = parent.join(format!(".{leaf}.installing-{}", std::process::id()));
-    // 清理历史残留的 installing 目录（上次失败/中断留下的）
+    let backup = parent.join(format!(".{leaf}.replaced-{}", std::process::id()));
+
+    // 清理历史残留（上次失败/中断留下的 staging 与 backup 目录）
     if let Ok(entries) = std::fs::read_dir(&parent) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&format!(".{leaf}.installing-")) {
-                let _ = std::fs::remove_dir_all(entry.path());
+            if name.starts_with(&format!(".{leaf}.installing-"))
+                || name.starts_with(&format!(".{leaf}.replaced-"))
+            {
+                let _ = remove_dir_all(&entry.path());
             }
         }
     }
-    let _ = remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+
+    // 旧目录让位（rename 同分区、瞬间完成；不动旧目录内容，失败可回滚）
+    let had_old = dest.exists();
+    if had_old {
+        let _ = remove_dir_all(&backup);
+        std::fs::rename(dest, &backup)
+            .map_err(|e| format!("DSH_OLD_MOVE_ASIDE_FAILED: {e}"))?;
+    }
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        if had_old {
+            let _ = std::fs::rename(&backup, dest); // 回滚
+        }
+        return Err(e.to_string());
+    }
 
     // 写 package.json：依赖 @deepseek-ai/dsh 指定版本
     let manifest = serde_json::json!({
@@ -206,7 +231,7 @@ pub async fn install_to<R: Runtime>(
         },
     });
     std::fs::write(
-        staging.join("package.json"),
+        dest.join("package.json"),
         serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
@@ -222,30 +247,51 @@ pub async fn install_to<R: Runtime>(
             .collect::<Vec<_>>()
             .join("\n")
     );
-    std::fs::write(staging.join("pnpm-workspace.yaml"), workspace_yaml)
+    std::fs::write(dest.join("pnpm-workspace.yaml"), workspace_yaml)
         .map_err(|e| e.to_string())?;
 
-    log::info!("pnpm 安装 {}@{} 到 {}…", DSH_NPM_PACKAGE, version, staging.display());
-    let result = run_pnpm(&node, &pnpm, &staging, &["install"], on_progress).await?;
+    log::info!("pnpm 安装 {}@{} 到 {}…", DSH_NPM_PACKAGE, version, dest.display());
+    let result = match run_pnpm(&node, &pnpm, dest, &["install"], on_progress).await {
+        Ok(r) => r,
+        Err(e) => {
+            // 回滚：删掉装了一半的新目录，把旧目录挪回来（避免用户环境彻底不可用）
+            rollback_install(dest, &backup, had_old);
+            return Err(e);
+        }
+    };
     log::info!("pnpm install 输出：{}", result.trim().lines().last().unwrap_or(""));
 
-    // 验证 bin.js
-    let bin = staging
+    // 验证 bin.js —— 关键：现在是在**正式路径**上验证。
+    // 原地安装后 node_modules 内的链接指向 <dest>/node_modules/.pnpm/…，真实可达。
+    let bin = dest
         .join("node_modules")
         .join(DSH_NPM_PACKAGE)
         .join("lib/bin.js");
     if !bin.exists() {
-        let _ = remove_dir_all(&staging);
+        rollback_install(dest, &backup, had_old);
         return Err(format!("DSH_NPM_BIN_MISSING: 安装后未找到 {bin:?}"));
     }
 
-    // 原子替换目标目录
-    if dest.exists() {
-        remove_dir_all(dest).map_err(|e| format!("DSH_DEST_CLEAN_FAILED: {e}"))?;
+    // 成功：清理旧版本备份
+    if had_old {
+        let _ = remove_dir_all(&backup);
     }
-    std::fs::rename(&staging, dest).map_err(|e| format!("DSH_DEST_COMMIT_FAILED: {e}"))?;
     log::info!("dsh {} 安装完成：{}", version, dest.display());
     Ok(())
+}
+
+/// 安装失败时回滚：删掉半成品，把旧目录挪回原位。
+///
+/// 只在「旧目录已被挪到 backup」时才有意义；无旧目录（全新安装）则仅清理半成品。
+fn rollback_install(dest: &Path, backup: &Path, had_old: bool) {
+    let _ = remove_dir_all(dest);
+    if had_old && backup.exists() {
+        if let Err(e) = std::fs::rename(backup, dest) {
+            log::error!("回滚失败：无法把 {} 恢复为 {}：{e}", backup.display(), dest.display());
+        } else {
+            log::warn!("安装失败已回滚到旧版本：{}", dest.display());
+        }
+    }
 }
 
 /// 执行 pnpm 命令（node <pnpm.cjs> install），带超时。

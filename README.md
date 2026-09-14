@@ -86,24 +86,40 @@ node server.js --port 8080 --token 你的管理口令
 客户端侧：在 `launcher-config.json` 配置 `serverUrl`（如 `http://10.0.0.5:8080`）即可启用同步；
 管理员在中心服务端添加推荐插件后，各客户端下一次轮询（默认 5 分钟）会收到提示并可在托盘确认安装。
 
-### 内网域名配置（新旧环境并存）
+### 内网域名（新环境 `*.ai.ict.cmcc`）
 
-内网原有 `*.ict.cmcc`，新部署的 K8S 环境改用 `*.ai.ict.cmcc`。**两套环境并存**，
-故内置默认已切到新环境，但可随时切回：
+内网原有 `*.ict.cmcc`，新部署的 K8S 环境改用 `*.ai.ict.cmcc`。
+**2026-09-14 起旧环境已全部下线**（实测旧域名全部 HTTP 000 连接失败），
+内置默认与存量配置都已切到新域名。
 
-| 项 | 默认（新环境） | 旧环境 |
+| 服务 | 新域名（唯一可用） | 旧域名（已下线） |
 |---|---|---|
-| 中心服务端 `serverUrl` | `http://conf.ai.ict.cmcc` | `http://ai-conf.ict.cmcc` |
-| 管理能力 bridge CORS 放行 Origin | `http://conf.ai.ict.cmcc` | `http://ai-conf.ict.cmcc` |
+| 中心服务端 `serverUrl` | `http://conf.ai.ict.cmcc` | ~~`http://ai-conf.ict.cmcc`~~ |
+| 门户 | `http://market.ai.ict.cmcc` | ~~`http://ai-market.ict.cmcc`~~ |
+| 门户管理 | `http://market-admin.ai.ict.cmcc` | ~~`http://ai-market-admin.ict.cmcc`~~ |
+| 岗位发布台 | `http://job.ai.ict.cmcc` | ~~`http://ai-job.ict.cmcc`~~ |
+| 花名册 | `http://roster.ai.ict.cmcc` | ~~`http://ai-roster.ict.cmcc`~~ |
+| 数字人测试台 | `http://test.ai.ict.cmcc` | ~~`http://ai-test.ict.cmcc`~~ |
+| 网关控制台 | `http://gateway.ai.ict.cmcc` | ~~`http://ai-gateway.ict.cmcc`~~ |
+| 认证（Keycloak） | `http://auth.ai.ict.cmcc` | ~~`http://ai-auth.ict.cmcc`~~ |
 
-- **切回旧环境**：在
-  `%APPDATA%\io.github.hairyf.deepseek-harness-launcher\launcher-config.json`
-  里把 `serverUrl` 改成 `http://ai-conf.ict.cmcc`（用户配置覆盖内置默认，改完重启生效）。
+**不迁移的域名**（新旧环境共用，实测仍可用）：
+
+- Matrix homeserver `https://im-ipm.ict.cmcc`（承载网 172.21.163.150）
+- npm 私服 `http://registry.ict.cmcc`
+
+#### 旧域名自动迁移（0.3.6+）
+
+存量同事的 `launcher-config.json` 里存着已下线的旧域名，而「用户显式设置」的字段
+不会被内置默认覆盖 → 升级 launcher 也救不回来。为此启动时**自动迁移**：
+
+- 位置：`launcher-config.json` 的 `serverUrl` / `quickLinks[].url` / `mirrorSettings`
+- 行为：改完**立即原子写回**（只改用户真正写过的字段，不固化内置默认值）
+- 日志：`域名迁移：serverUrl http://ai-conf.ict.cmcc → http://conf.ai.ict.cmcc`
+- 实现：`src-tauri/src/domain_migrate.rs`（含单测，覆盖最长匹配/端口/路径/矩阵与 registry 不迁移）
+
 - **CORS 白名单**：bridge 默认**同时放行新旧两个** `conf` 域名（`http`/`https` 各一），
   无需配置；如需追加其他来源，用环境变量 `ADMIN_ORIGIN`（逗号分隔）。
-- 其他服务域名对应关系：门户 `ai-market.ict.cmcc` → `market.ai.ict.cmcc`；
-  岗位网关 `ai-job.ict.cmcc` → `gateway.ai.ict.cmcc`；
-  花名册 `ai-roster.ict.cmcc` → `roster.ai.ict.cmcc`。
 
 ## 构建与运行
 

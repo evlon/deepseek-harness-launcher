@@ -373,13 +373,35 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// 读取已装 dsh 版本（字符串，如 `0.1.1-rc.2`）；未安装/解析失败返回空串。
+/// 读取已装 dsh 版本（字符串，如 `0.1.1-rc.2`）；未安装/解析失败返回 `None`。
+///
+/// ⚠️ 2026-09-14 修复：此前读的是 `dependencies/dsh/package.json`——
+/// 那是 launcher 自己生成的**包装清单**（`{"name":"dsh-runtime","private":true,
+/// "dependencies":{...}}`），**没有 `version` 字段** → 恒返回 None。
+/// 后果：① 日志「当前 ，发现新版本 …」版本号为空；
+/// ② `version_supports_no_open` 恒为 false → 启动不带 `--no-open` → 每次启动都弹浏览器。
+///
+/// 真实版本在 `node_modules/@deepseek-ai/dsh/package.json`。
+/// 兼容旧结构：包装清单若确实带 `version`（历史版本）也认。
 pub fn installed_dsh_version<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
-    let manifest = dsh_install_path(app).join("package.json");
-    let text = std::fs::read_to_string(&manifest).ok()?;
+    let root = dsh_install_path(app);
+    // 首选：真实包清单（npm 安装结构）
+    let real = root
+        .join("node_modules")
+        .join(crate::dsh_npm::DSH_NPM_PACKAGE)
+        .join("package.json");
+    if let Some(v) = read_version_field(&real) {
+        return Some(v);
+    }
+    // 兜底：包装清单（仅当它确实带 version 时）
+    read_version_field(&root.join("package.json"))
+}
+
+/// 读某个 package.json 的 `version` 字段；文件不存在/无该字段返回 None。
+fn read_version_field(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let version = json.get("version")?.as_str()?.to_string();
-    Some(version)
+    json.get("version")?.as_str().map(|s| s.to_string())
 }
 
 /// 读取已装 dsh 版本，判断是否支持 `--no-open`（>= 0.1.0-rc.8）。
