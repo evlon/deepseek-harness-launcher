@@ -155,14 +155,68 @@ cargo build --release  # 发布版
 
 IPC 命令（`invoke('cmd_status')` 等，与 CLI 一一对应）：`cmd_install` / `cmd_launch` / `cmd_stop` / `cmd_sync` / `cmd_speedtest` / `cmd_mirror` / `cmd_status` / `cmd_open_console`。
 
-## 发布（GitHub Actions）
+## 版本号与发布（GitHub Actions）
 
-打 tag（如 `v0.1.0`）自动触发 `.github/workflows/release.yml` 构建并发布 GitHub Release：
+### 版本号维护在三处，必须逐字相等
+
+| 文件 | 字段 |
+|---|---|
+| `package.json` | `version` |
+| `src-tauri/Cargo.toml` | `[package] version` |
+| `src-tauri/tauri.conf.json` | `version` |
+
+**为什么必须一致**：launcher 的自动更新拿**服务端元数据里的版本**与本机
+`CARGO_PKG_VERSION`（即 `src-tauri/Cargo.toml` 的 `[package] version`，编译期写死进 exe）
+做「**严格大于**」比较（`self_update.rs:79` `has_newer`、`:28` `current_version`）。
+
+- `Cargo.toml` 是**运行时真正生效**的那个 —— 它决定 exe 自报的版本；
+- `tauri.conf.json` 的 `version` 是 Tauri 打包时的产品版本；
+- `package.json` 的 `version` 是仓库自身声明的版本。
+
+三处不一致时，**发布物 tag / 服务端元数据 / exe 自报版本会互相打架**，典型后果是
+**自更新失效且不报错**：`Cargo.toml` 落后 → exe 一直自报旧版、反复下载同一个包；
+`Cargo.toml` 超前 → launcher 自认已是最新、**永远收不到新版**。两种都很隐蔽。
+
+改版本号时**三处一起改**，然后本地跑一次护栏自检：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+node scripts/check-version.mjs            # 校验三处一致
+node scripts/check-version.mjs v0.3.7     # 再校验 tag 与版本号一致
 ```
+
+CI 也会跑同一个脚本（见下），**不一致直接构建失败**，不会产出错误版本的安装包。
+
+### 打 tag 发布
+
+打 tag（`v` + 版本号，如 `v0.3.7`）自动触发 `.github/workflows/release.yml`
+构建并发布 GitHub Release：
+
+```bash
+git tag v0.3.7
+git push origin v0.3.7
+```
+
+> ⚠️ **tag 必须等于 `v` + 三处版本号**。CI 在 checkout 之后、Rust 工具链与编译**之前**
+> 就跑版本护栏，tag 与版本号不符会**立即失败**（省掉一次几分钟的无用构建）。
+
+### ⚠️ 历史 tag 空洞（**只作记录，不补打**）
+
+本仓库已打的 tag：`v0.2.0`、`v0.2.1`、`v0.3.1`、`v0.3.4`、`v0.3.5`、`v0.3.6`、`v0.3.7`。
+
+**`v0.3.0` / `v0.3.2` / `v0.3.3` 这三个版本号从未打过 tag** ——
+当时的发布是把 exe 直接传到中心服务端（`conf.…/api/launcher/releases`），
+**没有走 GitHub tag 流程**，所以 tag 序列是断的。
+
+**处理决定：这些历史空洞不补打 tag。**
+
+- 补打 tag 会触发 CI 重新构建并发布 GitHub Release，产出的是**今天源码**编出的包，
+  而**不是**当年那个 0.3.3 —— 版本号相同、内容不同，**反而制造假证据**；
+- 同事真正下载的是**中心服务端**的 exe（`/api/launcher/latest`），**不依赖 GitHub tag**，
+  补 tag 对交付没有任何作用；
+- 因此：**历史 tag 空洞只在此记录成因，不再回溯**。
+
+**往前看**：自本护栏加入起，每次发版都走 tag 流程，且 tag 与三处版本号由 CI 强制校验，
+**不会再产生新的空洞**。
 
 Release 产物为客户端包：
 

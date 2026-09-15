@@ -24,6 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 版本一致性护栏：三处版本号（package.json / Cargo.toml / tauri.conf.json）
+      # 必须逐字相等，且 tag 必须等于 "v" + 版本号。
+      # 版本号错一处 → 自更新比对失效 → 用户永远收不到新版，故在构建前拦住。
+      - name: Verify version consistency
+        shell: bash
+        run: node scripts/check-version.mjs "${{ github.ref_name }}"
+
       # Rust 工具链（edition 2021，稳定版）
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
