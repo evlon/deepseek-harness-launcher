@@ -29,8 +29,12 @@
 //! 6. settings.yaml 的 namespace                   ← 最高（用户设置页）
 //! ```
 //!
-//! 本模块写**第 6 层**（用户可见可改），且遵循「只填空缺」：
-//! 用户已显式设置过的值**不覆盖**。
+//! 本模块写**第 6 层**（用户可见可改）。
+//!
+//! 覆盖策略分两类键：
+//! - **环境地址类键**（服务端下发的系统级统一值，见 [`FORCE_OVERRIDE_KEYS`]）：
+//!   **强制覆盖**——认证域名等值是全公司统一的，不该由用户本地残留旧值决定。
+//! - **其余键**：遵循「只填空缺」——用户已显式设置过的值**不覆盖**。
 //!
 //! ## 什么不该下发
 //!
@@ -160,10 +164,45 @@ pub fn env_defaults_table() -> BTreeMap<&'static str, Vec<(&'static str, &'stati
     m
 }
 
-/// 应用**服务端下发**的环境默认配置到 settings.yaml（仍遵循「只填空缺」）。
+/// 环境地址类键（namespace.key）：**系统级统一配置，服务端有值就强制覆盖**。
+///
+/// 这些键承载的是「内网服务地址 / 认证域名」等全公司统一的值，不属个人可调项。
+/// 用户本地 settings.yaml 里若残留旧值（如早期默认值 `http://auth.ai.ict.cmcc`），
+/// 必须被服务端下发的新值纠正，否则会跳已下线/错误的域名。
+///
+/// 语义与 `sync.rs` 里 `dshMirrorUrl`「企业统一管理项、强制覆盖」一致。
+/// 其余键（个人凭据 username/token/accessToken/userId 等）仍遵循「只填空缺」。
+const FORCE_OVERRIDE_KEYS: &[(&str, &str)] = &[
+    // ── 数字分身自动激活（认证域名是本次改造目标，必须强制覆盖）──
+    ("matrix-activation", "keycloakIssuer"),
+    ("matrix-activation", "clientId"),
+    ("matrix-activation", "activateEndpoint"),
+    ("matrix-activation", "homeserverUrl"),
+    // ── 数字分身（dsh-matrix-agent）环境地址 ──
+    ("dsh-matrix", "homeserverUrl"),
+    // ── 花名册 ──
+    ("roster", "rosterUrl"),
+    // ── HiMarket 门户 ──
+    ("himarket", "baseUrl"),
+    ("himarket", "gatewayUrl"),
+    // ── 默认模型路由 ──
+    ("llm-codebuddy", "baseURL"),
+];
+
+/// 判断 `namespace.key` 是否为「环境地址类键」（服务端强制覆盖，不遵循「只填空缺」）。
+fn is_force_override_key(ns: &str, key: &str) -> bool {
+    FORCE_OVERRIDE_KEYS.iter().any(|(n, k)| *n == ns && *k == key)
+}
+
+/// 应用**服务端下发**的环境默认配置到 settings.yaml。
 ///
 /// 入参形状：`{ "<namespace>": { "<key>": "<value>" } }`（launcher-server 的
 /// `config.json` 的 `envDefaults` 字段）。
+///
+/// 覆盖策略（两类键）：
+/// - **环境地址类键**（[`FORCE_OVERRIDE_KEYS`]）：服务端有值就**强制覆盖**本地，
+///   纠正存量旧值（认证域名等系统级配置不该由用户本地值决定）。
+/// - **其余键**（个人凭据等）：仍遵循「只填空缺」，用户已设的不覆盖。
 ///
 /// 与 [`apply_env_defaults_to_file`] 的关系：本函数处理**服务端下发**的值，
 /// 由 `sync.rs` 在同步时调用；代码内置的 [`ENV_DEFAULTS`] 是兜底（服务端未配时用）。
@@ -213,13 +252,23 @@ pub fn apply_env_defaults_map_to_file(
                 continue;
             }
             let key = Value::String(k.clone());
-            let cur_empty = match map.get(&key) {
-                None => true,
-                Some(Value::Null) => true,
-                Some(Value::String(s)) => s.trim().is_empty(),
-                Some(_) => false,
+            let cur = map.get(&key);
+            let cur_str = match cur {
+                Some(Value::String(s)) => s.trim(),
+                _ => "",
             };
-            if cur_empty {
+            let cur_empty = cur_str.is_empty();
+
+            if is_force_override_key(ns, k) {
+                // 环境地址类键：服务端有值就强制覆盖（纠正存量旧值）
+                if cur_str != val_str {
+                    map.insert(key, Value::String(val_str));
+                    filled += 1;
+                } else {
+                    skipped += 1;
+                }
+            } else if cur_empty {
+                // 其余键：只填空缺
                 map.insert(key, Value::String(val_str));
                 filled += 1;
             } else {
@@ -307,18 +356,95 @@ mod tests {
     #[test]
     fn server_map_fills_and_keeps_user() {
         let p = tmp_path("servermap");
-        std::fs::write(&p, "roster:\n  rosterUrl: http://mine:1\n").unwrap();
+        // portalId 是非强制键（个人/业务配置），用户已设 → 服务端不覆盖
+        std::fs::write(&p, "himarket:\n  portalId: user-portal-1\n").unwrap();
         let server = serde_json::json!({
-            "roster": { "rosterUrl": "http://server:2", "rosterEnabled": "true" },
-            "himarket": { "portalId": "portal-abc" }
+            "roster": { "rosterUrl": "http://server:2" },
+            "himarket": { "portalId": "server-portal-9", "adminUsername": "admin" }
         });
         let (filled, skipped) = apply_env_defaults_map_to_file(&p, &server).unwrap();
-        assert_eq!(filled, 2, "rosterEnabled 与 portalId 应被填充");
-        assert_eq!(skipped, 1, "用户已设的 rosterUrl 应跳过");
+        // rosterUrl 是强制覆盖键（用户值为空也会填），adminUsername 填空，portalId 用户已设→跳过
+        assert_eq!(filled, 2, "rosterUrl(强制) 与 adminUsername(填空) 应被填充");
+        assert_eq!(skipped, 1, "用户已设的 portalId 应跳过");
         let txt = std::fs::read_to_string(&p).unwrap();
-        assert!(txt.contains("http://mine:1"), "用户值必须保留");
-        assert!(!txt.contains("http://server:2"), "不该写入被跳过的默认值");
-        assert!(txt.contains("portal-abc"));
+        assert!(txt.contains("http://server:2"), "强制覆盖键应写入服务端值");
+        assert!(txt.contains("user-portal-1"), "非强制键用户值必须保留");
+        assert!(!txt.contains("server-portal-9"), "非强制键不该被服务端覆盖");
+        assert!(txt.contains("admin"), "空键应被填充");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn server_map_force_overrides_stale_env_addr() {
+        let p = tmp_path("forceaddr");
+        // 模拟存量同事 settings.yaml 里残留旧认证域名（非空，会被「只填空缺」保护）
+        std::fs::write(
+            &p,
+            "matrix-activation:\n  keycloakIssuer: http://auth.ai.ict.cmcc/realms/himarket\n",
+        )
+        .unwrap();
+        let server = serde_json::json!({
+            "matrix-activation": {
+                "keycloakIssuer": "https://auth.ict.cmcc/realms/himarket",
+                "clientId": "matrix-twin-activation"
+            }
+        });
+        let (_filled, _skipped) = apply_env_defaults_map_to_file(&p, &server).unwrap();
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            txt.contains("https://auth.ict.cmcc/realms/himarket"),
+            "强制覆盖键应纠正旧域名：{txt}"
+        );
+        assert!(
+            !txt.contains("auth.ai.ict.cmcc"),
+            "旧域名残留必须被清除：{txt}"
+        );
+        assert!(txt.contains("matrix-twin-activation"), "空键 clientId 应被填充");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn server_map_force_override_skips_when_same() {
+        let p = tmp_path("forcesame");
+        std::fs::write(
+            &p,
+            "matrix-activation:\n  keycloakIssuer: https://auth.ict.cmcc/realms/himarket\n",
+        )
+        .unwrap();
+        let server = serde_json::json!({
+            "matrix-activation": { "keycloakIssuer": "https://auth.ict.cmcc/realms/himarket" }
+        });
+        let (filled, skipped) = apply_env_defaults_map_to_file(&p, &server).unwrap();
+        assert_eq!(filled, 0, "值相同不该重复写");
+        assert_eq!(skipped, 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn server_map_keeps_personal_credentials() {
+        let p = tmp_path("keepscred");
+        // 个人凭据（dsh-matrix.userId/accessToken）不是强制覆盖键，用户值必须保留
+        std::fs::write(
+            &p,
+            "dsh-matrix:\n  userId: '@me:im-ipm.ict.cmcc'\n  accessToken: tok123\n",
+        )
+        .unwrap();
+        let server = serde_json::json!({
+            "dsh-matrix": {
+                "homeserverUrl": "https://im-ipm.ict.cmcc",
+                "userId": "@server-override:im-ipm.ict.cmcc",
+                "accessToken": "server-tok"
+            }
+        });
+        let (filled, skipped) = apply_env_defaults_map_to_file(&p, &server).unwrap();
+        // homeserverUrl 是强制覆盖键（空→填），userId/accessToken 是非强制键（用户已设→保留）
+        assert_eq!(filled, 1, "只填 homeserverUrl");
+        assert_eq!(skipped, 2, "userId/accessToken 用户值保留");
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("@me:im-ipm.ict.cmcc"), "个人凭据 userId 必须保留");
+        assert!(txt.contains("tok123"), "个人凭据 accessToken 必须保留");
+        assert!(!txt.contains("@server-override"), "不该覆盖个人 userId");
+        assert!(txt.contains("https://im-ipm.ict.cmcc"), "强制覆盖键 homeserverUrl 应填");
         let _ = std::fs::remove_file(&p);
     }
 

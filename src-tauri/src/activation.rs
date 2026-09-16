@@ -70,6 +70,11 @@ fn read_activation_config<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) 
     let ns = read_yaml_ns_str(&path, "matrix-activation");
     if let Some(ns) = ns {
         if let Some(v) = ns.get("keycloakIssuer").filter(|s| !s.is_empty()) {
+            // 直接信任 settings.yaml 里的值。其正确性由两层保证：
+            // ① 服务端 envDefaults 下发（环境地址类键强制覆盖，纠正存量旧值）；
+            // ② 代码内置默认值（服务端未下发时的兜底）。
+            // 这里不再做运行时「旧域名归一化」fallback——按约定：服务器不可达/
+            // 配置不对，客户端就不该替用户猜，直接暴露问题让管理员在配置中心改。
             out.issuer = v.clone();
         }
         if let Some(v) = ns.get("clientId").filter(|s| !s.is_empty()) {
