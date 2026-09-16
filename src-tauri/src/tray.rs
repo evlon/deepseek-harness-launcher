@@ -246,12 +246,14 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     items.push(&dsh_submenu);
     items.push(&bridge_submenu);
 
-    // 收尾：查看日志 / 收集日志（排障回传） / 退出
+    // 收尾：查看日志 / 收集日志（排障回传） / 重装内网证书 / 退出
     let log_item = MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?;
     let logpack_item = MenuItem::with_id(app, "logpack", "📦 收集日志（发给管理员排障）", true, None::<&str>)?;
+    let cert_item = MenuItem::with_id(app, "cert-reinstall", "🔐 重装内网证书", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     items.push(&log_item);
     items.push(&logpack_item);
+    items.push(&cert_item);
     items.push(&quit_item);
 
     let menu = Menu::with_items(app, &items)?;
@@ -976,6 +978,29 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     Err(e) => {
                         crate::ops::fail_op(&h, &format!("收集日志失败：{e}"));
                         notify(&h, "收集日志失败", &e);
+                    }
+                }
+            });
+        }
+        "cert-reinstall" => {
+            // 重装内网根证书：独立重试入口（此前「同步」菜单并不触发证书安装，
+            // 证书导入失败后用户无路可走；此菜单项补上真实闭环）。
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "cert-reinstall", "重装内网证书", &["导入根证书"]);
+                crate::ops::mark_step_running(&h, 0);
+                crate::ops::update_step(&h, "正在导入内网根证书…");
+                let cfg = load_cached();
+                match crate::install::install_root_ca(&h, &cfg) {
+                    Ok(()) => {
+                        crate::ops::finish_op(&h, "内网根证书已导入系统信任库");
+                        notify(&h, "内网证书已就绪", "已导入系统信任库，浏览器访问 *.ai.ict.cmcc 不再红锁");
+                        refresh_sync_menu(&h);
+                    }
+                    Err(e) => {
+                        crate::ops::fail_op(&h, &e);
+                        notify(&h, "内网证书导入失败", &format!("{e}\n\n若提示需要管理员权限，请以管理员身份重新运行 launcher 后再试"));
+                        refresh_sync_menu(&h);
                     }
                 }
             });

@@ -33,7 +33,10 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let cfg = load_cached();
 
     // 操作状态中心：登记安装操作 + 自动弹出进度窗口
+    // 证书导入放在第一步：它是独立于依赖下载的最快闭环，且此前排在最末位
+    // 会被前面任何一步失败「短路」——证书永远装不上，浏览器一直红锁。
     let steps = vec![
+        "导入内网根证书",
         "下载 / 安装 Node.js",
         "安装 pnpm",
         "下载 Harness 核心",
@@ -46,6 +49,24 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         log::warn!("进度窗口打开失败（降级为托盘状态 + 通知）：{e}");
     }
 
+    // ① 内网根证书：最先做。失败不阻断后续依赖安装（依赖本体仍要装好），
+    //    但必须显式告知用户并留下重试入口（托盘「重装内网证书」）。
+    crate::ops::mark_step_running(app, 0);
+    crate::ops::update_step(app, "正在导入内网根证书…");
+    crate::ops::append_log(app, "开始导入内网根证书（im.ai.ict.cmcc 等 HTTPS 依赖）…");
+    if let Err(e) = install_root_ca(app, &cfg) {
+        log::warn!("内网根证书导入未完成：{e}");
+        crate::ops::mark_step_failed(app, 0);
+        crate::ops::append_log(app, &format!("✗ 内网根证书导入未完成：{e}"));
+        crate::notify::notify(
+            app,
+            "内网证书导入未完成",
+            &format!("{e}\n\n依赖安装会继续；完成后可点托盘「重装内网证书」补装"),
+        );
+    } else {
+        crate::ops::append_log(app, "✓ 内网根证书已导入系统信任库");
+    }
+
     // 预写 npmrc，使加速源在安装后就绪（供后续插件拉包）
     let _ = crate::plugin::ensure_profile_npmrc(app, &cfg);
 
@@ -53,7 +74,8 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     #[cfg(windows)]
     order.push(Component::Git);
 
-    let mut step_index = 0usize;
+    // 步骤 0 已被「导入内网根证书」占用，组件从步骤 1 开始
+    let mut step_index = 1usize;
     for component in &order {
         if component.check_installed(app) {
             log::info!("{} 已安装，跳过", component.title());
@@ -104,14 +126,14 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     copy_launcher_brand(app, &cfg);
 
     // 预置 web profile 插件（幂等：已装的自动跳过/更新）
-    crate::ops::mark_step_running(app, 3);
+    crate::ops::mark_step_running(app, 4);
     crate::ops::update_step(app, "预置 web 插件…");
     crate::notify::notify(app, "安装 / 修复", "预置 web 插件…");
     let web_packages: Vec<String> = PRESET_PLUGINS.iter().map(|s| s.to_string()).collect();
     preset_profile(app, &cfg, "web", &web_packages).await?;
 
     // 预置 matrix profile（数字分身）：dsh-matrix-agent + launcher-brand + 品牌 patch
-    crate::ops::mark_step_running(app, 4);
+    crate::ops::mark_step_running(app, 5);
     crate::ops::update_step(app, "预置 matrix 数字分身…");
     crate::notify::notify(app, "安装 / 修复", "预置 matrix 数字分身…");
     preset_matrix_profile(app, &cfg).await?;
@@ -119,7 +141,7 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // 服务器推荐的插件装到当前生效 profile（同事实际运行的 profile）。
     // 默认 profile 是 matrix，服务器推荐的 web 类插件（如 dsh-codebuddy-models）
     // 必须装到这里才会在运行实例里生效——装到 web profile 对 matrix 用户不可见。
-    crate::ops::mark_step_running(app, 5);
+    crate::ops::mark_step_running(app, 6);
     crate::ops::update_step(app, "安装服务器推荐插件…");
     crate::notify::notify(app, "安装 / 修复", "安装服务器推荐插件…");
     install_server_recommended(app, &cfg).await?;
@@ -452,6 +474,110 @@ fn copy_dir_recursive(src: &PathBuf, dest: &PathBuf) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 内嵌的内网根 CA 证书（编译期 include_str!）。
+///
+/// 用途：im.ai.ict.cmcc 等 *.ai.ict.cmcc 域名已启用 HTTPS（自建内网 CA 签发，
+/// 零成本、不依赖集团 CMCA）。浏览器（Chrome/Edge）默认不信任该根 CA，
+/// 故需在首次安装时把它导入 Windows 系统信任库，否则访问会报红锁。
+///
+/// 内嵌原因与 launcher-brand 相同：launcher 支持自动更新（替换单个 exe），
+/// 若证书只放在 zip 里 exe 旁边，自动更新后丢失 → 同事机器红锁复发。
+const ICT_INTERNAL_CA_PEM: &str = include_str!("../resources/ict-internal-ca.crt");
+
+/// 把内嵌的内网根 CA 导入 Windows 系统信任库（Chrome/Edge 走这里）。
+///
+/// 幂等：certutil -addstore 重复导入同名证书不报错（覆盖更新）。
+///
+/// 返回 `Result<(), String>`：Ok = 已成功导入（或验证确认已存在）；Err = 导入失败，
+/// 错误信息已尽量精确定位（权限不足 / certutil 缺失 / 证书内容异常）。
+/// 供 install_all 与托盘「重装内网证书」菜单共用，保证两处行为一致。
+pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // 1. 落到磁盘（certutil 需要一个文件路径）
+        let cert_path = dsh_home(app, cfg).join("ict-internal-ca.crt");
+        if let Some(parent) = cert_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // 内容有变化才重写（幂等，避免无谓磁盘 IO）
+        let need_write = match std::fs::read_to_string(&cert_path) {
+            Ok(existing) => existing != ICT_INTERNAL_CA_PEM,
+            Err(_) => true,
+        };
+        if need_write {
+            std::fs::write(&cert_path, ICT_INTERNAL_CA_PEM)
+                .map_err(|e| format!("写入根证书失败：{e}"))?;
+        }
+
+        // 2. certutil -addstore -f "Root" <cert>：导入系统信任库
+        //    Chrome/Edge 在 Windows 上读系统信任库，导入后即绿锁。
+        //    Firefox 用独立 NSS 库，暂不处理（同事主要用 Chrome/Edge）。
+        let out = Command::new("certutil")
+            .arg("-addstore")
+            .arg("-f")
+            .arg("Root")
+            .arg(&cert_path)
+            .output();
+
+        match out {
+            Ok(o) if o.status.success() => {
+                log::info!("内网根 CA 已导入系统信任库：{}", cert_path.display());
+            }
+            Ok(o) => {
+                // 失败：解析 stderr 定位原因。certutil 权限不足时 stderr 含
+                // "Access is denied" / "拒绝访问" / "0x80070005"（E_ACCESSDENIED）。
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let combined = format!("{stdout}\n{stderr}");
+                log::warn!("certutil 导入根 CA 返回非零：{combined}");
+                if combined.contains("Access is denied")
+                    || combined.contains("拒绝访问")
+                    || combined.contains("0x80070005")
+                    || combined.contains("Administrator")
+                    || combined.contains("管理员")
+                {
+                    return Err("导入内网根证书需要管理员权限：请右键托盘图标 →「重装内网证书」，并以管理员身份运行 launcher".to_string());
+                }
+                return Err(format!("certutil 导入根 CA 失败：{}", stderr.trim()));
+            }
+            Err(e) => {
+                log::warn!("调用 certutil 失败：{e}");
+                return Err(format!("调用 certutil 失败（系统可能缺少 certutil）：{e}"));
+            }
+        }
+
+        // 3. 验证闭环：读回系统信任库，确认证书确实在「受信任的根证书颁发机构」里。
+        //    不验证的话，certutil 报成功但实际没进信任库（例如被组策略拦截）时会误报绿锁。
+        let verify = Command::new("certutil")
+            .arg("-store")
+            .arg("Root")
+            .output();
+        match verify {
+            Ok(v) if v.status.success() => {
+                let text = String::from_utf8_lossy(&v.stdout).to_string();
+                // 按 CN 精确匹配我们的根 CA（避免误判其它同名证书）
+                if text.contains("ICT Internal AI Root CA") {
+                    log::info!("验证通过：内网根 CA 已在系统信任库中");
+                    Ok(())
+                } else {
+                    Err("验证失败：certutil 报告成功，但未在系统信任库中找到「ICT Internal AI Root CA」".to_string())
+                }
+            }
+            Ok(v) => {
+                let stderr = String::from_utf8_lossy(&v.stderr).to_string();
+                Err(format!("验证系统信任库失败：{}", stderr.trim()))
+            }
+            Err(e) => Err(format!("验证系统信任库时调用 certutil 失败：{e}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, cfg);
+        log::info!("非 Windows 平台，跳过根 CA 导入");
+        Ok(())
+    }
 }
 
 /// Windows 下确保 `pnpm.cmd` 存在（转发到同目录 pnpm.cjs）。
