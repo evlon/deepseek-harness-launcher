@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod admin_bridge;
+mod activation;
 mod cli;
 mod commands;
 mod config;

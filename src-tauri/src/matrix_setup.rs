@@ -489,6 +489,73 @@ pub fn handle_scheme_request<R: TauriRuntime>(
             Err(e) => json_resp(StatusCode::OK, serde_json::json!({"ok": false, "error": e.to_string()})),
         };
     }
+    if method == tauri::http::Method::POST && path == "/activate" {
+        // 自动激活：授权码 + PKCE + 本地回调（P3）。后台线程跑完整流程
+        // （起回调 → 打开浏览器 → 等回调 → 换 token → 调 /activate → 写配置 → 重启）。
+        // 与 /submit 一致：任务移交后台，进度走 ops + console 窗口，向导窗口关闭。
+        let h = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::ops::start_op(&h, "matrix-activate", "自动激活数字分身", &["浏览器授权", "认领身份", "写入配置", "重启数字分身", "等待连接"]);
+            crate::ops::mark_step_running(&h, 0);
+            crate::ops::update_step(&h, "等待浏览器授权…");
+            crate::ops::append_log(&h, "已打开浏览器，请在浏览器中完成公司 SSO 登录…");
+            match crate::activation::run_activation(&h) {
+                r if r.ok => {
+                    crate::ops::mark_step_running(&h, 2);
+                    crate::ops::update_step(&h, "已认领分身，写入配置…");
+                    crate::ops::append_log(&h, &format!("✓ 已认领分身账号 {}", r.user_id));
+                    // 配置已由 run_activation 写入 settings.yaml，这里只需重启 + 等连接
+                    let cfg_now = load_cached();
+                    let running = crate::workflow::is_running();
+                    let cur_profile = crate::workflow::current_profile();
+                    crate::ops::mark_step_running(&h, 3);
+                    crate::ops::update_step(&h, "重启数字分身…");
+                    if running && cur_profile.as_deref() == Some(MATRIX_PROFILE) {
+                        crate::workflow::stop();
+                        crate::ops::append_log(&h, "已停止旧数字分身进程（连接参数需重启生效）");
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                    match crate::workflow::launch_with_profile(&h, MATRIX_PROFILE) {
+                        Ok(port) => {
+                            crate::ops::append_log(&h, &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)));
+                            crate::ops::mark_step_running(&h, 4);
+                            crate::ops::update_step(&h, "等待 Matrix 连接…");
+                            match wait_matrix_ready(&h, &cfg_now, std::time::Duration::from_secs(45)) {
+                                Ok(()) => {
+                                    crate::ops::finish_op(&h, &format!("数字分身已激活并可用：{}", r.user_id));
+                                    crate::notify::notify(&h, "数字分身已激活", &format!("{} 已就绪，可在 Matrix 客户端 @ 它试试", r.user_id));
+                                    crate::tray::refresh_sync_menu(&h);
+                                }
+                                Err(e) => {
+                                    crate::ops::finish_op(&h, &format!("数字分身已激活（{}），但连接等待超时：{}", r.user_id, e));
+                                    crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置。连接验证超时（不影响使用），可稍后在托盘查看。", r.user_id));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::ops::fail_op(&h, &format!("分身已激活但启动失败：{e}"));
+                            crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置，但启动失败：{}。可在托盘「启动」重试。", r.user_id, e));
+                        }
+                    }
+                }
+                r => {
+                    crate::ops::fail_op(&h, &r.message);
+                    crate::notify::notify(&h, "自动激活失败", &r.message);
+                }
+            }
+        });
+        // 弹进度窗口 + 关闭向导（与 /submit 一致）
+        let h = app.clone();
+        tauri::async_runtime::spawn(async move {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let _ = crate::console::open_console(&h);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if let Some(win) = h.get_webview_window("matrix-setup") {
+                let _ = win.close();
+            }
+        });
+        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始自动激活"}));
+    }
     if method == tauri::http::Method::POST && path == "/submit" {
         // 解析 body: { homeserverUrl, userId, accessToken, owner }
         let body: serde_json::Value = serde_json::from_slice(&request.into_body()).unwrap_or(serde_json::Value::Null);
@@ -642,7 +709,19 @@ pub fn wizard_html() -> String {
 </head>
 <body>
   <h1>🤖 配置数字分身</h1>
-  <div class="sub">填好下面信息，点「开始配置」，我们自动帮你完成剩下的事。</div>
+  <div class="sub">推荐：点下面「自动激活」，用公司账号一键认领你的数字分身（无需手填任何信息）。</div>
+
+  <div class="section" id="activateSection" style="border-color:var(--green)">
+    <h2 style="color:var(--green)">⭐ 自动激活（推荐）</h2>
+    <div class="hint" style="margin-bottom:10px">用公司 SSO（Keycloak）登录，自动认领你的 @ai-你的邮箱前缀 数字分身。无需密码、无需 token。</div>
+    <button class="btn btn-primary" id="activateBtn" style="width:100%;background:var(--green)">🚀 自动激活数字分身</button>
+    <div class="status" id="activateStatus"></div>
+  </div>
+
+  <div class="section">
+    <h2 style="color:var(--muted)">手动配置（高级）</h2>
+    <div class="hint" style="margin-bottom:10px">如果你无法使用公司 SSO，或需要手动指定账号，用下面的表单。</div>
+  </div>
 
   <div class="section">
     <h2>1. 分身连接信息</h2>
@@ -730,6 +809,19 @@ pub fn wizard_html() -> String {
         st.innerHTML='<span class="ok">✓ 已提交！正在后台配置——进度窗口即将弹出，本窗口会自动关闭。</span>';
       } else { st.className="status err"; st.textContent="✗ "+(j.error||"提交失败"); $("submit").disabled=false; }
     }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("submit").disabled=false; }
+  };
+
+  // 自动激活：调本机服务，打开浏览器授权（窗口随后自动关闭，进度走操作窗口）
+  $("activateBtn").onclick=async()=>{
+    const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
+    $("activateBtn").disabled=true;
+    try{
+      const r=await fetch("http://matrix-setup.localhost/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      const j=await r.json();
+      if(j.ok){
+        st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。本窗口会自动关闭，进度在操作窗口显示。</span>';
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; }
   };
 })();
 </script>
