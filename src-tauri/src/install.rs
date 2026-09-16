@@ -488,10 +488,15 @@ const ICT_INTERNAL_CA_PEM: &str = include_str!("../resources/ict-internal-ca.crt
 
 /// 把内嵌的内网根 CA 导入 Windows 系统信任库（Chrome/Edge 走这里）。
 ///
-/// 幂等：certutil -addstore 重复导入同名证书不报错（覆盖更新）。
+/// 流程（先查后装，避免重复弹 UAC）：
+/// 1. 证书落到磁盘（certutil 需要文件路径）
+/// 2. **只读检查** `certutil -store Root`：若已含本根 CA → 直接 Ok，不弹 UAC
+/// 3. **UAC 提权导入**：`ShellExecuteExW("runas")` 拉起提权的 cmd 执行
+///    `certutil -addstore -f Root <cert>`，弹系统原生 UAC 对话框
+/// 4. 回读验证信任库，确认确实已入「受信任的根证书颁发机构」
 ///
 /// 返回 `Result<(), String>`：Ok = 已成功导入（或验证确认已存在）；Err = 导入失败，
-/// 错误信息已尽量精确定位（权限不足 / certutil 缺失 / 证书内容异常）。
+/// 错误信息已尽量精确定位（用户取消 UAC / certutil 缺失 / 证书内容异常）。
 /// 供 install_all 与托盘「重装内网证书」菜单共用，保证两处行为一致。
 pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
     #[cfg(windows)]
@@ -511,65 +516,41 @@ pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> 
                 .map_err(|e| format!("写入根证书失败：{e}"))?;
         }
 
-        // 2. certutil -addstore -f "Root" <cert>：导入系统信任库
-        //    Chrome/Edge 在 Windows 上读系统信任库，导入后即绿锁。
-        //    Firefox 用独立 NSS 库，暂不处理（同事主要用 Chrome/Edge）。
-        let out = Command::new("certutil")
-            .arg("-addstore")
-            .arg("-f")
-            .arg("Root")
-            .arg(&cert_path)
-            .output();
-
-        match out {
-            Ok(o) if o.status.success() => {
-                log::info!("内网根 CA 已导入系统信任库：{}", cert_path.display());
+        // 2. 只读预检：证书已在信任库 → 直接成功，不弹 UAC。
+        //    certutil -store Root 是只读操作，不需要管理员权限。
+        match certutil_has_root_ca() {
+            Ok(true) => {
+                log::info!("内网根 CA 已存在于系统信任库，跳过导入");
+                return Ok(());
             }
-            Ok(o) => {
-                // 失败：解析 stderr 定位原因。certutil 权限不足时 stderr 含
-                // "Access is denied" / "拒绝访问" / "0x80070005"（E_ACCESSDENIED）。
-                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-                let combined = format!("{stdout}\n{stderr}");
-                log::warn!("certutil 导入根 CA 返回非零：{combined}");
-                if combined.contains("Access is denied")
-                    || combined.contains("拒绝访问")
-                    || combined.contains("0x80070005")
-                    || combined.contains("Administrator")
-                    || combined.contains("管理员")
-                {
-                    return Err("导入内网根证书需要管理员权限：请右键托盘图标 →「重装内网证书」，并以管理员身份运行 launcher".to_string());
-                }
-                return Err(format!("certutil 导入根 CA 失败：{}", stderr.trim()));
+            Ok(false) => {
+                log::info!("内网根 CA 不在信任库，进入 UAC 提权导入");
             }
             Err(e) => {
-                log::warn!("调用 certutil 失败：{e}");
-                return Err(format!("调用 certutil 失败（系统可能缺少 certutil）：{e}"));
+                // 预检失败（如 certutil 缺失）不能直接当作「没装」——
+                // 下面提权导入会再次暴露真实错误。这里仅记录，继续走导入流程。
+                log::warn!("预检系统信任库失败（继续尝试导入）：{e}");
             }
         }
 
-        // 3. 验证闭环：读回系统信任库，确认证书确实在「受信任的根证书颁发机构」里。
+        // 3. UAC 提权导入：用 ShellExecuteExW 的 runas verb 拉起提权进程执行
+        //    certutil -addstore -f Root <cert>。弹系统原生 UAC 对话框。
+        //    Chrome/Edge 在 Windows 上读系统信任库，导入后即绿锁。
+        //    Firefox 用独立 NSS 库，暂不处理（同事主要用 Chrome/Edge）。
+        elevate_certutil_addstore(&cert_path)?;
+
+        // 4. 验证闭环：读回系统信任库，确认证书确实在「受信任的根证书颁发机构」里。
         //    不验证的话，certutil 报成功但实际没进信任库（例如被组策略拦截）时会误报绿锁。
-        let verify = Command::new("certutil")
-            .arg("-store")
-            .arg("Root")
-            .output();
-        match verify {
-            Ok(v) if v.status.success() => {
-                let text = String::from_utf8_lossy(&v.stdout).to_string();
-                // 按 CN 精确匹配我们的根 CA（避免误判其它同名证书）
-                if text.contains("ICT Internal AI Root CA") {
-                    log::info!("验证通过：内网根 CA 已在系统信任库中");
-                    Ok(())
-                } else {
-                    Err("验证失败：certutil 报告成功，但未在系统信任库中找到「ICT Internal AI Root CA」".to_string())
-                }
+        match certutil_has_root_ca() {
+            Ok(true) => {
+                log::info!("验证通过：内网根 CA 已在系统信任库中");
+                Ok(())
             }
-            Ok(v) => {
-                let stderr = String::from_utf8_lossy(&v.stderr).to_string();
-                Err(format!("验证系统信任库失败：{}", stderr.trim()))
-            }
-            Err(e) => Err(format!("验证系统信任库时调用 certutil 失败：{e}")),
+            Ok(false) => Err(
+                "验证失败：导入命令已执行，但未在系统信任库中找到「ICT Internal AI Root CA」"
+                    .to_string(),
+            ),
+            Err(e) => Err(format!("验证系统信任库失败：{e}")),
         }
     }
     #[cfg(not(windows))]
@@ -578,6 +559,104 @@ pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> 
         log::info!("非 Windows 平台，跳过根 CA 导入");
         Ok(())
     }
+}
+
+/// 只读检查系统信任库是否已含本内网根 CA（按 CN 精确匹配，避免误判同名证书）。
+///
+/// `certutil -store Root` 是只读操作，不需要管理员权限，因此可放心前置预检。
+/// 返回 Ok(true) = 已存在；Ok(false) = 不存在；Err = 查询失败（如 certutil 缺失）。
+#[cfg(windows)]
+fn certutil_has_root_ca() -> Result<bool, String> {
+    let out = Command::new("certutil")
+        .arg("-store")
+        .arg("Root")
+        .output()
+        .map_err(|e| format!("调用 certutil 失败（系统可能缺少 certutil）：{e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        return Err(format!("certutil -store Root 返回非零：{}", stderr.trim()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    Ok(text.contains("ICT Internal AI Root CA"))
+}
+
+/// 通过 UAC 提权执行 `certutil -addstore -f Root <cert>`。
+///
+/// 用 `ShellExecuteExW` 的 `runas` verb 拉起**提权的** `cmd.exe /C certutil ...`，
+/// 触发系统原生 UAC 对话框。launcher 本体保持普通权限，只在导入这一瞬间提权。
+///
+/// 关键行为：
+/// - 同步等待：`ShellExecuteExW` 返回 `hProcess` 进程句柄，`WaitForSingleObject`
+///   等提权进程结束，否则无法立即回读验证；
+/// - 用户点「否」/关闭 UAC → `ShellExecuteExW` 返回失败且 `GetLastError` =
+///   `ERROR_CANCELLED`(1223) → 友好提示；
+/// - `SW_HIDE` 隐藏 cmd 窗口，避免闪黑框。
+#[cfg(windows)]
+fn elevate_certutil_addstore(cert_path: &std::path::Path) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHELLEXECUTEINFOW_0,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    // 命令：certutil -addstore -f Root "<cert>"  —— 用引号包裹证书路径，
+    // 避免路径含空格时被 cmd 拆错。整个命令经 runas 提权执行。
+    let cert = cert_path.to_string_lossy();
+    let cmd_line = format!("certutil -addstore -f Root \"{cert}\"");
+
+    // 宽字符（Windows 需 UTF-16 且以 NUL 结尾的参数）
+    let operation: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
+    let file: Vec<u16> = "cmd.exe".encode_utf16().chain(std::iter::once(0)).collect();
+    let params: Vec<u16> = format!("/C \"{cmd_line}\"")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    log::info!("弹 UAC 提权导入根 CA：{cmd_line}");
+
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS, // 要拿到 hProcess，才能等待进程结束
+        hwnd: std::ptr::null_mut(),
+        lpVerb: operation.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: params.as_ptr(),
+        lpDirectory: std::ptr::null(),
+        nShow: SW_HIDE as i32,
+        hInstApp: std::ptr::null_mut(),
+        lpIDList: std::ptr::null_mut(),
+        lpClass: std::ptr::null(),
+        hkeyClass: std::ptr::null_mut(), // HKEY = *mut c_void
+        dwHotKey: 0,
+        Anonymous: SHELLEXECUTEINFOW_0 {
+            hMonitor: std::ptr::null_mut(),
+        },
+        hProcess: std::ptr::null_mut(),
+    };
+
+    let ok = unsafe { ShellExecuteExW(&mut sei) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_CANCELLED {
+            return Err(
+                "已取消：你在系统提示中选择了「否」，未导入内网证书。可在托盘「重装内网证书」重试"
+                    .to_string(),
+            );
+        }
+        return Err(format!("UAC 提权启动失败（错误码 {err}）：无法弹出管理员授权对话框"));
+    }
+
+    // 同步等待提权进程结束（certutil 导入是毫秒级，但必须等它写完才能回读验证）
+    if !sei.hProcess.is_null() {
+        unsafe {
+            // 无限等待；certutil 导入极快，正常情况下秒级返回
+            WaitForSingleObject(sei.hProcess, 0xFFFFFFFF);
+            CloseHandle(sei.hProcess);
+        }
+    }
+
+    Ok(())
 }
 
 /// Windows 下确保 `pnpm.cmd` 存在（转发到同目录 pnpm.cjs）。

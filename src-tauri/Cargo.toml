@@ -39,8 +39,11 @@ arboard = "3.6.1"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Globalization",
+  "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_System_Time",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 # 本机编译内存受限：`windows`/`syn` 等巨型 crate 冷编译会内存耗尽。
