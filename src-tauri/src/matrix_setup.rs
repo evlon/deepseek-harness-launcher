@@ -653,6 +653,19 @@ pub struct WizardState {
     pub user_id: String,
     pub access_token_set: bool,
     pub owner: String,
+    /// 订阅/安装清单差异（待装或待更新的推荐插件），激活成功后引导去装。
+    pub pending_plugins: Vec<serde_json::Value>,
+}
+
+/// 计算订阅/安装清单差异：服务端推荐清单 vs 本地已装清单。
+/// 返回 [{name, installed, latest, action}]，action ∈ install | update。
+fn pending_plugin_diff<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig) -> Vec<serde_json::Value> {
+    let state = crate::sync::load_state(app, cfg);
+    let Some(recommended) = state.cached_config.as_ref().map(|c| c.plugins.clone()) else {
+        return Vec::new();
+    };
+    let installed = crate::sync::installed_plugins_current_profile_with_versions(app, cfg);
+    crate::sync::pending_with_updates(&recommended, &installed, &state.plugin_latest_versions)
 }
 
 /// 收集向导初始数据（读当前配置 + 预置）。
@@ -671,6 +684,7 @@ pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherCon
         user_id: acc.user_id,
         access_token_set: !acc.access_token.is_empty() && acc.access_token != PENDING_CONFIG,
         owner: acc.owner,
+        pending_plugins: pending_plugin_diff(app, cfg),
     }
 }
 
@@ -749,6 +763,12 @@ pub fn wizard_html() -> String {
     </div>
   </div>
 
+  <div class="section" id="pendingSection" style="display:none">
+    <h2 style="color:var(--amber)">📋 订阅 / 安装清单</h2>
+    <div class="hint" style="margin-bottom:8px">你的账号已订阅以下能力，但本地尚未安装或版本落后。点「安装 / 修复」会自动补齐。</div>
+    <div id="pendingList" style="font-size:12px"></div>
+  </div>
+
   <button class="btn btn-primary" id="submit" style="width:100%">开始配置</button>
   <div class="status" id="status"></div>
 
@@ -765,6 +785,21 @@ pub fn wizard_html() -> String {
     accessTokenSet=!!s.access_token_set;
     if(s.status==="configured"){ $("status").innerHTML='<span class="ok">已配置。可直接修改后重新提交。</span>'; }
     else if(s.status==="not-installed"){ $("status").innerHTML='<span class="err">数字分身插件未安装——请先关闭本窗口，在托盘点「安装 / 修复」。</span>'; }
+    // 订阅/安装清单差异
+    if(s.pending_plugins && s.pending_plugins.length){
+      const list=$("pendingList"); list.innerHTML="";
+      s.pending_plugins.forEach(p=>{
+        const tag = p.action==="update"
+          ? '<span style="color:var(--amber)">待更新</span>'
+          : '<span style="color:var(--blue)">待安装</span>';
+        const ver = p.installed ? ` <span style="color:var(--muted)">（已装 ${esc(p.installed)} → ${esc(p.latest||"最新")}）</span>` : "";
+        const div=document.createElement("div");
+        div.style.cssText="padding:4px 0;border-bottom:1px solid var(--line)";
+        div.innerHTML=`${tag} <strong>${esc(p.name)}</strong>${ver}`;
+        list.appendChild(div);
+      });
+      $("pendingSection").style.display="block";
+    }
   }).catch(()=>{});
 
   // token 获取模式切换
