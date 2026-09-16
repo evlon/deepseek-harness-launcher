@@ -30,7 +30,7 @@
 //! | 花名册 | `ai-roster.ict.cmcc` | `roster.ai.ict.cmcc` |
 //! | 测试台 | `ai-test.ict.cmcc` | `test.ai.ict.cmcc` |
 //! | 网关控制台 | `ai-gateway.ict.cmcc` | `gateway.ai.ict.cmcc` |
-//! | 认证 | `ai-auth.ict.cmcc` | `auth.ai.ict.cmcc` |
+//! | 认证 | `ai-auth.ict.cmcc` | `auth.ict.cmcc` |
 //!
 //! **注意 `im-ipm.ict.cmcc`（Matrix homeserver）不在迁移范围**——
 //! 它是承载网地址（172.21.163.150），新旧环境共用，没有 `.ai.` 版本。
@@ -49,7 +49,7 @@ pub const DOMAIN_MIGRATIONS: &[(&str, &str)] = &[
     ("ai-test.ict.cmcc", "test.ai.ict.cmcc"),
     ("ai-gateway-admin.ict.cmcc", "gateway-admin.ai.ict.cmcc"),
     ("ai-gateway.ict.cmcc", "gateway.ai.ict.cmcc"),
-    ("ai-auth.ict.cmcc", "auth.ai.ict.cmcc"),
+    ("ai-auth.ict.cmcc", "auth.ict.cmcc"),
 ];
 
 /// 把单个 URL 里的旧域名换成新域名；无需迁移时原样返回。

@@ -101,7 +101,7 @@ node server.js --port 8080 --token 你的管理口令
 | 花名册 | `http://roster.ai.ict.cmcc` | ~~`http://ai-roster.ict.cmcc`~~ |
 | 数字人测试台 | `http://test.ai.ict.cmcc` | ~~`http://ai-test.ict.cmcc`~~ |
 | 网关控制台 | `http://gateway.ai.ict.cmcc` | ~~`http://ai-gateway.ict.cmcc`~~ |
-| 认证（Keycloak） | `http://auth.ai.ict.cmcc` | ~~`http://ai-auth.ict.cmcc`~~ |
+| 认证（Keycloak） | `https://auth.ict.cmcc` | ~~`http://ai-auth.ict.cmcc`~~ |
 
 **不迁移的域名**（新旧环境共用，实测仍可用）：
 

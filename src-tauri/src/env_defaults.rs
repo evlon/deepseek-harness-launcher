@@ -87,7 +87,7 @@ pub const ENV_DEFAULTS: &[EnvDefault] = &[
     // launcher 的 activation.rs 从 settings.yaml 的 matrix-activation namespace 读这些地址。
     // 都是环境地址（统一值），非个人凭据，可下发。client_secret 属敏感凭据，
     // 不经这里下发（从环境变量 DSH_TWIN_CLIENT_SECRET 读）。
-    EnvDefault { namespace: "matrix-activation", key: "keycloakIssuer", value: "http://auth.ai.ict.cmcc/realms/himarket" },
+    EnvDefault { namespace: "matrix-activation", key: "keycloakIssuer", value: "https://auth.ict.cmcc/realms/himarket" },
     EnvDefault { namespace: "matrix-activation", key: "clientId", value: "matrix-twin-activation" },
     EnvDefault { namespace: "matrix-activation", key: "activateEndpoint", value: "http://im.ai.ict.cmcc/_matrix/activate" },
     EnvDefault { namespace: "matrix-activation", key: "homeserverUrl", value: "https://im-ipm.ict.cmcc" },
