@@ -135,13 +135,18 @@ fn main() {
             // 配置
             config::ensure_base_dir(&handle);
             let cfg = config::load_config(&handle);
-            log::info!("DeepSeek Harness Launcher 启动");
+            log::info!("DeepSeek Harness Launcher 启动，版本 v{}", env!("CARGO_PKG_VERSION"));
+
+            // ⚠️ 顺序关键：先恢复状态，再建托盘菜单。
+            // 此前 build_tray 在 load_from_disk 之前，导致菜单在「启动瞬间」一次性构建：
+            // - 残留的 Running op 尚未被转成 Failed → has_running() 误判为 true → 启动/安装被灰；
+            // - RUNNING（内存态）尚未恢复 → 停止/打开页面被灰。
+            // 先恢复，再建菜单，按钮状态才正确。
+            ops::load_from_disk(&handle);
+            workflow::restore_from_disk(&handle);
 
             // 托盘
             tray::build_tray(&handle)?;
-
-            // 恢复上次操作状态（重启后托盘/窗口可见上次结果）
-            ops::load_from_disk(&handle);
 
             // 首次运行 / 未配置引导（小白第一入口，仅一次）：
             // ① dsh 未安装（全新机器）→ 弹「首次使用」欢迎窗口（说明程序已在托盘 + 一键安装），

@@ -42,6 +42,130 @@ struct Running {
 
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 
+/// 运行状态落盘路径（`<dsh_home>/running-state.json`）。
+///
+/// 为什么需要：RUNNING 原本是纯内存 static，launcher 重启后即丢失——
+/// 但 Harness（dsh web）进程其实还在后台活着。导致重启后「停止 / 打开页面」
+/// 永远灰（launcher 误判「未在运行」）。落盘后重启时恢复 PID/port/profile，
+/// 并校验 PID 存活，让重启后的托盘菜单状态与真实进程一致。
+fn running_state_path<R: Runtime>(app: &AppHandle<R>) -> std::path::PathBuf {
+    crate::config::dsh_home(app, &crate::config::load_cached()).join("running-state.json")
+}
+
+/// 运行状态落盘结构（仅需要可恢复「停止/打开」的最小字段）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RunningState {
+    pid: u32,
+    port: u16,
+    profile: String,
+}
+
+/// 把当前 RUNNING 状态落盘（launch 成功后、stop 后调用）。
+///
+/// 不落盘 token（每次启动随机、且 access_url 能惰性补抓）；不落盘 log_path。
+fn persist_running<R: Runtime>(app: &AppHandle<R>) {
+    let guard = RUNNING.lock().unwrap();
+    let Some(r) = guard.as_ref() else {
+        // 未运行：删除状态文件（清理）
+        let _ = std::fs::remove_file(running_state_path(app));
+        return;
+    };
+    let path = running_state_path(app);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let state = RunningState {
+        pid: r.pid,
+        port: r.port,
+        profile: r.profile.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&state) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// 启动时从磁盘恢复运行状态（在 build_tray 之前调用，见 main.rs）。
+///
+/// 恢复后校验 PID 存活：仍存活 → 托盘「停止 / 打开页面」可用；已退出 → 清理。
+/// token 恢复为 None，交由 access_url 惰性补抓（读 dsh 启动日志）。
+pub fn restore_from_disk<R: Runtime>(app: &AppHandle<R>) {
+    let path = running_state_path(app);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(state) = serde_json::from_str::<RunningState>(&text) else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    if !pid_alive(state.pid) {
+        log::info!("恢复运行状态：PID={} 已退出，清理（Harness 未在运行）", state.pid);
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    log::info!(
+        "恢复运行状态：PID={}, 端口={}, profile={}（Harness 仍在运行）",
+        state.pid,
+        state.port,
+        state.profile
+    );
+    // 恢复 token：从日志目录扫描含「该端口 ?token=」的最新启动日志。
+    // 若无（旧版 dsh 无 token 机制 / 日志已归档），token=None，URL 不带参数。
+    let (token, log_path) = scan_token_for_port(app, state.port);
+    *RUNNING.lock().unwrap() = Some(Running {
+        pid: state.pid,
+        port: state.port,
+        profile: state.profile,
+        token,
+        log_path,
+    });
+}
+
+/// 从 dsh 日志目录扫描出「含指定端口 token」的最新启动日志，返回 (token, 日志路径)。
+///
+/// dsh 启动日志文件名形如 `dsh-launch-<launcherPID>.log`，恢复场景下我们不知道
+/// 原来的 launcher PID，只能扫描目录。匹配条件：日志内容含 `:{port}/?token=`
+/// （access_url 拼出的那行）。取 mtime 最新的那份（多次启动时对应最新进程）。
+fn scan_token_for_port<R: Runtime>(
+    app: &AppHandle<R>,
+    port: u16,
+) -> (Option<String>, PathBuf) {
+    let dir = crate::config::dsh_home(app, &crate::config::load_cached()).join("logs");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return (None, PathBuf::new());
+    };
+    let marker = format!(":{port}/?token=");
+    let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with("dsh-launch-") || !name.ends_with(".log") {
+            continue;
+        }
+        let path = e.path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !text.contains(&marker) {
+            continue;
+        }
+        // 用该文件里该 marker 之后提取 token（extract_token_from_log 取第一个 ?token=）
+        let token = extract_token_from_log(&text);
+        let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().map(|(t, _, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, token.unwrap_or_default(), path));
+        }
+    }
+    match best {
+        Some((_, token, path)) => {
+            if token.is_empty() {
+                (None, path)
+            } else {
+                (Some(token), path)
+            }
+        }
+        None => (None, PathBuf::new()),
+    }
+}
+
 /// 最近一次成功启动的端口（供「打开 Harness 页面」）。
 pub fn last_port() -> Option<u16> {
     RUNNING.lock().unwrap().as_ref().map(|r| r.port)
@@ -313,6 +437,7 @@ pub fn launch_with_profile<R: Runtime>(app: &AppHandle<R>, profile: &str) -> Res
         profile,
         crate::config::dsh_home(app, &cfg).display()
     );
+    persist_running(app);
     Ok(port)
 }
 
