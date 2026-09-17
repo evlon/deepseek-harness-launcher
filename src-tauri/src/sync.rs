@@ -96,6 +96,17 @@ pub struct SyncState {
     /// 否则「缓存 == 已装版本」会永远跳过查询，registry 更新了也发现不了。
     #[serde(default)]
     pub plugin_versions_checked_at: Option<String>,
+    /// 服务端「曾经推荐过」的插件历史集合（跨多次同步累积，只增不减）。
+    ///
+    /// 用途：精确判定「管理员下架」——只有**曾出现在服务端推荐清单、现在被移除**
+    /// 的插件才提示卸载（口径 A）。同事自己手动装的插件从未进过此集合，
+    /// 因此绝不会被误提示卸载。
+    #[serde(default)]
+    pub server_seen_plugins: std::collections::HashSet<String>,
+    /// 最近一次同步算出的「建议卸载」清单（曾推荐过、本次已移除）。
+    /// 托盘渲染时直接读这个值（离线/未同步时保留上次结果）。
+    #[serde(default)]
+    pub last_removed: Vec<String>,
 }
 
 // ---------- 路径 ----------
@@ -420,22 +431,32 @@ fn installed_plugin_version<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig
         .unwrap_or_default()
 }
 
-/// 当前 profile 已装但未完成配置的 bundle 插件（patch 里含占位 token `pending-config`）。
-/// 用于托盘提示「已装待配置」——插件启用（设置页可配置）但必需参数未配，
-/// 配置后（设置页/环境变量/编辑 patch）自动生效。
-pub fn disabled_installed_plugins<R: Runtime>(
+/// 插件禁用/待配置的两种原因（用于托盘区分展示）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginIssueKind {
+    /// `cordis.patch.yml` 含 `disabled: true` → 被 DSH 兜底禁用，**影响启动**。
+    DisabledByDsh,
+    /// 含占位 token `pending-config` → 已装但必需参数未配置，**待配置**。
+    PendingConfig,
+}
+
+/// 扫描当前 profile 下「有问题」的 bundle 插件，返回 (插件名, 原因)。
+///
+/// 遍历 node_modules 顶层 + @deepseek-ai scope，读每个包的 `cordis.patch.yml`：
+/// - 含 `disabled: true` → `DisabledByDsh`（影响启动，DSH 已客观判定它坏了/不可用）
+/// - 含 `pending-config` → `PendingConfig`（已装未配置）
+fn scan_plugin_issues<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
-) -> Vec<String> {
+) -> Vec<(String, PluginIssueKind)> {
     let profile = resolve_profile(cfg);
     let profile_dir = dsh_home(app, cfg).join("profiles").join(profile);
     let nm = profile_dir.join("node_modules");
-    let mut out: Vec<String> = Vec::new();
-    let scan = |dir: &Path, scope: Option<&str>| -> Vec<String> {
+    let mut out: Vec<(String, PluginIssueKind)> = Vec::new();
+    let scan = |dir: &Path, scope: Option<&str>, out: &mut Vec<(String, PluginIssueKind)>| {
         let Ok(rd) = std::fs::read_dir(dir) else {
-            return Vec::new();
+            return;
         };
-        let mut names = Vec::new();
         for e in rd.flatten() {
             if !e.path().is_dir() {
                 continue;
@@ -447,27 +468,59 @@ pub fn disabled_installed_plugins<R: Runtime>(
             let Ok(text) = std::fs::read_to_string(&patch) else {
                 continue;
             };
-            // 占位 token（launcher 补的）或 disabled → 视为未配置
-            if text.contains("pending-config") || text.contains("disabled: true") {
-                let leaf = e.file_name().to_string_lossy().to_string();
-                let full = match scope {
-                    Some(s) => format!("@{s}/{leaf}"),
-                    None => leaf.clone(),
-                };
-                names.push(full);
+            let leaf = e.file_name().to_string_lossy().to_string();
+            let full = match scope {
+                Some(s) => format!("@{s}/{leaf}"),
+                None => leaf.clone(),
+            };
+            // disabled 优先于 pending-config（前者语义更重：影响启动）
+            if text.contains("disabled: true") {
+                out.push((full, PluginIssueKind::DisabledByDsh));
+            } else if text.contains("pending-config") {
+                out.push((full, PluginIssueKind::PendingConfig));
             }
         }
-        names
     };
-    out.extend(scan(&nm, None));
+    scan(&nm, None, &mut out);
     if let Ok(scoped) = std::fs::read_dir(nm.join("@deepseek-ai")) {
         for s in scoped.flatten() {
             if s.path().is_dir() {
-                out.extend(scan(&s.path(), Some("deepseek-ai")));
+                scan(&s.path(), Some("deepseek-ai"), &mut out);
             }
         }
     }
     out
+}
+
+/// 当前 profile 已装但未完成配置的 bundle 插件（patch 里含占位 token `pending-config`）。
+/// 用于托盘提示「已装待配置」——插件启用（设置页可配置）但必需参数未配，
+/// 配置后（设置页/环境变量/编辑 patch）自动生效。
+pub fn disabled_installed_plugins<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+) -> Vec<String> {
+    scan_plugin_issues(app, cfg)
+        .into_iter()
+        .filter(|(_, kind)| *kind == PluginIssueKind::PendingConfig)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// 当前 profile 被 DSH 兜底禁用（`disabled: true`）的 bundle 插件 —— **影响启动**。
+///
+/// 这是场景②的判定数据源（用户选 1B）：`disabled: true` 是 DSH 已经做出的客观判定
+/// （`install.rs::repair_missing_bundle_patches` 会为缺 patch 的插件补最小 patch 并禁用），
+/// 最不容易误报。不管插件是管理员要求装的还是同事自己装的，只要被 DSH 禁用、
+/// 客观影响启动，都应展示给用户决定是否一键清理。
+pub fn startup_broken_plugins<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+) -> Vec<String> {
+    scan_plugin_issues(app, cfg)
+        .into_iter()
+        .filter(|(_, kind)| *kind == PluginIssueKind::DisabledByDsh)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// 待安装清单 = 服务端推荐 − 已装（保推荐顺序，去重；任一 profile 装了即算已装）。
@@ -512,6 +565,84 @@ pub fn pending_with_updates(
         }));
     }
     out
+}
+
+/// 计算「管理员已下架、建议卸载」的插件清单。
+///
+/// **口径 A（唯一正确口径）**：差集 = `上次缓存的服务端清单` − `本次服务端清单`，
+/// 且**只保留曾出现在服务端推荐清单里的插件**（`seen` 集合）。
+///
+/// 安全边界（用户明确要求的硬约束）：
+/// - 管理员要求装的（曾在服务端清单里）→ 被下架才提示卸载；
+/// - 同事自己手动装的（从未进过服务端清单）→ **绝不提示、绝不卸载**。
+///
+/// 参数：
+/// - `previous`：上一次同步缓存的推荐清单（`state.cached_config.plugins`）；
+/// - `current`：本次拉到的推荐清单；
+/// - `seen`：历史累积的服务端推荐集合（含本次，调用方需先并入）。
+///
+/// 返回保序去重的插件名列表。
+pub fn plugins_to_remove(
+    previous: &[String],
+    current: &[String],
+    seen: &HashSet<String>,
+) -> Vec<String> {
+    let current_set: HashSet<&str> = current.iter().map(|s| s.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut emitted: HashSet<&str> = HashSet::new();
+    for name in previous {
+        // 本次清单里还在 → 不是下架
+        if current_set.contains(name.as_str()) {
+            continue;
+        }
+        // 未在服务端推荐集合里出现过（同事自己装的）→ 不碰
+        if !seen.contains(name.as_str()) {
+            continue;
+        }
+        if emitted.insert(name.as_str()) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+/// 卸载一个插件：`node <dsh>/lib/bin.js plugin --profile <当前profile> remove <name>`。
+///
+/// 与 `install_plugin` 对称：同样的 node/dsh 定位、同样的 child_env、
+/// 同样的 spawn_blocking 包裹（避免阻塞 async 运行时）。
+pub async fn uninstall_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Result<(), String> {
+    let cfg = load_cached();
+    let profile = resolve_profile(&cfg);
+    let node = effective_node_path(app, &cfg);
+    let dsh_bin = dsh_binary_path(app);
+    if !node.exists() || !dsh_bin.exists() {
+        return Err("NODE_OR_DSH_NOT_FOUND: 请先「安装 / 修复」".to_string());
+    }
+    let env = crate::workflow::child_env(app, &cfg)?;
+    let mut cmd = std::process::Command::new(&node);
+    cmd.arg(&dsh_bin)
+        .arg("plugin")
+        .arg("--profile")
+        .arg(&profile)
+        .arg("remove")
+        .arg(name)
+        .current_dir(dsh_install_path(app))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    let output = tauri::async_runtime::spawn_blocking(move || cmd.output()).await
+        .map_err(|e| format!("UNINSTALL_SPAWN_FAILED: {e}"))?;
+    let output = output.map_err(|e| format!("UNINSTALL_LAUNCH_FAILED: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::error!("卸载插件 {name} 失败（exit={}）：{}", output.status, stderr.trim());
+        return Err(format!("PLUGIN_UNINSTALL_FAILED: {name}（exit={}），详情见日志", output.status));
+    }
+    log::info!("插件已卸载：{name}（profile={profile}）");
+    Ok(())
 }
 
 /// 简单版本比较（a > b → true）。容忍 rc/beta 预发布。
@@ -679,6 +810,8 @@ pub struct SyncOutcome {
     pub pending: Vec<String>,
     /// 本次是否发生了「待装清单变化」（用于通知去重）。
     pub pending_changed: bool,
+    /// 管理员已下架、建议卸载的插件（曾推荐过、本次清单已移除）。
+    pub removed: Vec<String>,
 }
 
 /// 执行一次同步：拉取 → 对比 → 缓存 → 应用菜单策略 → 上报。
@@ -720,16 +853,30 @@ pub async fn sync_once<R: Runtime>(
             apply_server_defaults(app, &config);
             // 缓存菜单策略（托盘渲染据此展示；用户配置永不被覆盖）
             state.cached_managed_menu = config.managed_menu.clone();
+            // 计算「管理员下架」：旧清单 − 新清单，且只针对曾推荐过的插件（口径 A）。
+            // 必须在覆盖 cached_config 之前用旧值做差集。
+            let previous_plugins: Vec<String> = state
+                .cached_config
+                .as_ref()
+                .map(|c| c.plugins.clone())
+                .unwrap_or_default();
+            // 先把本次清单并入历史集合（跨会话累积，只增不减）
+            for p in &config.plugins {
+                state.server_seen_plugins.insert(p.clone());
+            }
+            let removed = plugins_to_remove(&previous_plugins, &config.plugins, &state.server_seen_plugins);
             state.cached_config = Some(config.clone());
             state.last_installed = installed_all.clone();
+            state.last_removed = removed.clone();
             state.last_sync_at = Some(now_iso());
             save_state(app, cfg, &state);
             // 菜单策略可能变化 → 刷新托盘
             tray::refresh_sync_menu(app);
             log::info!(
-                "同步成功：应装 {} 个插件，本机待装 {} 个；菜单策略 {}",
+                "同步成功：应装 {} 个插件，本机待装 {} 个；建议卸载 {} 个；菜单策略 {}",
                 config.plugins.len(),
                 pending.len(),
+                removed.len(),
                 if config.managed_menu.as_ref().map(|m| m.enabled).unwrap_or(false) { "启用" } else { "关闭" }
             );
             let pending_hash = hash_list(&pending);
@@ -737,6 +884,7 @@ pub async fn sync_once<R: Runtime>(
                 pending_changed: last_notified_hash.map(|h| h != pending_hash).unwrap_or(!pending.is_empty()),
                 config: Some(config),
                 pending,
+                removed,
             }
         }
         Err(e) => {
@@ -756,6 +904,7 @@ pub async fn sync_once<R: Runtime>(
                 pending_changed: false,
                 config: state.cached_config.clone(),
                 pending,
+                removed: Vec::new(),
             }
         }
     };
@@ -924,6 +1073,22 @@ pub async fn spawn_sync_loop<R: Runtime>(app: &AppHandle<R>) {
             notify::notify(app, "Harness 推荐插件", &msg);
             let hash = crate::sync::hash_list(&outcome.pending);
             *LAST_NOTIFIED.lock().unwrap() = Some(hash);
+        }
+        // 管理员下架 → 提示一次（带独立去重，避免每轮重复弹）
+        if !outcome.removed.is_empty() {
+            static LAST_REMOVED_NOTIFIED: std::sync::Mutex<Option<u64>> =
+                std::sync::Mutex::new(None);
+            let removed_hash = crate::sync::hash_list(&outcome.removed);
+            let mut last_removed = LAST_REMOVED_NOTIFIED.lock().unwrap();
+            if *last_removed != Some(removed_hash) {
+                let msg = format!(
+                    "管理员已下架 {} 个插件：{}\n请在托盘「同步 / 推荐插件 → 建议卸载」确认清理",
+                    outcome.removed.len(),
+                    outcome.removed.join(", ")
+                );
+                notify::notify(app, "插件已下架", &msg);
+                *last_removed = Some(removed_hash);
+            }
         }
         // 无论是否有变化都刷新托盘（安装后 pending 归零也刷新）
         tray::refresh_sync_menu(app);
@@ -1186,6 +1351,41 @@ mod tests {
         let rec = vec!["dsh-a".to_string(), "dsh-b".to_string()];
         let installed = vec!["dsh-a".to_string()]; // matrix profile 装了 dsh-a
         assert_eq!(pending_plugins(&rec, &installed), vec!["dsh-b".to_string()]);
+    }
+
+    #[test]
+    fn plugins_to_remove_only_removes_server_seen() {
+        // 口径 A：只提示「曾推荐过、现被移除」的插件
+        let previous = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let current = vec!["a".to_string()]; // b、c 被移除
+        let seen: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(plugins_to_remove(&previous, &current, &seen), vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn plugins_to_remove_ignores_user_installed() {
+        // 同事自己装的插件（从未进 seen 集合）即使本地存在也不提示卸载
+        let previous = vec!["a".to_string(), "user-plugin".to_string()];
+        let current = vec!["a".to_string()];
+        // seen 里只有 a（user-plugin 从未被服务端推荐过）
+        let seen: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(plugins_to_remove(&previous, &current, &seen), Vec::<String>::new());
+    }
+
+    #[test]
+    fn plugins_to_remove_empty_when_nothing_removed() {
+        let previous = vec!["a".to_string(), "b".to_string()];
+        let current = vec!["a".to_string(), "b".to_string()];
+        let seen: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert!(plugins_to_remove(&previous, &current, &seen).is_empty());
+    }
+
+    #[test]
+    fn plugins_to_remove_orders_and_dedups() {
+        let previous = vec!["x".to_string(), "y".to_string(), "x".to_string()];
+        let current: Vec<String> = vec![];
+        let seen: HashSet<String> = ["x", "y"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(plugins_to_remove(&previous, &current, &seen), vec!["x".to_string(), "y".to_string()]);
     }
 
     #[test]

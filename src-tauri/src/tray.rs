@@ -475,6 +475,8 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
 
     let mut status_items: Vec<MenuItem<R>> = Vec::new();
     let mut install_items: Vec<MenuItem<R>> = Vec::new();
+    let mut remove_items: Vec<MenuItem<R>> = Vec::new();
+    let mut broken_items: Vec<MenuItem<R>> = Vec::new();
 
     // 已装但未完成配置的插件提示（如 dsh-matrix-agent 未配 accessToken）
     let disabled_plugins = crate::sync::disabled_installed_plugins(app, &cfg);
@@ -484,6 +486,32 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
             format!("sync-disabled-{}", d.replace(['/', '@'], "_")),
             format!("⚙️ {d} 已装待配置（设置页配置参数后生效）"),
             false,
+            None::<&str>,
+        )?);
+    }
+
+    // ⚠️ 影响启动：被 DSH 兜底禁用（disabled: true）的插件 —— 不管谁装的，一律展示，
+    // 让用户决定是否一键清理（场景②）。判定数据源 = disabled:true（DSH 客观判定）。
+    let broken_plugins = crate::sync::startup_broken_plugins(app, &cfg);
+    for (i, b) in broken_plugins.iter().enumerate() {
+        broken_items.push(MenuItem::with_id(
+            app,
+            format!("sync-broken-{i}"),
+            format!("⚠️ {b} 影响启动（已被禁用，可清理）"),
+            true,
+            None::<&str>,
+        )?);
+    }
+
+    // 🗑 建议卸载：管理员已从服务端清单下架（曾推荐过、本次已移除）—— 场景①。
+    // 只针对曾出现在服务端推荐清单里的插件，同事自己装的绝不进入此列表。
+    let removed_plugins = state.last_removed.clone();
+    for (i, r) in removed_plugins.iter().enumerate() {
+        remove_items.push(MenuItem::with_id(
+            app,
+            format!("sync-remove-{i}"),
+            format!("🗑 {r}（管理员已下架，建议卸载）"),
+            true,
             None::<&str>,
         )?);
     }
@@ -512,6 +540,27 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     }
 
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<R>> = Vec::new();
+    // 分隔符菜单项需在 items 借用集合之外持有（owned），否则临时值被提前 drop。
+    let sep_broken = if broken_items.is_empty() {
+        None
+    } else {
+        Some(MenuItem::with_id(app, "sync-sep-broken", "─ ⚠️ 影响启动 ─", false, None::<&str>)?)
+    };
+    let sep_remove = if remove_items.is_empty() {
+        None
+    } else {
+        Some(MenuItem::with_id(app, "sync-sep-remove", "─ 🗑 建议卸载 ─", false, None::<&str>)?)
+    };
+    // 影响启动 → 排最前（最紧急）
+    if let Some(sep) = &sep_broken {
+        items.push(sep);
+        items.extend(broken_items.iter().map(|m| m as &dyn tauri::menu::IsMenuItem<R>));
+    }
+    // 建议卸载
+    if let Some(sep) = &sep_remove {
+        items.push(sep);
+        items.extend(remove_items.iter().map(|m| m as &dyn tauri::menu::IsMenuItem<R>));
+    }
     items.extend(status_items.iter().map(|m| m as &dyn tauri::menu::IsMenuItem<R>));
     items.extend(install_items.iter().map(|m| m as &dyn tauri::menu::IsMenuItem<R>));
     // 立即同步（手动触发）
@@ -534,6 +583,53 @@ fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<Str
                 .get(index)
                 .and_then(|p| p["name"].as_str().map(|s| s.to_string()))
         })
+}
+
+/// 供菜单点击时取「第 i 个建议卸载插件名」（与 build_sync_submenu 的索引一致）。
+fn removable_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<String> {
+    let cfg = load_cached();
+    let state = crate::sync::load_state(app, &cfg);
+    state.last_removed.get(index).cloned()
+}
+
+/// 供菜单点击时取「第 i 个影响启动插件名」（与 build_sync_submenu 的索引一致）。
+fn broken_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<String> {
+    let cfg = load_cached();
+    crate::sync::startup_broken_plugins(app, &cfg).get(index).cloned()
+}
+
+/// 卸载前的二次确认框（原生 MessageBox，`确定`/`取消`）。
+///
+/// 返回 true = 用户确认卸载。Windows 用 `MessageBoxW`（windows-sys 已有依赖，
+/// 无需新增 crate）；非 Windows 平台无确认框，直接放行（桌面端仅面向 Windows）。
+fn confirm_uninstall(name: &str, reason: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONWARNING, MB_OKCANCEL, IDOK,
+        };
+        let title: Vec<u16> = "确认卸载插件".encode_utf16().chain(std::iter::once(0)).collect();
+        let body: Vec<u16> = format!(
+            "{reason}\n\n确定要卸载插件「{name}」吗？\n\n卸载后可随时重新安装。"
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+        let ret = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OKCANCEL | MB_ICONWARNING,
+            )
+        };
+        ret == IDOK
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (name, reason);
+        true
+    }
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
@@ -852,11 +948,16 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 crate::ops::update_step(&h, "执行策略…");
                 refresh_sync_menu(&h);
                 if let Some(config) = &outcome.config {
-                    let msg = if outcome.pending.is_empty() {
-                        "已是最新，无待安装推荐插件".to_string()
+                    let mut parts: Vec<String> = Vec::new();
+                    if outcome.pending.is_empty() {
+                        parts.push("已是最新，无待安装推荐插件".to_string());
                     } else {
-                        format!("待安装推荐：{}", outcome.pending.join(", "))
-                    };
+                        parts.push(format!("待安装推荐：{}", outcome.pending.join(", ")));
+                    }
+                    if !outcome.removed.is_empty() {
+                        parts.push(format!("管理员已下架：{}（可在菜单「建议卸载」清理）", outcome.removed.join(", ")));
+                    }
+                    let msg = parts.join("\n");
                     crate::ops::finish_op(&h, &msg);
                     notify(&h, "同步完成", &msg);
                     let _ = config;
@@ -890,6 +991,74 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                             Err(e) => {
                                 crate::ops::fail_op(&h, &e);
                                 notify(&h, "插件安装失败", &e);
+                                refresh_sync_menu(&h);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        id if id.starts_with("sync-remove-") => {
+            // 🗑 建议卸载（场景①：管理员已下架）——二次确认后卸载
+            let idx = id
+                .strip_prefix("sync-remove-")
+                .and_then(|s| s.parse::<usize>().ok());
+            if let Some(idx) = idx {
+                if let Some(name) = removable_plugin_at(app, idx) {
+                    if !confirm_uninstall(&name, "管理员已从服务端下架此插件") {
+                        notify(app, "已取消", &format!("未卸载 {name}"));
+                        return;
+                    }
+                    let h = app.clone();
+                    let name_clone = name.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::ops::start_op(&h, "plugin-uninstall", "卸载插件", &["卸载插件"]);
+                        crate::ops::mark_step_running(&h, 0);
+                        crate::ops::update_step(&h, &format!("正在卸载 {name_clone}…"));
+                        match crate::sync::uninstall_plugin(&h, &name).await {
+                            Ok(()) => {
+                                crate::ops::finish_op(&h, &format!("{name_clone} 已卸载"));
+                                notify(&h, "插件已卸载", &format!("{name_clone} 已卸载"));
+                                let cfg = load_cached();
+                                let _ = crate::sync::sync_once(&h, &cfg, None, false).await;
+                                refresh_sync_menu(&h);
+                            }
+                            Err(e) => {
+                                crate::ops::fail_op(&h, &e);
+                                notify(&h, "插件卸载失败", &e);
+                                refresh_sync_menu(&h);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        id if id.starts_with("sync-broken-") => {
+            // ⚠️ 影响启动（场景②：被 DSH 兜底禁用）——二次确认后清理
+            let idx = id
+                .strip_prefix("sync-broken-")
+                .and_then(|s| s.parse::<usize>().ok());
+            if let Some(idx) = idx {
+                if let Some(name) = broken_plugin_at(app, idx) {
+                    if !confirm_uninstall(&name, "此插件已被 DSH 禁用（影响启动）") {
+                        notify(app, "已取消", &format!("未清理 {name}"));
+                        return;
+                    }
+                    let h = app.clone();
+                    let name_clone = name.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::ops::start_op(&h, "plugin-uninstall", "清理插件", &["清理插件"]);
+                        crate::ops::mark_step_running(&h, 0);
+                        crate::ops::update_step(&h, &format!("正在清理 {name_clone}…"));
+                        match crate::sync::uninstall_plugin(&h, &name).await {
+                            Ok(()) => {
+                                crate::ops::finish_op(&h, &format!("{name_clone} 已清理"));
+                                notify(&h, "插件已清理", &format!("{name_clone} 已清理"));
+                                refresh_sync_menu(&h);
+                            }
+                            Err(e) => {
+                                crate::ops::fail_op(&h, &e);
+                                notify(&h, "插件清理失败", &e);
                                 refresh_sync_menu(&h);
                             }
                         }
