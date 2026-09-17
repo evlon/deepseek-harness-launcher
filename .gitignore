@@ -11,6 +11,8 @@ dist
 
 # Logs / runtime
 *.log
+build-log.txt
+build-log-cargo.txt
 
 # dsh-matrix-agent 运行状态（含聊天记录/状态，绝不提交）
 .dsh-matrix/

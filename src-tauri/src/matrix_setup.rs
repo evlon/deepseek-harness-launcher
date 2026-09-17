@@ -299,91 +299,6 @@ pub fn atomic_write_public(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- Matrix 登录换 token ----------
-
-/// Matrix 密码登录错误（分类给 UI 明确提示）。
-#[derive(Debug, Clone, PartialEq)]
-pub enum LoginError {
-    /// 账号或密码不对（HTTP 401/403 或 M_FORBIDDEN 等）。
-    BadCredentials(String),
-    /// 网络/服务器不可达。
-    Network(String),
-    /// 服务器返回其它错误。
-    Other(String),
-}
-
-impl std::fmt::Display for LoginError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LoginError::BadCredentials(m) => write!(f, "分身账号或密码不对：{m}"),
-            LoginError::Network(m) => write!(f, "连不上服务器：{m}"),
-            LoginError::Other(m) => write!(f, "登录失败：{m}"),
-        }
-    }
-}
-
-/// 用账号密码调 Matrix 标准登录 API 换取 access token（blocking——向导协议 handler
-/// 是同步回调，单次登录请求 ≤15s 可接受）。
-/// `POST {homeserver}/_matrix/client/v3/login`
-/// body: {"type":"m.login.password","identifier":{"type":"m.id.user","user":"<userId>"},"password":"<pwd>"}
-/// → {"access_token": "...", "user_id": "..."}
-pub fn fetch_matrix_token(
-    homeserver: &str,
-    user_id: &str,
-    password: &str,
-) -> Result<String, LoginError> {
-    let base = homeserver.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err(LoginError::Other("服务器地址为空".to_string()));
-    }
-    if user_id.trim().is_empty() || password.is_empty() {
-        return Err(LoginError::BadCredentials("账号或密码为空".to_string()));
-    }
-    let url = format!("{base}/_matrix/client/v3/login");
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("dsh-harness-launcher-matrix-setup")
-        .connect_timeout(std::time::Duration::from_secs(8))
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| LoginError::Network(e.to_string()))?;
-    let body = serde_json::json!({
-        "type": "m.login.password",
-        "identifier": { "type": "m.id.user", "user": user_id.trim() },
-        "password": password,
-    });
-    let resp = match client.post(&url).json(&body).send() {
-        Ok(r) => r,
-        Err(e) => return Err(LoginError::Network(e.to_string())),
-    };
-    let status = resp.status().as_u16();
-    let text = match resp.text() {
-        Ok(t) => t,
-        Err(_) => String::new(),
-    };
-    if status == 200 {
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-        let token = json
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if token.is_empty() {
-            return Err(LoginError::Other("登录成功但未返回 access_token".to_string()));
-        }
-        return Ok(token);
-    }
-    // 错误：Matrix 用 errcode（M_FORBIDDEN 等）
-    let errcode = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|j| j.get("errcode").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .unwrap_or_default();
-    if status == 401 || status == 403 || errcode.contains("FORBIDDEN") || errcode.contains("UNKNOWN") {
-        Err(LoginError::BadCredentials(if text.is_empty() { format!("HTTP {status}") } else { text }))
-    } else {
-        Err(LoginError::Other(format!("HTTP {status} {text}")))
-    }
-}
-
 // ---------- 等待 Matrix 连接 ----------
 
 /// 等待 Matrix 桥连接就绪：轮询 dsh-matrix-agent 的 diagnostics.log（stateDir），
@@ -478,17 +393,6 @@ pub fn handle_scheme_request<R: TauriRuntime>(
         let st = collect_state(app, &cfg);
         return json_resp(StatusCode::OK, serde_json::to_value(&st).unwrap_or_else(|_| serde_json::json!({})));
     }
-    if method == tauri::http::Method::POST && path == "/fetch-token" {
-        // 解析 body: { homeserverUrl, userId, password }
-        let body: serde_json::Value = serde_json::from_slice(&request.into_body()).unwrap_or(serde_json::Value::Null);
-        let hs = body.get("homeserverUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let uid = body.get("userId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let pwd = body.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        return match fetch_matrix_token(&hs, &uid, &pwd) {
-            Ok(token) => json_resp(StatusCode::OK, serde_json::json!({"ok": true, "token": token})),
-            Err(e) => json_resp(StatusCode::OK, serde_json::json!({"ok": false, "error": e.to_string()})),
-        };
-    }
     if method == tauri::http::Method::POST && path == "/activate" {
         // 自动激活：授权码 + PKCE + 本地回调（P3）。后台线程跑完整流程
         // （起回调 → 打开浏览器 → 等回调 → 换 token → 调 /activate → 写配置 → 重启）。
@@ -557,91 +461,102 @@ pub fn handle_scheme_request<R: TauriRuntime>(
         return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始自动激活"}));
     }
     if method == tauri::http::Method::POST && path == "/submit" {
-        // 解析 body: { homeserverUrl, userId, accessToken, owner }
-        let body: serde_json::Value = serde_json::from_slice(&request.into_body()).unwrap_or(serde_json::Value::Null);
-        let acc = MatrixAccount {
-            homeserver_url: body.get("homeserverUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            user_id: body.get("userId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            access_token: body.get("accessToken").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            owner: body.get("owner").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        // 手动配置提交：默认禁用（连接参数由服务端下发 + 自动激活写入），
+        // 仅当开发者本地把 launcher-config.json 的 matrixManualConfig 改为 true 时启用，
+        // 便于和测试环境（自建 homeserver）联调。
+        if !manual_config_enabled(&cfg) {
+            return json_resp(
+                StatusCode::OK,
+                serde_json::json!({"ok": false, "error": "手动配置已禁用。请使用上方「自动激活数字分身」，连接参数由服务端统一下发。"}),
+            );
+        }
+        // 读取请求体：{ homeserverUrl, userId, accessToken, owner }
+        let body: serde_json::Value = match serde_json::from_slice(request.body()) {
+            Ok(v) => v,
+            Err(_) => {
+                return json_resp(
+                    StatusCode::OK,
+                    serde_json::json!({"ok": false, "error": "请求体不是合法 JSON"}),
+                )
+            }
         };
+        let s = |k: &str| -> String {
+            body.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let acc = MatrixAccount {
+            homeserver_url: s("homeserverUrl"),
+            user_id: s("userId"),
+            access_token: s("accessToken"),
+            owner: s("owner"),
+        };
+        // 三要素校验（owner 可选）
         if !acc.complete() {
             return json_resp(
                 StatusCode::OK,
-                serde_json::json!({"ok": false, "error": format!("配置不完整，缺：{}", acc.missing().join(", "))}),
+                serde_json::json!({"ok": false, "error": "服务器地址、分身账号、访问令牌三项必填" }),
             );
         }
-        // 后台跑分步执行（写配置→重启→等连接，含最长 ~50s 轮询）；进度走 ops + console 窗口。
-        // 用 spawn_blocking 避免阻塞 async runtime（run_setup_steps 是同步阻塞函数）。
+        // 写配置 + 重启 matrix profile 生效（与自动激活一致）
         let h = app.clone();
-        let cfg_bg = load_cached();
         tauri::async_runtime::spawn_blocking(move || {
-            crate::ops::start_op(&h, "matrix-setup", "配置数字分身", &["写入配置", "重启数字分身", "等待连接"]);
-            match run_setup_steps(&h, &cfg_bg, acc) {
-                Ok(msg) => {
-                    crate::ops::finish_op(&h, &msg);
-                    crate::notify::notify(&h, "数字分身已配置完成", &msg);
-                    crate::tray::refresh_sync_menu(&h);
+            crate::ops::start_op(&h, "matrix-manual", "手动配置数字分身", &["写入配置", "重启数字分身", "等待连接"]);
+            crate::ops::mark_step_running(&h, 0);
+            match write_account(&h, &load_cached(), &acc) {
+                Ok(()) => {
+                    crate::ops::append_log(&h, "✓ 已写入连接配置");
+                    let cfg_now = load_cached();
+                    let running = crate::workflow::is_running();
+                    let cur_profile = crate::workflow::current_profile();
+                    crate::ops::mark_step_running(&h, 1);
+                    if running && cur_profile.as_deref() == Some(MATRIX_PROFILE) {
+                        crate::workflow::stop();
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                    match crate::workflow::launch_with_profile(&h, MATRIX_PROFILE) {
+                        Ok(port) => {
+                            crate::ops::append_log(&h, &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)));
+                            crate::ops::mark_step_running(&h, 2);
+                            match wait_matrix_ready(&h, &cfg_now, std::time::Duration::from_secs(45)) {
+                                Ok(()) => {
+                                    crate::ops::finish_op(&h, "数字分身已配置并连接成功");
+                                    crate::notify::notify(&h, "数字分身已配置", "连接成功，可在 Matrix 客户端 @ 它试试");
+                                    crate::tray::refresh_sync_menu(&h);
+                                }
+                                Err(e) => {
+                                    crate::ops::finish_op(&h, &format!("配置已写入，但连接等待超时：{e}"));
+                                    crate::notify::notify(&h, "数字分身已配置", "配置已写入，连接验证超时（不影响使用），可稍后在托盘查看。");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::ops::fail_op(&h, &format!("配置已写入但启动失败：{e}"));
+                            crate::notify::notify(&h, "数字分身已配置", &format!("配置已写入，但启动失败：{}。可在托盘「启动」重试。", e));
+                        }
+                    }
                 }
                 Err(e) => {
-                    crate::ops::fail_op(&h, &e);
-                    crate::notify::notify(&h, "数字分身配置失败", &e);
+                    crate::ops::fail_op(&h, &format!("写入配置失败：{e}"));
+                    crate::notify::notify(&h, "手动配置失败", &e);
                 }
             }
         });
-        // 弹进度窗口 + 关闭向导窗口（向导任务已移交后台，白屏窗口不应残留）。
-        // 注意：JS window.close() 对 Tauri WebView 无效（非脚本打开的窗口不能自关），
-        // 必须由 Rust 主动关——否则向导窗口持续残留（曾现白屏）。
+        // 弹进度窗口 + 关闭向导（与 /activate 一致）
         let h = app.clone();
         tauri::async_runtime::spawn(async move {
             std::thread::sleep(std::time::Duration::from_millis(400));
-            // 先弹进度窗口（让用户看到分步），再关向导
             let _ = crate::console::open_console(&h);
             std::thread::sleep(std::time::Duration::from_millis(300));
             if let Some(win) = h.get_webview_window("matrix-setup") {
                 let _ = win.close();
-                log::info!("[matrix-setup] 向导窗口已关闭，进度移交操作窗口");
             }
         });
-        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始配置"}));
+        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已提交手动配置"}));
     }
     json_resp(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not found"}))
-}
-
-/// 分步执行编排（带 ops 进度）：写配置 → 重启 → 等连接 → 完成。
-fn run_setup_steps<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig, acc: MatrixAccount) -> Result<String, String> {
-    // ① 写入配置
-    crate::ops::mark_step_running(app, 0);
-    crate::ops::update_step(app, "写入配置…");
-    write_account(app, cfg, &acc)?;
-    crate::ops::append_log(app, &format!("✓ 已写入 dsh-matrix 配置（homeserver={} userId={}）", acc.homeserver_url, acc.user_id));
-    log::info!("[matrix-setup] 已写入 dsh-matrix 账号配置");
-
-    // ② 重启数字分身（launch_with_profile 幂等：同 profile 已在跑返回现有端口；
-    // 连接参数改动后需重启才生效——若已在跑则先停再启）
-    crate::ops::mark_step_running(app, 1);
-    crate::ops::update_step(app, "重启数字分身…");
-    let running = crate::workflow::is_running();
-    let cur_profile = crate::workflow::current_profile();
-    if running && cur_profile.as_deref() == Some(MATRIX_PROFILE) {
-        crate::workflow::stop();
-        crate::ops::append_log(app, "已停止旧数字分身进程（连接参数需重启生效）");
-        std::thread::sleep(std::time::Duration::from_millis(800)); // 等端口释放
-    }
-    let port = crate::workflow::launch_with_profile(app, MATRIX_PROFILE)?;
-    // 用带 token 的 URL（dsh 0.1.2+ 缺 ?token= 会 401）；此处仅记录到进度日志
-    crate::ops::append_log(
-        app,
-        &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)),
-    );
-
-    // ③ 等待 Matrix 连接
-    crate::ops::mark_step_running(app, 2);
-    crate::ops::update_step(app, "等待 Matrix 连接…");
-    wait_matrix_ready(app, cfg, std::time::Duration::from_secs(45))?;
-    crate::ops::append_log(app, "✓ Matrix 桥已连接");
-
-    Ok("数字分身已可用——在 Matrix 客户端 @ 它试试吧".to_string())
 }
 
 /// 向导表单初始数据（GET /state 返回；预置值 + 当前已填值）。
@@ -653,6 +568,8 @@ pub struct WizardState {
     pub user_id: String,
     pub access_token_set: bool,
     pub owner: String,
+    /// 是否启用「手动配置」（开发者本地开关 matrixManualConfig，默认 false）。
+    pub manual_config_enabled: bool,
     /// 订阅/安装清单差异（待装或待更新的推荐插件），激活成功后引导去装。
     pub pending_plugins: Vec<serde_json::Value>,
 }
@@ -684,6 +601,7 @@ pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherCon
         user_id: acc.user_id,
         access_token_set: !acc.access_token.is_empty() && acc.access_token != PENDING_CONFIG,
         owner: acc.owner,
+        manual_config_enabled: manual_config_enabled(&cfg),
         pending_plugins: pending_plugin_diff(app, cfg),
     }
 }
@@ -719,6 +637,11 @@ pub fn wizard_html() -> String {
   .token-toggle a{color:var(--blue);cursor:pointer;font-size:12px;text-decoration:none}
   .secret-mode{display:none}
   .step-done{color:var(--green)}
+  .cfg-table{width:100%;border-collapse:collapse;font-size:12px}
+  .cfg-table td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  .cfg-key{color:var(--muted);width:90px;white-space:nowrap}
+  .cfg-val{color:var(--text);word-break:break-all}
+  .cfg-val.empty{color:var(--muted)}
 </style>
 </head>
 <body>
@@ -733,34 +656,30 @@ pub fn wizard_html() -> String {
   </div>
 
   <div class="section">
-    <h2 style="color:var(--muted)">手动配置（高级）</h2>
-    <div class="hint" style="margin-bottom:10px">如果你无法使用公司 SSO，或需要手动指定账号，用下面的表单。</div>
+    <h2 style="color:var(--blue)">📡 当前连接配置（服务端下发，只读）</h2>
+    <div class="hint" style="margin-bottom:10px">以下连接参数由服务端统一下发（激活时自动写入），本地不可手改，用于排查连接问题。</div>
+    <table class="cfg-table">
+      <tr><td class="cfg-key">服务器地址</td><td class="cfg-val" id="viewHs">—</td></tr>
+      <tr><td class="cfg-key">分身账号</td><td class="cfg-val" id="viewUid">—</td></tr>
+      <tr><td class="cfg-key">主人账号</td><td class="cfg-val" id="viewOwner">—</td></tr>
+      <tr><td class="cfg-key">访问令牌</td><td class="cfg-val" id="viewToken">—</td></tr>
+    </table>
   </div>
 
-  <div class="section">
-    <h2>1. 分身连接信息</h2>
-    <label>服务器地址（问管理员要，如 https://im-company.example）</label>
-    <input id="hs" placeholder="https://…">
-    <label>分身账号（如 @ai-zhangsan:server）</label>
-    <input id="uid" placeholder="@ai-…:…">
-    <label>主人账号（可选，负责审批你的分身；一般填你自己的真实账号）</label>
-    <input id="owner" placeholder="@zhangsan:…">
-  </div>
-
-  <div class="section">
-    <h2>2. 分身访问令牌（access token）</h2>
-    <div class="row">
-      <input id="token" type="password" placeholder="粘贴 access token" style="flex:1">
-    </div>
-    <div class="token-toggle"><a id="toggle">没有 token？用「账号 + 密码」自动获取 →</a></div>
-    <div class="secret-mode" id="pwdMode">
-      <label>分身账号密码</label>
-      <div class="row">
-        <input id="pwd" type="password" placeholder="输入密码" style="flex:1">
-        <button class="btn btn-ghost" id="fetchBtn">获取令牌</button>
-      </div>
-      <div class="status info" id="fetchStatus"></div>
-    </div>
+  <div class="section" id="manualSection" style="display:none">
+    <h2 style="color:var(--amber)">🛠 手动配置（开发者）</h2>
+    <div class="hint" style="margin-bottom:10px">已启用开发者手动配置开关（matrixManualConfig）。此处可手填连接参数，覆盖服务端下发值，用于测试环境联调。</div>
+    <label>服务器地址（homeserverUrl）</label>
+    <input id="mHs" placeholder="https://matrix.example.com">
+    <label>分身账号（userId）</label>
+    <input id="mUid" placeholder="@ai-xxx:example.com">
+    <label>主人账号（owner，可选）</label>
+    <input id="mOwner" placeholder="@owner:example.com">
+    <label>访问令牌（accessToken）</label>
+    <input id="mToken" type="password" placeholder="syt_...">
+    <div class="token-toggle"><a id="toggleToken" onclick="return false">显示令牌</a></div>
+    <button class="btn btn-primary" id="submitBtn" style="width:100%">保存手动配置</button>
+    <div class="status" id="manualStatus"></div>
   </div>
 
   <div class="section" id="pendingSection" style="display:none">
@@ -769,22 +688,31 @@ pub fn wizard_html() -> String {
     <div id="pendingList" style="font-size:12px"></div>
   </div>
 
-  <button class="btn btn-primary" id="submit" style="width:100%">开始配置</button>
   <div class="status" id="status"></div>
 
 <script>
 (function(){
   const $=id=>document.getElementById(id);
   const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  let accessTokenSet=false;
 
-  // 加载当前状态（预置值 + 已填值）
-  fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{    if(s.homeserver_url) $("hs").value=s.homeserver_url;
-    if(s.user_id) $("uid").value=s.user_id;
-    if(s.owner) $("owner").value=s.owner;
-    accessTokenSet=!!s.access_token_set;
-    if(s.status==="configured"){ $("status").innerHTML='<span class="ok">已配置。可直接修改后重新提交。</span>'; }
+  // 只读展示：加载当前连接配置（服务端下发 + 激活写入），用于排查，不允许本地手改
+  fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
+    $("viewHs").textContent = s.homeserver_url || "（未下发）";
+    $("viewUid").textContent = s.user_id || "（未激活）";
+    $("viewOwner").textContent = s.owner || "（未设置）";
+    $("viewToken").textContent = s.access_token_set ? "已写入（明文不在此展示）" : "（未写入）";
+    if(s.status==="configured"){ $("status").innerHTML='<span class="ok">✓ 已配置并连接。</span>'; }
     else if(s.status==="not-installed"){ $("status").innerHTML='<span class="err">数字分身插件未安装——请先关闭本窗口，在托盘点「安装 / 修复」。</span>'; }
+    else if(s.status==="unconfigured"){ $("status").innerHTML='<span class="info">尚未完成激活。请点上方「自动激活」。</span>'; }
+    // 开发者手动配置开关：matrixManualConfig=true 时显示手填区块并预填当前值
+    if(s.manual_config_enabled){
+      $("manualSection").style.display="block";
+      $("mHs").value = s.homeserver_url || "";
+      $("mUid").value = s.user_id || "";
+      $("mOwner").value = s.owner || "";
+      // access token 不回传明文，仅占位提示
+      $("mToken").placeholder = s.access_token_set ? "已设置（留空则保持不变）" : "syt_...";
+    }
     // 订阅/安装清单差异
     if(s.pending_plugins && s.pending_plugins.length){
       const list=$("pendingList"); list.innerHTML="";
@@ -802,50 +730,6 @@ pub fn wizard_html() -> String {
     }
   }).catch(()=>{});
 
-  // token 获取模式切换
-  let pwdMode=false;
-  $("toggle").onclick=()=>{
-    pwdMode=!pwdMode;
-    $("pwdMode").style.display=pwdMode?"block":"none";
-    $("toggle").textContent=pwdMode?"← 直接粘贴 token":"没有 token？用「账号 + 密码」自动获取 →";
-  };
-  $("fetchBtn").onclick=async()=>{
-    const st=$("fetchStatus"); st.className="status info"; st.textContent="获取中…";
-    try{
-      const r=await fetch("http://matrix-setup.localhost/fetch-token",{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({homeserverUrl:$("hs").value.trim(),userId:$("uid").value.trim(),password:$("pwd").value})
-      });
-      const j=await r.json();
-      if(j.ok && j.token){ $("token").value=j.token; accessTokenSet=true; st.className="status ok"; st.textContent="✓ 已获取令牌（已自动填入，密码不会保存）"; $("pwd").value=""; }
-      else { st.className="status err"; st.textContent="✗ "+(j.error||"获取失败"); }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; }
-  };
-
-  $("submit").onclick=async()=>{
-    const st=$("status"); st.className="status info"; st.textContent="正在提交…";
-    const body={
-      homeserverUrl:$("hs").value.trim(),
-      userId:$("uid").value.trim(),
-      accessToken:$("token").value.trim(),
-      owner:$("owner").value.trim()
-    };
-    if(!body.homeserverUrl||!body.userId){ st.className="status err"; st.textContent="✗ 请填写服务器地址和分身账号"; return; }
-    if(!body.accessToken){ st.className="status err"; st.textContent="✗ 请粘贴 access token，或用账号密码获取"; return; }
-    // 防重复提交 + 防提交后页面异常（窗口会由本机服务自动关闭）
-    $("submit").disabled=true;
-    try{
-      const r=await fetch("http://matrix-setup.localhost/submit",{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify(body)
-      });
-      const j=await r.json();
-      if(j.ok){
-        st.innerHTML='<span class="ok">✓ 已提交！正在后台配置——进度窗口即将弹出，本窗口会自动关闭。</span>';
-      } else { st.className="status err"; st.textContent="✗ "+(j.error||"提交失败"); $("submit").disabled=false; }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("submit").disabled=false; }
-  };
-
   // 自动激活：调本机服务，打开浏览器授权（窗口随后自动关闭，进度走操作窗口）
   $("activateBtn").onclick=async()=>{
     const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
@@ -857,6 +741,26 @@ pub fn wizard_html() -> String {
         st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。本窗口会自动关闭，进度在操作窗口显示。</span>';
       } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
     }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; }
+  };
+
+  // 开发者手动配置：显示令牌切换 + 提交
+  $("toggleToken").onclick=()=>{ const el=$("mToken"); el.type = el.type==="password" ? "text" : "password"; };
+  $("submitBtn").onclick=async()=>{
+    const st=$("manualStatus"); st.className="status info"; st.textContent="正在写入配置…";
+    $("submitBtn").disabled=true;
+    const payload={
+      homeserverUrl:$("mHs").value.trim(),
+      userId:$("mUid").value.trim(),
+      owner:$("mOwner").value.trim(),
+      accessToken:$("mToken").value.trim()
+    };
+    try{
+      const r=await fetch("http://matrix-setup.localhost/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const j=await r.json();
+      if(j.ok){
+        st.innerHTML='<span class="ok">✓ 已提交！本窗口会自动关闭，进度在操作窗口显示。</span>';
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"提交失败"); $("submitBtn").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("submitBtn").disabled=false; }
   };
 })();
 </script>

@@ -111,6 +111,16 @@ pub struct LauncherConfig {
     /// 能出外网的同事会绕过内网源看到官方全量（含 Alpha），让「内网只放 RC」的双保险失效。
     /// 内网环境建议设 false，使内网 registry 成为唯一版本来源。
     pub allow_upstream_registry: Option<bool>,
+    /// 是否允许在数字分身配置向导里「手动配置」连接参数（缺省 false = 禁止）。
+    ///
+    /// 背景：数字分身的连接参数（homeserverUrl / userId / accessToken / owner）本应由
+    /// 服务端统一下发（envDefaults）+ 自动激活写入，普通同事不应手改——手填错误会覆盖
+    /// 服务端下发的正确值，导致「连接等待超时」这类故障。
+    ///
+    /// 本字段是**开发者本地联调开关**：默认 false，向导只展示「自动激活 + 只读展示当前
+    /// 配置」；开发者把本字段改为 true（重启生效）后，向导额外出现手填表单，方便和
+    /// 测试环境（自建 homeserver）联调。**不通过服务端下发**，只能本地改文件启用。
+    pub matrix_manual_config: Option<bool>,
 }
 
 /// dsh 版本通道。
@@ -527,6 +537,11 @@ pub fn resolve_profile(cfg: &LauncherConfig) -> String {
     } else {
         p.to_string()
     }
+}
+
+/// 数字分身「手动配置」是否启用（缺省 false = 禁止，开发者本地改文件启用）。
+pub fn manual_config_enabled(cfg: &LauncherConfig) -> bool {
+    cfg.matrix_manual_config.unwrap_or(false)
 }
 
 /// 枚举 `$DSH_HOME/profiles/` 下已存在的 profile 名（排序）。
@@ -977,6 +992,7 @@ fn merge_user_into_builtin(builtin: &mut LauncherConfig, user: LauncherConfig) {
     //    （此函数是显式字段列表，不是反射式合并）。
     if user.dsh_channel.is_some() { builtin.dsh_channel = user.dsh_channel; }
     if user.allow_upstream_registry.is_some() { builtin.allow_upstream_registry = user.allow_upstream_registry; }
+    if user.matrix_manual_config.is_some() { builtin.matrix_manual_config = user.matrix_manual_config; }
 }
 
 /// 服务器配置覆盖本地（遵循「用户显式设置过的不被覆盖」）：
@@ -1568,5 +1584,41 @@ mod tests {
         // 非法输入 → 不可用
         assert!(!node_version_compatible(""));
         assert!(!node_version_compatible("not-a-version"));
+    }
+
+    #[test]
+    fn manual_config_defaults_disabled() {
+        // 缺省（未设置 matrixManualConfig）→ 禁止手动配置
+        let cfg = LauncherConfig::default();
+        assert!(!manual_config_enabled(&cfg));
+        // 显式 false → 禁止
+        let cfg = LauncherConfig {
+            matrix_manual_config: Some(false),
+            ..Default::default()
+        };
+        assert!(!manual_config_enabled(&cfg));
+    }
+
+    #[test]
+    fn manual_config_enabled_when_true() {
+        // 开发者显式 true → 启用
+        let cfg = LauncherConfig {
+            matrix_manual_config: Some(true),
+            ..Default::default()
+        };
+        assert!(manual_config_enabled(&cfg));
+    }
+
+    #[test]
+    fn manual_config_user_overrides_builtin() {
+        // 用户 launcher-config.json 里写了 true → 覆盖内置默认（false）
+        let mut builtin = builtin_default_config();
+        assert!(!manual_config_enabled(&builtin), "内置默认应为 false");
+        let user = LauncherConfig {
+            matrix_manual_config: Some(true),
+            ..Default::default()
+        };
+        merge_user_into_builtin(&mut builtin, user);
+        assert!(manual_config_enabled(&builtin));
     }
 }
