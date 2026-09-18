@@ -321,7 +321,10 @@ fn version_greater(a: &str, b: &str) -> bool {
 /// - `"@deepseek-ai/dsh@0.1.2-rc.1"` → ("@deepseek-ai/dsh", "0.1.2-rc.1")
 /// - `"pkg@next"`                    → ("pkg", "next")                  // dist-tag
 /// 规则：按**最后一个** `@` 拆分；拆出的 name 为空则整串当作裸包名（spec=latest）。
-fn split_spec(input: &str) -> (String, String) {
+///
+/// `pub(crate)`：管理能力 bridge 的 /api/registry/sync-status 也要拆 pkg@spec，
+/// 共用此实现避免两套解析逻辑漂移。
+pub(crate) fn split_spec(input: &str) -> (String, String) {
     let s = input.trim();
     if s.is_empty() {
         return (String::new(), "latest".to_string());

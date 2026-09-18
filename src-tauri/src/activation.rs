@@ -359,36 +359,35 @@ fn start_callback_server() -> Result<CallbackServer, String> {
     let state_clone = state.clone();
     let thread = std::thread::spawn(move || {
         log::info!("[activation] 本地回调服务已启动：http://127.0.0.1:{port}/callback");
-        // 只处理一次请求（单次激活），处理完即退出循环
-        for request in server.incoming_requests() {
-            if shutdown_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            let url = request.url().to_string();
-            log::info!("[activation] 收到回调：{}", url);
-            // 解析 query：?code=...&state=...
-            let (code, got_state) = parse_callback_query(&url);
-            // 响应：成功/失败都给一个简单页面（浏览器可见）
-            let body = if code.is_empty() {
-                "<html><body><h3>激活失败</h3><p>未收到授权码，请关闭此页回到启动器。</p></body></html>"
-            } else {
-                "<html><body><h3>授权成功</h3><p>可关闭此页，回到启动器完成激活。</p></body></html>"
-            };
-            let _ = request.respond(
-                tiny_http::Response::from_string(body.to_string())
-                    .with_header(
+        // 单次激活：只处理一个回调请求即结束（浏览器授权后会请求一次 /callback）。
+        // 用 `if let Some(...)` 而非 `for ... { break }`——循环体必定 break，
+        // clippy::never_loop 会判为错误（deny 级），且语义上确实只需要一个请求。
+        if let Some(request) = server.incoming_requests().next() {
+            if !shutdown_clone.load(Ordering::Relaxed) {
+                let url = request.url().to_string();
+                log::info!("[activation] 收到回调：{}", url);
+                // 解析 query：?code=...&state=...
+                let (code, got_state) = parse_callback_query(&url);
+                // 响应：成功/失败都给一个简单页面（浏览器可见）
+                let body = if code.is_empty() {
+                    "<html><body><h3>激活失败</h3><p>未收到授权码，请关闭此页回到启动器。</p></body></html>"
+                } else {
+                    "<html><body><h3>授权成功</h3><p>可关闭此页，回到启动器完成激活。</p></body></html>"
+                };
+                let _ = request.respond(
+                    tiny_http::Response::from_string(body.to_string()).with_header(
                         tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
                             .unwrap(),
                     ),
-            );
-            // 存结果并唤醒等待方
-            {
-                let (lock, cvar) = &*result_clone;
-                let mut guard = lock.lock().unwrap();
-                *guard = Some((code, got_state));
-                cvar.notify_all();
+                );
+                // 存结果并唤醒等待方
+                {
+                    let (lock, cvar) = &*result_clone;
+                    let mut guard = lock.lock().unwrap();
+                    *guard = Some((code, got_state));
+                    cvar.notify_all();
+                }
             }
-            break; // 单次激活：处理一个回调即停
         }
         let _ = state_clone;
     });

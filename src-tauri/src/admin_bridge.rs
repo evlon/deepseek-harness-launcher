@@ -248,6 +248,30 @@ fn handle_request_inner<R: Runtime>(
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
             }
         }
+        // 查内网 registry 上各包的同步状态（管理页徽章用）。
+        //
+        // 为什么由 launcher 承担：生产环境中心服务端在机房集群内，未必能解析/访问
+        // 内网 registry（实测集群 CoreDNS 拒绝解析 registry.ict.cmcc，导致管理页
+        // 徽章全部「查询失败」）。管理员本机 launcher 既能出外网又能访问内网 registry，
+        // 是天然的桥接者——与 /api/registry/meta（查外网上游）形成对称：
+        //   meta        → 查**外网** npmjs/npmmirror（上游最新版）
+        //   sync-status → 查**内网** registry（已同步版本）
+        //
+        // 参数：names（逗号分隔，支持 pkg@spec；scoped 包取最后一个 @）；
+        //       registry（可选，缺省用配置的 mirror_registry）。
+        ("GET", "/api/registry/sync-status") => {
+            let names = query.get("names").cloned().unwrap_or_default();
+            let cfg = load_cached();
+            let registry = query
+                .get("registry")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| crate::config::mirror_registry(&cfg));
+            match block_on_sync_status(&names, &registry) {
+                Ok(out) => serde_json::json!({ "ok": true, "registry": registry, "plugins": out }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e }),
+            }
+        }
         ("POST", "/api/script/exec") => {
             if !allow_scripts {
                 respond_json(request, 403, serde_json::json!({ "error": "scripts disabled (adminBridge.allowScripts)" }), &origin);
@@ -418,6 +442,105 @@ fn block_on_query_meta(name: &str) -> Result<serde_json::Value, String> {
     rt.block_on(query_meta_async(name))
 }
 
+/// 查内网 registry 同步状态（阻塞封装）。
+fn block_on_sync_status(names: &str, registry: &str) -> Result<serde_json::Value, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(sync_status_async(names, registry))
+}
+
+/// 逐个查内网 registry：包是否存在、dist-tags.latest、以及指定 spec 是否已同步。
+///
+/// 语义与中心服务端 /api/registry/sync-status 保持一致（管理页两处共用同一套判定）：
+///   state = synced / unsynced / error
+///   spec=latest → 看 dist-tags.latest 是否存在
+///   spec=版本号/dist-tag → 看 versions 里是否有该版本（rc/next 等 tag 版本
+///                          不体现在 latest，必须查 versions）
+///
+/// 与 mirror.rs 的 split_spec 共用拆包逻辑，避免「pkg@spec 解析」出现两套实现。
+async fn sync_status_async(names: &str, registry: &str) -> Result<serde_json::Value, String> {
+    use reqwest::Client;
+    // `.no_proxy()`：**必须**。实测踩坑——本机设了 HTTP_PROXY（企业代理），reqwest 默认
+    // 继承该环境变量，于是对 registry.ict.cmcc 的请求被发往代理，代理不转发内网域名、
+    // 直接返回空响应（报 "error sending request"）。而内网 registry 本就该直连，
+    // 不该走外网代理（这正是「内网服务」的定义）。
+    // 对照：query_meta_async（查 npmjs 外网）**保留**代理，那里代理是必需的。
+    let client = Client::builder()
+        .user_agent("dsh-harness-launcher-bridge")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let reg = registry.trim_end_matches('/');
+    let mut out = serde_json::Map::new();
+
+    for raw in names.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let (name, spec) = crate::mirror::split_spec(raw);
+        if name.is_empty() {
+            continue;
+        }
+        let mut entry = serde_json::json!({ "registry": reg, "spec": spec });
+        let encoded = name.replace('/', "%2F");
+        let url = format!("{reg}/{encoded}");
+        match client
+            .get(&url)
+            .header("Accept-Encoding", "identity") // 明确不接收压缩，避免代理改写引入编码损坏
+            .send()
+            .await
+        {
+            Ok(res) if res.status().is_success() => match res.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    let latest = data
+                        .get("dist-tags")
+                        .and_then(|d| d.get("latest"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    entry["version"] = serde_json::json!(latest);
+                    if spec != "latest" {
+                        // spec 可能是 dist-tag：先解 tag → 版本号，再查 versions
+                        let target = data
+                            .get("dist-tags")
+                            .and_then(|d| d.get(&spec))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(spec.as_str())
+                            .to_string();
+                        let synced = data
+                            .get("versions")
+                            .and_then(|v| v.get(&target))
+                            .is_some();
+                        entry["targetVersion"] = serde_json::json!(target);
+                        entry["targetSynced"] = serde_json::json!(synced);
+                        entry["state"] = serde_json::json!(if synced { "synced" } else { "unsynced" });
+                    } else {
+                        entry["state"] =
+                            serde_json::json!(if latest.is_empty() { "unsynced" } else { "synced" });
+                    }
+                }
+                Err(e) => {
+                    entry["state"] = serde_json::json!("error");
+                    entry["error"] = serde_json::json!(format!("json: {e}"));
+                }
+            },
+            Ok(res) if res.status().as_u16() == 404 => {
+                entry["state"] = serde_json::json!("unsynced");
+            }
+            Ok(res) => {
+                entry["state"] = serde_json::json!("error");
+                entry["error"] = serde_json::json!(format!("HTTP {}", res.status()));
+            }
+            Err(e) => {
+                entry["state"] = serde_json::json!("error");
+                entry["error"] = serde_json::json!(e.to_string());
+            }
+        }
+        out.insert(name, entry);
+    }
+
+    Ok(serde_json::Value::Object(out))
+}
+
 async fn query_meta_async(name: &str) -> Result<serde_json::Value, String> {
     use reqwest::Client;
     let client = Client::builder()
@@ -510,4 +633,124 @@ fn exec_script(body: &serde_json::Value) -> Result<String, String> {
         stdout.trim(),
         stderr.trim()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    // 只用到 crate::mirror::split_spec 与 serde_json，无需 super::*（避免 unused import 警告）
+
+    /// 逐包状态判定的纯逻辑部分：给定 registry 元数据 + spec，算出 state。
+    /// 与 sync_status_async 内的分支保持一致（把网络部分剥离以便离线测试）。
+    fn judge(data: &serde_json::Value, spec: &str) -> (String, String, bool) {
+        let latest = data
+            .get("dist-tags")
+            .and_then(|d| d.get("latest"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if spec != "latest" {
+            let target = data
+                .get("dist-tags")
+                .and_then(|d| d.get(&spec))
+                .and_then(|v| v.as_str())
+                .unwrap_or(spec)
+                .to_string();
+            let synced = data.get("versions").and_then(|v| v.get(&target)).is_some();
+            let state = if synced { "synced" } else { "unsynced" };
+            (state.to_string(), target, synced)
+        } else {
+            let state = if latest.is_empty() { "unsynced" } else { "synced" };
+            (state.to_string(), latest, state == "synced")
+        }
+    }
+
+    #[test]
+    fn sync_status_latest_synced() {
+        let data = serde_json::json!({
+            "dist-tags": { "latest": "0.1.7" },
+            "versions": { "0.1.6": {}, "0.1.7": {} }
+        });
+        let (state, ver, _) = judge(&data, "latest");
+        assert_eq!(state, "synced");
+        assert_eq!(ver, "0.1.7");
+    }
+
+    #[test]
+    fn sync_status_latest_missing_tag_is_unsynced() {
+        let data = serde_json::json!({ "versions": {} });
+        let (state, ver, _) = judge(&data, "latest");
+        assert_eq!(state, "unsynced");
+        assert_eq!(ver, "");
+    }
+
+    /// 关键用例：内网只有 0.1.6、请求 0.1.7 → 必须 unsynced
+    /// （这正是「npmjs 已发新版但内网未同步」的判定依据）
+    #[test]
+    fn sync_status_explicit_version_not_present() {
+        let data = serde_json::json!({
+            "dist-tags": { "latest": "0.1.6" },
+            "versions": { "0.1.6": {} }
+        });
+        let (state, target, synced) = judge(&data, "0.1.7");
+        assert_eq!(state, "unsynced");
+        assert_eq!(target, "0.1.7");
+        assert!(!synced);
+    }
+
+    #[test]
+    fn sync_status_explicit_version_present() {
+        let data = serde_json::json!({
+            "dist-tags": { "latest": "0.1.7" },
+            "versions": { "0.1.6": {}, "0.1.7": {} }
+        });
+        let (state, _, synced) = judge(&data, "0.1.6");
+        assert_eq!(state, "synced");
+        assert!(synced);
+    }
+
+    /// dist-tag 形式：请求 next，内网 dist-tags.next 指向 0.2.0-rc.1 且 versions 有 → synced
+    #[test]
+    fn sync_status_dist_tag_resolves_to_version() {
+        let data = serde_json::json!({
+            "dist-tags": { "latest": "0.1.6", "next": "0.2.0-rc.1" },
+            "versions": { "0.1.6": {}, "0.2.0-rc.1": {} }
+        });
+        let (state, target, synced) = judge(&data, "next");
+        assert_eq!(state, "synced");
+        assert_eq!(target, "0.2.0-rc.1");
+        assert!(synced);
+    }
+
+    /// dist-tag 指向的版本不存在 → unsynced（tag 未同步）
+    #[test]
+    fn sync_status_dist_tag_missing_version() {
+        let data = serde_json::json!({
+            "dist-tags": { "latest": "0.1.6", "next": "0.2.0-rc.1" },
+            "versions": { "0.1.6": {} }
+        });
+        let (state, target, synced) = judge(&data, "next");
+        assert_eq!(state, "unsynced");
+        assert_eq!(target, "0.2.0-rc.1");
+        assert!(!synced);
+    }
+
+    /// names 参数解析：逗号分隔、空白、空项都应被正确处理
+    #[test]
+    fn sync_status_names_parsing() {
+        let raw = " dsh-a , ,@scope/pkg@0.1.2 , dsh-b ";
+        let parsed: Vec<(String, String)> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(crate::mirror::split_spec)
+            .collect();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], ("dsh-a".to_string(), "latest".to_string()));
+        // scoped 包：@ 是包名一部分，最后一个 @ 才是 spec
+        assert_eq!(
+            parsed[1],
+            ("@scope/pkg".to_string(), "0.1.2".to_string())
+        );
+        assert_eq!(parsed[2], ("dsh-b".to_string(), "latest".to_string()));
+    }
 }
