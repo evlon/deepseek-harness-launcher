@@ -156,6 +156,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     // 同步 / 推荐插件 子菜单（动态）
     let sync_submenu = build_sync_submenu(app)?;
+    // 已装插件 子菜单（动态：一键卸载）
+    let plugins_submenu = build_plugins_submenu(app)?;
     // 切换 Profile 子菜单（动态）
     let profile_submenu = build_profile_submenu(app)?;
     // 管理能力子菜单（动态）
@@ -240,6 +242,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // 配置组
     items.push(&profile_submenu);
     items.push(&sync_submenu);
+    items.push(&plugins_submenu);
     items.push(&url_submenu);
     items.push(&accel_submenu);
     // 高级组
@@ -458,15 +461,18 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     }
 
     // 待装/待更新清单：优先用缓存的服务端配置（离线也可显示）。
-    // 判断口径 = 当前 profile 已装 + registry 最新版本（已装旧版 → 提示更新）
+    // 判断口径 = 当前 profile 已装 + registry 最新版本（已装旧版 → 提示更新）。
+    // 清单按当前 profile 精确取（profilePlugins[当前] 优先，回落全局 plugins）。
+    let current_profile = resolve_profile(&cfg);
     let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
     let state = crate::sync::load_state(app, &cfg);
     let pending_entries: Vec<serde_json::Value> = state
         .cached_config
         .as_ref()
         .map(|c| {
+            let cur = crate::sync::plugins_for_profile(c, &current_profile);
             crate::sync::pending_with_updates(
-                &c.plugins,
+                &cur,
                 &installed_with_ver,
                 &state.plugin_latest_versions,
             )
@@ -570,16 +576,70 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     Submenu::with_id_and_items(app, "sync", "同步 / 推荐插件", true, &items)
 }
 
+/// 构建「已装插件」子菜单：列出当前 profile 已装插件，点击二次确认后一键卸载。
+///
+/// 数据源 = 当前 profile 的 package.json `dependencies`（node_modules 里真实存在）。
+/// 这正是「用户能看到报错、知道是哪个插件错了，直接来菜单点它卸载」的入口。
+fn build_plugins_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R>> {
+    let cfg = load_cached();
+    let current_profile = resolve_profile(&cfg);
+    let installed = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
+
+    // 标题行：显示当前 profile 及已装数量
+    let header = format!("当前 profile：{current_profile}（已装 {} 个）", installed.len());
+    let header_item = MenuItem::with_id(app, "plugins-header", header, false, None::<&str>)?;
+
+    let mut plugin_items: Vec<MenuItem<R>> = Vec::new();
+    if installed.is_empty() {
+        plugin_items.push(MenuItem::with_id(app, "plugins-none", "（未安装任何插件）", false, None::<&str>)?);
+    } else {
+        // 按名字排序，稳定可预测
+        let mut sorted: Vec<(&String, &String)> = installed.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (i, (name, version)) in sorted.iter().enumerate() {
+            let label = if version.is_empty() {
+                format!("🗑 {name}")
+            } else {
+                format!("🗑 {name}  v{version}")
+            };
+            plugin_items.push(MenuItem::with_id(
+                app,
+                format!("plugin-uninstall-{i}"),
+                label,
+                true,
+                None::<&str>,
+            )?);
+        }
+    }
+
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<R>> = Vec::new();
+    items.push(&header_item);
+    items.extend(plugin_items.iter().map(|m| m as &dyn tauri::menu::IsMenuItem<R>));
+
+    Submenu::with_id_and_items(app, "plugins", "已装插件", true, &items)
+}
+
+/// 供菜单点击时取「第 i 个已装插件名」（与 build_plugins_submenu 的排序一致）。
+fn installed_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<String> {
+    let cfg = load_cached();
+    let installed = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
+    let mut sorted: Vec<(&String, &String)> = installed.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    sorted.get(index).map(|(name, _)| (*name).clone())
+}
+
 /// 供菜单点击时取「第 i 个待装插件名」（与 build_sync_submenu 的索引一致）。
 fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<String> {
     let cfg = load_cached();
+    let current_profile = resolve_profile(&cfg);
     let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
     let state = crate::sync::load_state(app, &cfg);
     state
         .cached_config
         .as_ref()
         .and_then(|c| {
-            crate::sync::pending_with_updates(&c.plugins, &installed_with_ver, &state.plugin_latest_versions)
+            let cur = crate::sync::plugins_for_profile(c, &current_profile);
+            crate::sync::pending_with_updates(&cur, &installed_with_ver, &state.plugin_latest_versions)
                 .get(index)
                 .and_then(|p| p["name"].as_str().map(|s| s.to_string()))
         })
@@ -728,6 +788,9 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                                 crate::ops::finish_op(&h, &format!("{name}：{url}"));
                                 notify(&h, "Profile 已切换", &format!("{name}：{url}"));
                                 refresh_sync_menu(&h);
+                                // 切换后对齐插件清单：装新 profile 的插件、自动卸下架的旧预置
+                                // （实现「选中哪个 profile 就该是哪个」，清单由服务端下发）
+                                crate::install::apply_profile_plugins(&h).await;
                             }
                             Err(e) => {
                                 crate::ops::fail_op(&h, &e);
@@ -1059,6 +1122,39 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                             Err(e) => {
                                 crate::ops::fail_op(&h, &e);
                                 notify(&h, "插件清理失败", &e);
+                                refresh_sync_menu(&h);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        id if id.starts_with("plugin-uninstall-") => {
+            // 已装插件一键卸载（用户自主操作）：二次确认后卸载
+            let idx = id
+                .strip_prefix("plugin-uninstall-")
+                .and_then(|s| s.parse::<usize>().ok());
+            if let Some(idx) = idx {
+                if let Some(name) = installed_plugin_at(app, idx) {
+                    if !confirm_uninstall(&name, "卸载后该插件将从当前 profile 移除") {
+                        notify(app, "已取消", &format!("未卸载 {name}"));
+                        return;
+                    }
+                    let h = app.clone();
+                    let name_clone = name.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::ops::start_op(&h, "plugin-uninstall", "卸载插件", &["卸载插件"]);
+                        crate::ops::mark_step_running(&h, 0);
+                        crate::ops::update_step(&h, &format!("正在卸载 {name_clone}…"));
+                        match crate::sync::uninstall_plugin(&h, &name).await {
+                            Ok(()) => {
+                                crate::ops::finish_op(&h, &format!("{name_clone} 已卸载"));
+                                notify(&h, "插件已卸载", &format!("{name_clone} 已卸载"));
+                                refresh_sync_menu(&h);
+                            }
+                            Err(e) => {
+                                crate::ops::fail_op(&h, &e);
+                                notify(&h, "插件卸载失败", &e);
                                 refresh_sync_menu(&h);
                             }
                         }

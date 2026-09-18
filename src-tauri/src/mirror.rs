@@ -400,11 +400,12 @@ pub fn start_mirror_upload<R: Runtime>(
     let registry = registry.to_string();
     let token = token.to_string();
 
-    // 应装清单来自服务端缓存的配置（SyncState.cached_config.plugins）
+    // 应装清单来自服务端缓存的配置（全局 plugins + 所有 profilePlugins 的并集）。
+    // 内网 registry 要镜像所有 profile 用得到的插件，不能只镜像全局清单。
     log::info!("mirror:: 读取 sync-state…");
     let mut plugins: Vec<String> = crate::sync::load_state(&h, &cfg)
         .cached_config
-        .map(|c| c.plugins)
+        .map(|c| crate::sync::all_plugins(&c))
         .unwrap_or_default();
     log::info!("mirror:: sync-state 读取完成，plugins={}", plugins.len());
     // 单包模式：只同步指定插件

@@ -578,7 +578,12 @@ pub struct WizardState {
 /// 返回 [{name, installed, latest, action}]，action ∈ install | update。
 fn pending_plugin_diff<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig) -> Vec<serde_json::Value> {
     let state = crate::sync::load_state(app, cfg);
-    let Some(recommended) = state.cached_config.as_ref().map(|c| c.plugins.clone()) else {
+    // 数字分身向导面向 matrix profile，按 matrix 的清单取（profilePlugins.matrix 优先）。
+    let Some(recommended) = state
+        .cached_config
+        .as_ref()
+        .map(|c| crate::sync::plugins_for_profile(c, MATRIX_PROFILE))
+    else {
         return Vec::new();
     };
     let installed = crate::sync::installed_plugins_current_profile_with_versions(app, cfg);

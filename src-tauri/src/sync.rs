@@ -36,6 +36,10 @@ pub struct ServerConfig {
     pub version: Option<u64>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    /// 按 profile 精确下发的插件清单：`{ "<profileName>": ["pkg", ...] }`。
+    /// 客户端切换/运行某 profile 时优先用这里的清单，缺省回落 `plugins`（全局）。
+    #[serde(default, rename = "profilePlugins")]
+    pub profile_plugins: std::collections::HashMap<String, Vec<String>>,
     #[serde(default)]
     pub updated_at: Option<String>,
     #[serde(default)]
@@ -606,6 +610,44 @@ pub fn plugins_to_remove(
     out
 }
 
+/// 解析「当前 profile 应装的插件清单」。
+///
+/// 优先级：服务端 `profilePlugins[当前profile]` → 服务端全局 `plugins`（兜底）。
+/// 这是"预置插件由服务端配置、选中哪个 profile 就该装哪个"的核心取值入口。
+///
+/// 语义（关键）：
+/// - `profilePlugins` 里有该 profile 的键（**哪怕是空数组**）→ 用该清单，
+///   空数组 = 该 profile 明确「不装任何预置插件」，**不回落全局**；
+/// - `profilePlugins` 里没有该 profile 的键 → 回落全局 `plugins`（兼容旧配置）。
+pub fn plugins_for_profile(config: &ServerConfig, profile: &str) -> Vec<String> {
+    if let Some(list) = config.profile_plugins.get(profile) {
+        return list.clone();
+    }
+    config.plugins.clone()
+}
+
+/// 服务端配置里【全部】应装插件的并集（全局 plugins + 所有 profilePlugins 的去重）。
+///
+/// 用于镜像上传等「跨 profile 全集」场景：内网 registry 需要镜像所有 profile
+/// 用得到的插件，不能只镜像全局清单（否则 profilePlugins 里的插件同事内网装不上）。
+pub fn all_plugins(config: &ServerConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for p in &config.plugins {
+        if seen.insert(p.clone()) {
+            out.push(p.clone());
+        }
+    }
+    for list in config.profile_plugins.values() {
+        for p in list {
+            if seen.insert(p.clone()) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
 /// 卸载一个插件：`node <dsh>/lib/bin.js plugin --profile <当前profile> remove <name>`。
 ///
 /// 与 `install_plugin` 对称：同样的 node/dsh 定位、同样的 child_env、
@@ -840,10 +882,14 @@ pub async fn sync_once<R: Runtime>(
 
     let outcome = match fetch_config(&server_url, &token).await {
         Ok(config) => {
+            // 当前 profile 应装的插件清单（profilePlugins[当前] 优先，回落全局 plugins）。
+            let current_profile = resolve_profile(cfg);
+            let current_plugins = plugins_for_profile(&config, &current_profile);
             // 版本检查：查 registry 最新版（带缓存），已装但落后的计入待处理。
+            // 查的是当前 profile 清单里的插件（只关心同事当前运行 profile 用得到的）。
             // 手动同步（force=true）忽略缓存强制重查。
-            let latest = refresh_plugin_latest_versions(app, cfg, &config.plugins, &mut state, force_version_check).await;
-            let pending_entries = pending_with_updates(&config.plugins, &installed_with_ver, &latest);
+            let latest = refresh_plugin_latest_versions(app, cfg, &current_plugins, &mut state, force_version_check).await;
+            let pending_entries = pending_with_updates(&current_plugins, &installed_with_ver, &latest);
             // 纯名字列表（通知/上报用）
             let pending: Vec<String> = pending_entries
                 .iter()
@@ -855,16 +901,18 @@ pub async fn sync_once<R: Runtime>(
             state.cached_managed_menu = config.managed_menu.clone();
             // 计算「管理员下架」：旧清单 − 新清单，且只针对曾推荐过的插件（口径 A）。
             // 必须在覆盖 cached_config 之前用旧值做差集。
+            // 按当前 profile 维度做差集：切到某 profile 后，该 profile 清单里消失的
+            // 插件才算「下架」（而非全局清单的消失）。
             let previous_plugins: Vec<String> = state
                 .cached_config
                 .as_ref()
-                .map(|c| c.plugins.clone())
+                .map(|c| plugins_for_profile(c, &current_profile))
                 .unwrap_or_default();
             // 先把本次清单并入历史集合（跨会话累积，只增不减）
-            for p in &config.plugins {
+            for p in &current_plugins {
                 state.server_seen_plugins.insert(p.clone());
             }
-            let removed = plugins_to_remove(&previous_plugins, &config.plugins, &state.server_seen_plugins);
+            let removed = plugins_to_remove(&previous_plugins, &current_plugins, &state.server_seen_plugins);
             state.cached_config = Some(config.clone());
             state.last_installed = installed_all.clone();
             state.last_removed = removed.clone();
@@ -873,8 +921,9 @@ pub async fn sync_once<R: Runtime>(
             // 菜单策略可能变化 → 刷新托盘
             tray::refresh_sync_menu(app);
             log::info!(
-                "同步成功：应装 {} 个插件，本机待装 {} 个；建议卸载 {} 个；菜单策略 {}",
-                config.plugins.len(),
+                "同步成功：当前 profile {} 应装 {} 个插件，本机待装 {} 个；建议卸载 {} 个；菜单策略 {}",
+                current_profile,
+                current_plugins.len(),
                 pending.len(),
                 removed.len(),
                 if config.managed_menu.as_ref().map(|m| m.enabled).unwrap_or(false) { "启用" } else { "关闭" }
@@ -890,11 +939,13 @@ pub async fn sync_once<R: Runtime>(
         Err(e) => {
             log::warn!("同步失败（离线？）：{e}；使用缓存配置");
             // 离线：用缓存配置 + 缓存的最新版本信息继续（版本判断用上次查到的）
+            let current_profile = resolve_profile(cfg);
             let pending: Vec<String> = state
                 .cached_config
                 .as_ref()
                 .map(|c| {
-                    crate::sync::pending_with_updates(&c.plugins, &installed_with_ver, &state.plugin_latest_versions)
+                    let cur = plugins_for_profile(c, &current_profile);
+                    crate::sync::pending_with_updates(&cur, &installed_with_ver, &state.plugin_latest_versions)
                         .iter()
                         .filter_map(|p| p["name"].as_str().map(|s| s.to_string()))
                         .collect()
@@ -1386,6 +1437,46 @@ mod tests {
         let current: Vec<String> = vec![];
         let seen: HashSet<String> = ["x", "y"].iter().map(|s| s.to_string()).collect();
         assert_eq!(plugins_to_remove(&previous, &current, &seen), vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn plugins_for_profile_prefers_profile_list() {
+        // profilePlugins 命中 → 用该 profile 的清单，而非全局 plugins
+        let json = r#"{"plugins":["global-a"],"profilePlugins":{"matrix":["matrix-a","matrix-b"]}}"#;
+        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            plugins_for_profile(&cfg, "matrix"),
+            vec!["matrix-a".to_string(), "matrix-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn plugins_for_profile_falls_back_to_global() {
+        // 该 profile 无专属清单 → 回落全局 plugins
+        let json = r#"{"plugins":["global-a","global-b"],"profilePlugins":{"web":["web-a"]}}"#;
+        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            plugins_for_profile(&cfg, "matrix"),
+            vec!["global-a".to_string(), "global-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn plugins_for_profile_empty_profile_list_means_no_preset() {
+        // 该 profile 明确配了空数组 → 返回空（不回落全局），表示「不装任何预置插件」
+        let json = r#"{"plugins":["global-a"],"profilePlugins":{"matrix":[]}}"#;
+        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(plugins_for_profile(&cfg, "matrix"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn profile_plugins_deserializes_from_camel_case() {
+        // ServerConfig 的 profilePlugins（camelCase）→ profile_plugins（snake_case）字段映射
+        let json = r#"{"profilePlugins":{"matrix":["a"],"web":["b","c"]}}"#;
+        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.profile_plugins.get("matrix").unwrap(), &vec!["a".to_string()]);
+        assert_eq!(cfg.profile_plugins.get("web").unwrap(), &vec!["b".to_string(), "c".to_string()]);
+        assert!(cfg.profile_plugins.get("nope").is_none());
     }
 
     #[test]

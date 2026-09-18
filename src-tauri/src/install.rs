@@ -9,24 +9,10 @@ use tauri::{AppHandle, Runtime};
 use crate::config::*;
 use crate::download::Component;
 
-/// 预置插件清单（对齐桌面端 web profile 的常用插件）。
-/// 首个 add 会自动初始化 web profile（dsh-base + dsh-web-app）。
-/// 全部不带版本号：`dsh plugin add <pkg>` 默认装最新版；包会持续更新，
-/// 已装的保持现状（如需升级由服务端推荐/手动 add 新版本触发）。
-pub const PRESET_PLUGINS: &[&str] = &[
-    "dsh-codebuddy-models",
-    "dsh-nested-followups",
-    "dsh-plugin-message-rewrite",
-    "@noob-stupid/dsh-plugin-console",
-];
-
-/// matrix profile（数字分身）的本地插件源。
+/// matrix profile（数字分身）的本地插件源名。
 /// - dsh-matrix-agent：Matrix 桥接（已发布到 npmjs / npmmirror / 内网 registry.ict.cmcc）
 /// - launcher-brand：内置品牌名称覆盖插件（file: 引用，随 launcher 分发）
 pub const MATRIX_PROFILE: &str = "matrix";
-
-/// dsh-matrix-agent 的 npm 包名（从 registry 安装，不带版本 = 最新版）。
-pub const MATRIX_AGENT_PACKAGE: &str = "dsh-matrix-agent";
 
 /// 安装 / 修复全部组件 + 预置 profile 插件。
 pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -40,8 +26,7 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         "下载 / 安装 Node.js",
         "安装 pnpm",
         "下载 Harness 核心",
-        "预置 web 插件",
-        "预置 matrix 数字分身",
+        "预置 profile 插件",
         "安装服务器推荐插件",
     ];
     crate::ops::start_op(app, "install", "安装 / 修复", &steps);
@@ -122,26 +107,22 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // cmd.exe 找不到裸 pnpm.cjs；pnpm 官方安装包仅含 pnpm.cjs）
     ensure_pnpm_shim(app);
 
-    // 把 launcher-brand 插件复制到 <dsh_home>/launcher-brand（供 file: 引用）
+    // 把 launcher-brand 插件复制到 <dsh_home>/launcher-brand（供 file: 引用）。
+    // 注意：这里只【释放】本地插件源；是否装进哪个 profile 由服务端清单决定
+    // （见下 install_server_recommended），不再代码里硬编码预置任何插件。
     copy_launcher_brand(app, &cfg);
 
-    // 预置 web profile 插件（幂等：已装的自动跳过/更新）
+    // 预置当前生效 profile 的插件（服务器清单驱动，选中哪个 profile 就装哪个）。
+    // 合并了原「预置 web」「预置 matrix」两步——预置来源从代码硬编码改为服务端下发。
     crate::ops::mark_step_running(app, 4);
-    crate::ops::update_step(app, "预置 web 插件…");
-    crate::notify::notify(app, "安装 / 修复", "预置 web 插件…");
-    let web_packages: Vec<String> = PRESET_PLUGINS.iter().map(|s| s.to_string()).collect();
-    preset_profile(app, &cfg, "web", &web_packages).await?;
-
-    // 预置 matrix profile（数字分身）：dsh-matrix-agent + launcher-brand + 品牌 patch
-    crate::ops::mark_step_running(app, 5);
-    crate::ops::update_step(app, "预置 matrix 数字分身…");
-    crate::notify::notify(app, "安装 / 修复", "预置 matrix 数字分身…");
-    preset_matrix_profile(app, &cfg).await?;
+    crate::ops::update_step(app, "预置 profile 插件…");
+    crate::notify::notify(app, "安装 / 修复", "预置 profile 插件…");
+    preset_current_profile(app, &cfg).await?;
 
     // 服务器推荐的插件装到当前生效 profile（同事实际运行的 profile）。
-    // 默认 profile 是 matrix，服务器推荐的 web 类插件（如 dsh-codebuddy-models）
-    // 必须装到这里才会在运行实例里生效——装到 web profile 对 matrix 用户不可见。
-    crate::ops::mark_step_running(app, 6);
+    // 与上一步「预置 profile 插件」共用一个清单来源（profilePlugins 优先、plugins 兜底），
+    // 这里负责补装/更新（含 registry 最新版比对），失败不阻断。
+    crate::ops::mark_step_running(app, 5);
     crate::ops::update_step(app, "安装服务器推荐插件…");
     crate::notify::notify(app, "安装 / 修复", "安装服务器推荐插件…");
     install_server_recommended(app, &cfg).await?;
@@ -159,15 +140,21 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 
 /// 把服务器推荐的、当前 profile 未装或版本落后的插件安装/更新到当前 profile。
 /// 失败不阻断（仅日志+通知），避免单个插件问题拖垮整个安装流程。
-async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+pub async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
     let server_url = resolve_server_url(cfg);
     if server_url.is_empty() {
         log::info!("未配置服务端，跳过服务器推荐插件安装");
         return Ok(());
     }
-    // 用本地缓存的推荐清单（sync 循环已缓存；离线也能装上次拉到的）
+    // 用本地缓存的推荐清单（sync 循环已缓存；离线也能装上次拉到的）。
+    // 清单按当前 profile 精确取：profilePlugins[当前] 优先，回落全局 plugins。
+    let profile = resolve_profile(cfg);
     let state = crate::sync::load_state(app, cfg);
-    let Some(recommended) = state.cached_config.as_ref().map(|c| c.plugins.clone()) else {
+    let Some(recommended) = state
+        .cached_config
+        .as_ref()
+        .map(|c| crate::sync::plugins_for_profile(c, &profile))
+    else {
         log::info!("暂无服务端推荐清单缓存，跳过");
         return Ok(());
     };
@@ -195,7 +182,6 @@ async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
         log::info!("当前 profile 无待装/待更新推荐插件");
         return Ok(());
     }
-    let profile = resolve_profile(cfg);
     log::info!("安装/更新服务器推荐插件到 {profile}：{}", specs.join(", "));
     let result = preset_profile(app, cfg, &profile, &specs).await;
     // 安装结果不影响整体完成（失败有日志 + 托盘可重试）
@@ -206,6 +192,62 @@ async fn install_server_recommended<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
     // 安装后刷新托盘（pending 归零则不再提示待装）
     crate::tray::refresh_sync_menu(app);
     result
+}
+
+/// 切换 profile 后调用：让当前 profile 的插件清单与服务端对齐。
+///
+/// 流程（实现「选中哪个 profile 就该是哪个」）：
+/// 1. 强制同步一次（拉到服务端最新 profilePlugins，按当前 profile 计算 pending/removed）；
+/// 2. 安装当前 profile 清单里待装/待更新的插件；
+/// 3. 自动卸载「曾经的预置插件、本次清单已下架」的插件（口径 A：只在 server_seen
+///    集合里出现过的才卸，同事自己手动装的绝不碰）。
+///
+/// 失败不阻断（仅日志 + 通知）：单个插件问题不应拖垮 profile 切换本身。
+pub async fn apply_profile_plugins<R: Runtime>(app: &AppHandle<R>) {
+    let cfg = load_cached();
+    if resolve_server_url(&cfg).is_empty() {
+        log::info!("未配置服务端，跳过 profile 插件对齐");
+        return;
+    }
+
+    // 1. 强制同步（拉最新配置；force=true 忽略 registry 版本缓存）
+    let outcome = crate::sync::sync_once(app, &cfg, None, true).await;
+
+    // 2. 安装当前 profile 待装/待更新插件
+    if let Err(e) = install_server_recommended(app, &cfg).await {
+        log::warn!("profile 插件安装未完成（不阻断）：{e}");
+    }
+
+    // 3. 自动卸载「曾经预置、现已下架」的插件（口径 A）
+    //    注意：这里只对「曾在服务端清单里出现过」的插件自动卸载——
+    //    同事自己手动装的插件从未进过 server_seen_plugins，不会被碰。
+    let removed = outcome.removed;
+    if !removed.is_empty() {
+        let profile = resolve_profile(&cfg);
+        let installed = crate::sync::installed_plugins_current_profile(app, &cfg);
+        let installed_set: std::collections::HashSet<&str> =
+            installed.iter().map(|s| s.as_str()).collect();
+        for name in &removed {
+            if !installed_set.contains(name.as_str()) {
+                continue; // 已不在当前 profile，无需卸载
+            }
+            match crate::sync::uninstall_plugin(app, name).await {
+                Ok(()) => {
+                    log::info!("已自动卸载下架的预置插件：{name}（profile={profile}）");
+                    crate::notify::notify(
+                        app,
+                        "插件已自动卸载",
+                        &format!("服务端已下架 {name}，已从 {profile} profile 卸载"),
+                    );
+                }
+                Err(e) => {
+                    log::warn!("自动卸载 {name} 失败（不阻断）：{e}");
+                }
+            }
+        }
+    }
+
+    crate::tray::refresh_sync_menu(app);
 }
 
 /// 补齐缺失的 bundle patch 文件。
@@ -728,32 +770,38 @@ pub async fn preset_profile<R: Runtime>(
     Ok(())
 }
 
-/// 预置 matrix profile（数字分身）：
-/// 1. 写 .npmrc（加速源）
-/// 2. `dsh plugin --profile matrix add launcher-brand`（file: 本地插件，先建 profile）
-/// 3. 把 `@deepseek-ai/dsh-web-app` 加进 bundles（dsh 内置 bundle，从 dsh 安装目录解析，
-///    无需 pnpm 安装——registry 上的 dsh-web-app 是旧版 0.0.1-rc.1）
-/// 4. `dsh plugin --profile matrix add dsh-matrix-agent`（link: 本地包）
-/// 5. 写 cordis.patch.yml（配置品牌名称）
-pub async fn preset_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
-    let brand_src = dsh_home(app, cfg).join("launcher-brand");
+/// 预置当前生效 profile 的结构性骨架（不含"装哪些插件"——那由服务端清单决定）。
+///
+/// 职责：
+/// - 通用：预写当前 profile 的 .npmrc（加速源）；
+/// - matrix profile 额外：释放 launcher-brand（file: 本地源）→ 加入 builtin bundle
+///   `@deepseek-ai/dsh-web-app` → 写品牌 patch → 下发环境默认配置。
+///
+/// 注意：不再在此处硬编码 add 任何插件。插件清单统一由服务端 `profilePlugins`
+/// （回落 `plugins`）驱动，在 `install_server_recommended` 中安装/更新。
+pub async fn preset_current_profile<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+    let profile = resolve_profile(cfg);
+    // 通用：预写当前 profile 的 .npmrc
+    let _ = crate::plugin::ensure_profile_npmrc_for(app, cfg, &profile);
 
-    if !brand_src.join("package.json").exists() {
-        log::warn!("launcher-brand 未就绪，跳过 matrix profile 预置");
-        return Ok(());
+    // matrix profile：额外做结构性骨架（launcher-brand 释放已在 install_all 前置完成）
+    if profile == MATRIX_PROFILE {
+        preset_matrix_profile(app, cfg).await?;
     }
 
-    // 预写 matrix profile 的 .npmrc（确保拉包走加速源/内网 registry.ict.cmcc）
-    let _ = crate::plugin::ensure_profile_npmrc_for(app, cfg, MATRIX_PROFILE);
+    log::info!("当前 profile {profile} 骨架预置完成（插件由服务端清单驱动）");
+    Ok(())
+}
 
-    // 装 launcher-brand（file:）——触发 profile 初始化
-    let brand_spec = format!("file:{}", brand_src.to_string_lossy());
-    preset_profile(app, cfg, MATRIX_PROFILE, &[brand_spec]).await?;
-
-    // 装 dsh-matrix-agent（从 registry 安装：npmjs / npmmirror / 内网 registry.ict.cmcc
-    // 均有发布；npm_config_registry 指向哪个源由用户配置或地域决定）
-    preset_profile(app, cfg, MATRIX_PROFILE, &[MATRIX_AGENT_PACKAGE.to_string()]).await?;
-
+/// matrix profile 的结构性骨架（不含插件安装）：
+/// 1. 把 `@deepseek-ai/dsh-web-app` 加进 bundles（dsh 内置 bundle，从安装目录解析，
+///    agent-presets / webserver 等 host 服务，dsh-matrix-agent 依赖它们）
+/// 2. 写 cordis.patch.yml（配置品牌名称）
+/// 3. 下发环境默认配置（各内网服务地址等统一值）到 settings.yaml
+///
+/// launcher-brand / dsh-matrix-agent 等插件本身由服务端 profilePlugins.matrix 清单
+/// 决定是否安装（见 install_server_recommended）。
+pub async fn preset_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
     // 把 @deepseek-ai/dsh-web-app 加入 bundles（dsh 内置，从安装目录解析；提供
     // agent-presets / webserver 等 host 服务，dsh-matrix-agent 依赖它们）
     add_builtin_bundle(app, cfg, MATRIX_PROFILE, "@deepseek-ai/dsh-web-app")?;
@@ -792,6 +840,27 @@ fn add_builtin_bundle<R: Runtime>(
         .join("profiles")
         .join(profile)
         .join("package.json");
+    // manifest 不存在（profile 尚未初始化）→ 先建最小骨架，再往下写 bundles。
+    // 之前靠「先 add launcher-brand 触发 profile 初始化」保证 manifest 存在；
+    // 现在插件安装由服务端清单驱动、与骨架解耦，故在此兜底创建。
+    if !manifest_path.exists() {
+        if let Some(parent) = manifest_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("PROFILE_DIR_CREATE_FAILED: {e}"))?;
+        }
+        let minimal = serde_json::json!({
+            "name": format!("dsh-profile-{profile}"),
+            "private": true,
+            "dsh": { "profile": { "bundles": [] } }
+        });
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&minimal)
+                .map_err(|e| format!("PROFILE_MANIFEST_SERIALIZE_FAILED: {e}"))?,
+        )
+        .map_err(|e| format!("PROFILE_MANIFEST_WRITE_FAILED: {e}"))?;
+        log::info!("已初始化 {profile} profile manifest（最小骨架）");
+    }
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("PROFILE_MANIFEST_READ_FAILED: {e}"))?;
     let mut json: serde_json::Value = serde_json::from_str(&text)
