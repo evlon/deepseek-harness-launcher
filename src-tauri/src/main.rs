@@ -20,6 +20,7 @@ mod mirror;
 mod notify;
 mod ops;
 mod plugin;
+mod reset;
 mod self_update;
 mod speedtest;
 mod sync;
@@ -31,6 +32,9 @@ static AUTO_SETUP_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// 本次进程是否已自动弹过「首次使用」欢迎窗口（防骚扰：只弹一次）。
 static FIRST_RUN_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 本次进程是否已自动弹过「找回会话」询问（防骚扰：只弹一次）。
+static RESTORE_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() {
     // 解析 CLI 参数（--cmd 等）
@@ -188,6 +192,29 @@ fn main() {
                                 crate::notify::notify(&h, "配置数字分身", "首次使用请先配置数字分身（填账号后即可用）");
                             }
                             Err(e) => log::warn!("自动弹配置向导失败：{e}"),
+                        }
+                    }
+
+                    // 找回会话：上次「一键重置」保留了会话历史，本次启动且当前无任何
+                    // DSH 用户数据（刚重置/重装完）→ 询问是否恢复。只问一次。
+                    if RESTORE_SHOWN.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                        if let Some(backup) = crate::reset::detect_backup(&h) {
+                            if crate::reset::has_no_user_data(&h, &cfg) {
+                                log::info!("检测到会话备份且当前无 DSH 数据，询问是否恢复：{}", backup.display());
+                                if crate::reset::confirm_restore() {
+                                    match crate::reset::restore_backup(&h, &backup, &cfg) {
+                                        Ok(()) => {
+                                            crate::notify::notify(&h, "会话已找回", "上次保留的会话历史已恢复。");
+                                        }
+                                        Err(e) => {
+                                            log::warn!("恢复会话失败：{e}");
+                                            crate::notify::notify(&h, "恢复会话失败", &e);
+                                        }
+                                    }
+                                } else {
+                                    log::info!("用户选择不恢复上次的会话历史");
+                                }
+                            }
                         }
                     }
                 });

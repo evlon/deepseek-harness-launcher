@@ -51,6 +51,9 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         })
         .build(app)?;
 
+    // 初始 tooltip：版本 + 状态（悬停提示），状态变化由 refresh_sync_menu → update_tray_tooltip 刷新
+    update_tray_tooltip(app);
+
     Ok(())
 }
 
@@ -63,6 +66,43 @@ pub fn refresh_sync_menu<R: Runtime>(app: &AppHandle<R>) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         if let Err(e) = tray.set_menu(Some(menu)) {
             log::warn!("更新托盘菜单失败：{e}");
+        }
+    }
+    update_tray_tooltip(app);
+}
+
+/// 刷新系统托盘图标 tooltip：鼠标悬停图标时显示「launcher 版本 + 数字分身 / 管理能力状态」。
+/// 复用 refresh_sync_menu 的调用点（同步/启停/bridge 等操作后都会走到），
+/// 用 tray_by_id 原地更新，无需额外存储句柄。
+pub fn update_tray_tooltip<R: Runtime>(app: &AppHandle<R>) {
+    let mut parts = vec![format!("DeepSeek Harness Launcher v{}", env!("CARGO_PKG_VERSION"))];
+
+    // 数字分身（matrix profile 进程）运行态
+    parts.push(if crate::workflow::is_running() {
+        "数字分身：运行中".to_string()
+    } else {
+        "数字分身：停止".to_string()
+    });
+
+    // 数字分身账号是否已配置（区分「没配 / 配了」）
+    let cfg = load_cached();
+    match crate::matrix_setup::status(app, &cfg) {
+        crate::matrix_setup::MatrixStatus::Configured => parts.push("账号：已配置".to_string()),
+        crate::matrix_setup::MatrixStatus::NotInstalled => parts.push("账号：未安装".to_string()),
+        crate::matrix_setup::MatrixStatus::Unconfigured { .. } => parts.push("账号：未配置".to_string()),
+    }
+
+    // 管理能力（bridge）运行态
+    parts.push(if crate::admin_bridge::is_running() {
+        format!("管理能力：开启（端口 {}）", crate::admin_bridge::port().map(|p| p.to_string()).unwrap_or_else(|| "?".into()))
+    } else {
+        "管理能力：关闭".to_string()
+    });
+
+    let tip = parts.join("  ·  ");
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Err(e) = tray.set_tooltip(Some(tip)) {
+            log::warn!("更新托盘 tooltip 失败：{e}");
         }
     }
 }
@@ -249,14 +289,16 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     items.push(&dsh_submenu);
     items.push(&bridge_submenu);
 
-    // 收尾：查看日志 / 收集日志（排障回传） / 重装内网证书 / 退出
+    // 收尾：查看日志 / 收集日志（排障回传） / 重装内网证书 / 一键重置（清空 DSH 数据） / 退出
     let log_item = MenuItem::with_id(app, "log", "查看日志", true, None::<&str>)?;
     let logpack_item = MenuItem::with_id(app, "logpack", "📦 收集日志（发给管理员排障）", true, None::<&str>)?;
     let cert_item = MenuItem::with_id(app, "cert-reinstall", "🔐 重装内网证书", true, None::<&str>)?;
+    let reset_item = MenuItem::with_id(app, "reset", "🗑 重置（清空数字分身数据）", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     items.push(&log_item);
     items.push(&logpack_item);
     items.push(&cert_item);
+    items.push(&reset_item);
     items.push(&quit_item);
 
     let menu = Menu::with_items(app, &items)?;
@@ -1279,6 +1321,76 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     }
                 }
             }
+        }
+        "reset" => {
+            // 预防性挡：有进行中的长操作则拒绝（避免清数据时被并发覆盖）
+            if crate::ops::has_running() {
+                notify(app, "一键重置", "已有操作进行中，请稍候再点");
+                return;
+            }
+            // 二次确认：三选一（备份后清空 / 彻底清空 / 取消）
+            let choice = crate::reset::confirm_reset_choice();
+            match choice {
+                crate::reset::ResetChoice::Cancel => {
+                    notify(app, "一键重置", "已取消，未做任何改动");
+                    return;
+                }
+                crate::reset::ResetChoice::BackupThenClear => {
+                    log::info!("一键重置：选择「备份会话后清空」");
+                }
+                crate::reset::ResetChoice::Wipe => {
+                    log::info!("一键重置：选择「彻底清空」");
+                }
+            }
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(
+                    &h,
+                    "reset",
+                    "重置数字分身",
+                    &["停止数字分身", "备份/清理数据"],
+                );
+                // 1) 先停 Harness（释放文件锁，否则删不掉正在用的文件）
+                crate::ops::mark_step_running(&h, 0);
+                crate::ops::update_step(&h, "正在停止数字分身…");
+                crate::workflow::stop();
+                std::thread::sleep(std::time::Duration::from_millis(600));
+
+                let cfg = load_cached();
+                // 2) 按选择决定是否先备份
+                if choice == crate::reset::ResetChoice::BackupThenClear {
+                    crate::ops::mark_step_running(&h, 1);
+                    crate::ops::update_step(&h, "正在备份会话历史…");
+                    match crate::reset::backup_user_data(&h, &cfg) {
+                        Ok(dir) => {
+                            log::info!("重置前会话已备份到 {}", dir.display());
+                        }
+                        Err(e) => {
+                            // 备份失败不阻断清空，但如实记录
+                            log::warn!("重置前备份会话失败（继续清空）：{e}");
+                        }
+                    }
+                }
+                // 3) 清空 DSH 用户数据
+                crate::ops::mark_step_running(&h, 1);
+                crate::ops::update_step(&h, "正在清空数字分身数据…");
+                match crate::reset::clear_dsh_data(&h, &cfg) {
+                    Ok(()) => {
+                        let msg = if choice == crate::reset::ResetChoice::BackupThenClear {
+                            "数字分身数据已清空，会话历史已保留。\n下次启动时会询问是否找回会话。"
+                        } else {
+                            "数字分身数据已彻底清空。\n重启 launcher 后重新安装即可。"
+                        };
+                        crate::ops::finish_op(&h, msg);
+                        notify(&h, "重置完成", msg);
+                    }
+                    Err(e) => {
+                        crate::ops::fail_op(&h, &e);
+                        notify(&h, "重置失败", &e);
+                    }
+                }
+                refresh_sync_menu(&h);
+            });
         }
         "quit" => {
             QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
