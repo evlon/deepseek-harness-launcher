@@ -70,8 +70,10 @@ pub const ENV_DEFAULTS: &[EnvDefault] = &[
     // 是否对外暴露"我在做什么"应由本人决定，launcher 不代劳。
 
     // ── 数字分身（dsh-matrix-agent）──
-    // homeserverUrl 是环境地址（统一）；userId/accessToken/owner 是个人凭据（下发不了）
-    EnvDefault { namespace: "dsh-matrix", key: "homeserverUrl", value: "https://im-ipm.ict.cmcc" },
+    // homeserverUrl 是环境地址（统一）；userId/accessToken/owner 是个人凭据（下发不了）。
+    // homeserver 不硬编码默认：由服务端 envDefaults 下发；未下发则留空（不会静默
+    // 回落过时域名，matrix-setup 会以「homeserverUrl 缺失」提示用户配置）。
+    EnvDefault { namespace: "dsh-matrix", key: "homeserverUrl", value: "" },
     EnvDefault { namespace: "dsh-matrix", key: "provider", value: "codebuddy" },
     EnvDefault { namespace: "dsh-matrix", key: "model", value: "deepseek-v4-flash" },
 
@@ -94,7 +96,9 @@ pub const ENV_DEFAULTS: &[EnvDefault] = &[
     EnvDefault { namespace: "matrix-activation", key: "keycloakIssuer", value: "https://auth.ict.cmcc/realms/himarket" },
     EnvDefault { namespace: "matrix-activation", key: "clientId", value: "matrix-twin-activation" },
     EnvDefault { namespace: "matrix-activation", key: "activateEndpoint", value: "http://im.ai.ict.cmcc/_matrix/activate" },
-    EnvDefault { namespace: "matrix-activation", key: "homeserverUrl", value: "https://im-ipm.ict.cmcc" },
+    // homeserver 不硬编码默认：服务端 envDefaults 下发；未下发则留空（激活时因
+    // homeserverUrl 缺失明确失败提示，不静默回落旧域名）。
+    EnvDefault { namespace: "matrix-activation", key: "homeserverUrl", value: "" },
 ];
 
 /// 应用环境默认值到 settings.yaml（**只填空缺**，不覆盖用户已设的）。
@@ -135,6 +139,12 @@ pub fn apply_env_defaults_to_file(path: &Path) -> Result<(usize, usize), String>
             Some(Value::String(s)) => s.trim().is_empty(),
             Some(_) => false, // 非字符串值（数字/布尔/列表）视为已设置
         };
+
+        // 默认值为空串 = 「不硬编码默认」，该键应由服务端 envDefaults 下发或用户手填。
+        // 不写入、不参与 filled/skipped 统计——本默认项不产生任何写入（保幂等、不落空串）。
+        if d.value.is_empty() {
+            continue;
+        }
 
         if cur_empty {
             map.insert(key, Value::String(d.value.to_string()));
@@ -299,10 +309,14 @@ mod tests {
         let p = tmp_path("fill");
         let _ = std::fs::remove_file(&p);
         let (filled, _) = apply_env_defaults_to_file(&p).unwrap();
-        assert_eq!(filled, ENV_DEFAULTS.len());
+        // 空默认值的键（homeserverUrl x2）不参与填充，只填有实际默认值的键
+        let nonempty = ENV_DEFAULTS.iter().filter(|d| !d.value.is_empty()).count();
+        assert_eq!(filled, nonempty);
         let txt = std::fs::read_to_string(&p).unwrap();
         assert!(txt.contains("rosterUrl: http://roster.ai.ict.cmcc"));
-        assert!(txt.contains("homeserverUrl: https://im-ipm.ict.cmcc"));
+        // homeserverUrl 默认空 = 不硬编码：不得出现旧/任何硬编码域名
+        assert!(!txt.contains("im-ipm.ict.cmcc"), "不得再硬编码旧域名");
+        assert!(!txt.contains("homeserverUrl"), "空默认可写键不应被持久化");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -337,7 +351,7 @@ mod tests {
         let txt = std::fs::read_to_string(&p).unwrap();
         assert!(txt.contains("@me:im-ipm.ict.cmcc"), "个人凭据必须保留");
         assert!(txt.contains("tok"));
-        assert!(txt.contains("homeserverUrl: https://im-ipm.ict.cmcc"), "环境地址应填充");
+        assert!(!txt.contains("homeserverUrl"), "homeserverUrl 默认空=不硬编码，不应被写入（避免旧域名/空壳键）");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -349,7 +363,8 @@ mod tests {
         assert!(f1 > 0);
         let (f2, s2) = apply_env_defaults_to_file(&p).unwrap();
         assert_eq!(f2, 0, "第二次运行不该再填");
-        assert_eq!(s2, ENV_DEFAULTS.len());
+        let nonempty = ENV_DEFAULTS.iter().filter(|d| !d.value.is_empty()).count();
+        assert_eq!(s2, nonempty, "第二次运行非空默认均已设（skipped）；空默认不参与统计");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -431,8 +446,8 @@ mod tests {
         .unwrap();
         let server = serde_json::json!({
             "dsh-matrix": {
-                "homeserverUrl": "https://im-ipm.ict.cmcc",
-                "userId": "@server-override:im-ipm.ict.cmcc",
+                "homeserverUrl": "https://im.ai.ict.cmcc",
+                "userId": "@server-override:im.ai.ict.cmcc",
                 "accessToken": "server-tok"
             }
         });
@@ -444,7 +459,7 @@ mod tests {
         assert!(txt.contains("@me:im-ipm.ict.cmcc"), "个人凭据 userId 必须保留");
         assert!(txt.contains("tok123"), "个人凭据 accessToken 必须保留");
         assert!(!txt.contains("@server-override"), "不该覆盖个人 userId");
-        assert!(txt.contains("https://im-ipm.ict.cmcc"), "强制覆盖键 homeserverUrl 应填");
+        assert!(txt.contains("https://im.ai.ict.cmcc"), "强制覆盖键 homeserverUrl 应填服务端下发的值");
         let _ = std::fs::remove_file(&p);
     }
 
