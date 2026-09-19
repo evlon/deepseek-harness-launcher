@@ -33,7 +33,7 @@ const CALLBACK_PORT_RANGE: u16 = 3;
 /// 激活相关地址（从 settings.yaml `matrix-activation` namespace 读，代码兜底）。
 #[derive(Debug, Clone)]
 pub struct ActivationConfig {
-    /// Keycloak issuer（如 https://auth.ict.cmcc/realms/himarket）
+    /// Keycloak issuer（如 https://auth.ict.cmcc/realms/employees）
     pub issuer: String,
     /// twin client 的 clientId（aud 校验 + 授权请求）
     pub client_id: String,
@@ -48,7 +48,7 @@ pub struct ActivationConfig {
 impl Default for ActivationConfig {
     fn default() -> Self {
         ActivationConfig {
-            issuer: "https://auth.ict.cmcc/realms/himarket".to_string(),
+            issuer: "https://auth.ict.cmcc/realms/employees".to_string(),
             client_id: "matrix-twin-activation".to_string(),
             client_secret: String::new(),
             activate_endpoint: "http://im.ai.ict.cmcc/_matrix/activate".to_string(),

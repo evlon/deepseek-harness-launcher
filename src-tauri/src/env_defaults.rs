@@ -93,7 +93,7 @@ pub const ENV_DEFAULTS: &[EnvDefault] = &[
     // launcher 的 activation.rs 从 settings.yaml 的 matrix-activation namespace 读这些地址。
     // 都是环境地址（统一值），非个人凭据，可下发。client_secret 属敏感凭据，
     // 不经这里下发（从环境变量 DSH_TWIN_CLIENT_SECRET 读）。
-    EnvDefault { namespace: "matrix-activation", key: "keycloakIssuer", value: "https://auth.ict.cmcc/realms/himarket" },
+    EnvDefault { namespace: "matrix-activation", key: "keycloakIssuer", value: "https://auth.ict.cmcc/realms/employees" },
     EnvDefault { namespace: "matrix-activation", key: "clientId", value: "matrix-twin-activation" },
     EnvDefault { namespace: "matrix-activation", key: "activateEndpoint", value: "http://im.ai.ict.cmcc/_matrix/activate" },
     // homeserver 不硬编码默认：服务端 envDefaults 下发；未下发则留空（激活时因
@@ -400,14 +400,14 @@ mod tests {
         .unwrap();
         let server = serde_json::json!({
             "matrix-activation": {
-                "keycloakIssuer": "https://auth.ict.cmcc/realms/himarket",
+                "keycloakIssuer": "https://auth.ict.cmcc/realms/employees",
                 "clientId": "matrix-twin-activation"
             }
         });
         let (_filled, _skipped) = apply_env_defaults_map_to_file(&p, &server).unwrap();
         let txt = std::fs::read_to_string(&p).unwrap();
         assert!(
-            txt.contains("https://auth.ict.cmcc/realms/himarket"),
+            txt.contains("https://auth.ict.cmcc/realms/employees"),
             "强制覆盖键应纠正旧域名：{txt}"
         );
         assert!(
