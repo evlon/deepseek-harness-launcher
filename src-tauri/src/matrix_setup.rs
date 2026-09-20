@@ -252,6 +252,138 @@ fn write_account_to_file(path: &Path, acc: &MatrixAccount) -> Result<(), String>
     atomic_write(path, out.as_bytes())
 }
 
+/// dsh-himarket 的 settings namespace（与 dsh-himarket/src/settings.ts NAMESPACE 一致）。
+pub const HIMARKET_NS: &str = "himarket";
+
+/// HiMarket 一键登录（SSO）结果：写入 settings.yaml `himarket` section 的字段。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HimarketLogin {
+    /// HiMarket 门户地址（如 http://market.ai.ict.cmcc）
+    pub base_url: String,
+    /// Keycloak preferred_username（展示用；SSO 登录时非密码账号）
+    pub username: String,
+    /// 开发者 JWT（7 天有效，来自 /developers/oauth2/token）
+    pub token: String,
+}
+
+/// 写 HiMarket 登录态：只覆盖 `himarket` section 的 baseUrl/username/token，
+/// **保留** gatewayUrl / adminUsername / portalId / skillInstallDir 等既有键
+/// （与 write_account 同样的逐字段 merge 语义）。
+///
+/// ⚠️ 为什么不写 password：SSO 登录没有密码；写入空串会覆盖用户手工兜底配置，
+/// 故仅在调用方明确给出非空 password 时才写（本函数不接收 password）。
+pub fn write_himarket_login<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+    login: &HimarketLogin,
+) -> Result<(), String> {
+    let path = settings_yaml_path(app, cfg);
+    write_himarket_login_to_file(&path, login)
+}
+
+/// 写 HiMarket 登录态到指定文件（纯逻辑，单测用；tmp+rename 原子写）。
+fn write_himarket_login_to_file(path: &Path, login: &HimarketLogin) -> Result<(), String> {
+    use serde_yaml::{Mapping, Value};
+    let mut root: Mapping = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let v: Value = serde_yaml::from_str(&text)
+                .map_err(|e| format!("SETTINGS_PARSE_FAILED: {e}"))?;
+            v.as_mapping().cloned().unwrap_or_default()
+        }
+        Err(_) => Mapping::new(),
+    };
+    let section = root
+        .entry(Value::String(HIMARKET_NS.to_string()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let m = section
+        .as_mapping_mut()
+        .ok_or("SETTINGS_NS_NOT_MAP: himarket 不是 map")?;
+    let set = |m: &mut Mapping, k: &str, v: &str| {
+        if !v.is_empty() {
+            m.insert(Value::String(k.to_string()), Value::String(v.to_string()));
+        }
+    };
+    // 只写非空值：SSO 登录缺 username 时不应把用户已填的兜底账号清掉
+    set(m, "baseUrl", &login.base_url);
+    set(m, "username", &login.username);
+    set(m, "token", &login.token);
+    let out = serde_yaml::to_string(&Value::Mapping(root))
+        .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+    atomic_write(path, out.as_bytes())
+}
+
+/// HiMarket 登录态（托盘菜单展示用）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum HimarketTokenState {
+    /// 已登录：携带展示用用户名（可为空）。
+    LoggedIn { username: String },
+    /// 未登录（token 为空/缺失）。
+    NotLoggedIn,
+}
+
+/// 读 HiMarket 登录态：读 settings.yaml 的 `himarket.token`。
+/// token 非空即视为已登录（不校验过期——过期由插件 401 时重登处理）。
+pub fn himarket_token_state<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> HimarketTokenState {
+    let path = settings_yaml_path(app, cfg);
+    himarket_token_state_in_file(&path)
+}
+
+/// 读 HiMarket 登录态（纯逻辑，单测用）。
+fn himarket_token_state_in_file(path: &Path) -> HimarketTokenState {
+    use serde_yaml::Value;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HimarketTokenState::NotLoggedIn;
+    };
+    let Ok(root) = serde_yaml::from_str::<Value>(&text) else {
+        return HimarketTokenState::NotLoggedIn;
+    };
+    let Some(section) = root.get(HIMARKET_NS).and_then(|s| s.as_mapping()) else {
+        return HimarketTokenState::NotLoggedIn;
+    };
+    let token = section
+        .get(Value::String("token".to_string()))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if token.trim().is_empty() {
+        return HimarketTokenState::NotLoggedIn;
+    }
+    let username = section
+        .get(Value::String("username".to_string()))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    HimarketTokenState::LoggedIn { username }
+}
+
+/// 清理 HiMarket 登录态：token/username 置空（保留 baseUrl 与其它键）。
+pub fn clear_himarket_login<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+    let path = settings_yaml_path(app, cfg);
+    clear_himarket_login_in_file(&path)
+}
+
+/// 清理 HiMarket 登录态（纯逻辑，单测用）。
+fn clear_himarket_login_in_file(path: &Path) -> Result<(), String> {
+    use serde_yaml::Value;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let root: Value = serde_yaml::from_str(&text)
+        .map_err(|e| format!("SETTINGS_PARSE_FAILED: {e}"))?;
+    let Some(mut mapping) = root.as_mapping().cloned() else {
+        return Ok(());
+    };
+    if let Some(section) = mapping.get_mut(Value::String(HIMARKET_NS.to_string())) {
+        if let Some(m) = section.as_mapping_mut() {
+            for k in ["token", "username", "password"] {
+                m.insert(Value::String(k.to_string()), Value::String(String::new()));
+            }
+        }
+    }
+    let out = serde_yaml::to_string(&Value::Mapping(mapping))
+        .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+    atomic_write(path, out.as_bytes())
+}
+
 /// 清理账号配置：账号键置空（保留镜像键），供测试反复走引导。
 pub fn clear_account<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
     let path = settings_yaml_path(app, cfg);
@@ -848,6 +980,96 @@ mod tests {
         assert_eq!(acc.user_id, "@u:a");
         assert_eq!(acc.access_token, "t1");
         assert_eq!(acc.owner, "@o:a");
+    }
+
+    // ---------- HiMarket SSO 登录态读写 ----------
+
+    #[test]
+    fn himarket_write_preserves_other_keys() {
+        let dir = std::env::temp_dir().join(format!("dsh-hm-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.yaml");
+        // 模拟已有 himarket 配置（含非登录键，必须保留）
+        std::fs::write(
+            &path,
+            "himarket:\n  baseUrl: 'http://market.example'\n  gatewayUrl: 'http://job.example'\n  portalId: 'p-1'\n  skillInstallDir: '/x'\n",
+        )
+        .unwrap();
+        let login = HimarketLogin {
+            base_url: "http://market.ai.ict.cmcc".into(),
+            username: "niukunliang".into(),
+            token: "tok-abc".into(),
+        };
+        write_himarket_login_to_file(&path, &login).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("token: tok-abc"));
+        assert!(text.contains("username: niukunliang"));
+        assert!(text.contains("baseUrl: http://market.ai.ict.cmcc"));
+        // 非登录键必须原样保留
+        assert!(text.contains("gatewayUrl: http://job.example"));
+        assert!(text.contains("portalId: p-1"));
+        assert!(text.contains("skillInstallDir: /x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn himarket_write_skips_empty_values() {
+        // SSO 登录缺 username 时，不应把用户已填的兜底账号清掉
+        let dir = std::env::temp_dir().join(format!("dsh-hm-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.yaml");
+        std::fs::write(&path, "himarket:\n  username: 'user'\n  password: 'pw'\n").unwrap();
+        let login = HimarketLogin {
+            base_url: String::new(),
+            username: String::new(),
+            token: "tok-new".into(),
+        };
+        write_himarket_login_to_file(&path, &login).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("token: tok-new"));
+        assert!(text.contains("username: user"), "空 username 不应覆盖已填值");
+        assert!(text.contains("password: pw"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn himarket_token_state_detects_login() {
+        let dir = std::env::temp_dir().join(format!("dsh-hm-state-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.yaml");
+
+        // 无文件 → 未登录
+        assert_eq!(himarket_token_state_in_file(&path), HimarketTokenState::NotLoggedIn);
+
+        // token 为空 → 未登录
+        std::fs::write(&path, "himarket:\n  token: ''\n  username: 'u'\n").unwrap();
+        assert_eq!(himarket_token_state_in_file(&path), HimarketTokenState::NotLoggedIn);
+
+        // token 非空 → 已登录（带用户名）
+        std::fs::write(&path, "himarket:\n  token: 't'\n  username: 'niukunliang'\n").unwrap();
+        assert_eq!(
+            himarket_token_state_in_file(&path),
+            HimarketTokenState::LoggedIn { username: "niukunliang".into() }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn himarket_clear_keeps_baseurl() {
+        let dir = std::env::temp_dir().join(format!("dsh-hm-clear-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.yaml");
+        std::fs::write(
+            &path,
+            "himarket:\n  baseUrl: 'http://m'\n  token: 't'\n  username: 'u'\n  portalId: 'p'\n",
+        )
+        .unwrap();
+        clear_himarket_login_in_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("token: ''") || text.contains("token: \"\""));
+        assert!(text.contains("baseUrl: http://m"), "baseUrl 应保留");
+        assert!(text.contains("portalId: p"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -205,6 +205,39 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
             print_result("matrix-setup-open", &out);
             if out.is_ok() { 0 } else { 1 }
         }
+        // HiMarket 一键登录（SSO）：授权码 + PKCE + 本地回调 → 换 developer token
+        // → 写 settings.yaml 的 himarket.token。测试与运维可脚本化调用。
+        "himarket-login" => {
+            let r = crate::activation::run_himarket_login(app);
+            let out = serde_json::json!({
+                "ok": r.ok,
+                "message": r.message,
+            });
+            println!("[himarket-login] {}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            if r.ok { 0 } else { 1 }
+        }
+        // HiMarket 登录状态查询（自动化测试断言用）。
+        "himarket-status" => {
+            let cfg = crate::config::load_cached();
+            let st = crate::matrix_setup::himarket_token_state(app, &cfg);
+            let (state, username) = match &st {
+                crate::matrix_setup::HimarketTokenState::LoggedIn { username } => {
+                    ("logged-in".to_string(), username.clone())
+                }
+                crate::matrix_setup::HimarketTokenState::NotLoggedIn => ("not-logged-in".to_string(), String::new()),
+            };
+            let json = serde_json::json!({ "status": state, "username": username });
+            println!("[himarket-status] {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+            0
+        }
+        // 清除 HiMarket 登录态（保留 baseUrl 等其它键），供测试反复验证登录流程。
+        "himarket-logout" => {
+            let cfg = crate::config::load_cached();
+            let r = crate::matrix_setup::clear_himarket_login(app, &cfg);
+            let out: Result<serde_json::Value, String> = r.map(|_| serde_json::json!({"ok": true, "message": "HiMarket 登录态已清除"}));
+            print_result("himarket-logout", &out);
+            if out.is_ok() { 0 } else { 1 }
+        }
         // 下发环境默认配置（各内网服务地址等统一值）到 settings.yaml。
         // 遵循「只填空缺」：用户已显式设置过的不覆盖。
         // 用于诊断「插件为何没拿到地址」以及管理员批量修复。

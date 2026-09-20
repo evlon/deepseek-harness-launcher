@@ -43,6 +43,8 @@ pub struct ActivationConfig {
     pub activate_endpoint: String,
     /// 分身 homeserver（写 settings.yaml 的 homeserverUrl）
     pub homeserver_url: String,
+    /// HiMarket 门户地址（SSO 换票用；空则跳过 HiMarket 登录）
+    pub himarket_base_url: String,
 }
 
 impl Default for ActivationConfig {
@@ -55,6 +57,9 @@ impl Default for ActivationConfig {
             // homeserver 不硬编码默认：服务端 envDefaults 下发；未下发则留空，
             // 激活/连接时因 homeserverUrl 缺失而明确失败提示，绝不静默回落旧域名。
             homeserver_url: String::new(),
+            // HiMarket 门户地址（SSO 换票）。代码内置默认走新 K8S 环境；
+            // 服务端可经 settings.yaml 的 himarket.baseUrl 覆盖（见 read_activation_config）。
+            himarket_base_url: "http://market.ai.ict.cmcc".to_string(),
         }
     }
 }
@@ -91,6 +96,14 @@ fn read_activation_config<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) 
     }
     // client_secret 从环境变量读（敏感，不落 settings）
     out.client_secret = std::env::var("DSH_TWIN_CLIENT_SECRET").unwrap_or_default();
+
+    // HiMarket 门户地址优先取 settings.yaml 的 himarket.baseUrl（服务端 envDefaults 下发，
+    // 与 dsh-himarket 插件用的是同一个键，保证换票与插件访问同一后端）。
+    if let Some(hm) = read_yaml_ns_str(&path, "himarket") {
+        if let Some(v) = hm.get("baseUrl").filter(|s| !s.is_empty()) {
+            out.himarket_base_url = v.clone();
+        }
+    }
     out
 }
 
@@ -264,12 +277,161 @@ pub fn run_activation<R: Runtime>(app: &AppHandle<R>) -> ActivationResult {
         };
     }
 
+    // ⑧ 同一次 SSO 登录顺带登录 HiMarket（JWT Bearer 换票）。
+    //    **失败不阻断分身激活** —— 分身是主流程，HiMarket 可用托盘「一键登录」重试。
+    let himarket_note: String;
+    match exchange_himarket_token(&acfg, &id_token) {
+        Ok(hm) => {
+            let login = crate::matrix_setup::HimarketLogin {
+                base_url: acfg.himarket_base_url.clone(),
+                username: hm.username.clone(),
+                token: hm.access_token,
+            };
+            match crate::matrix_setup::write_himarket_login(app, &cfg, &login) {
+                Ok(()) => {
+                    himarket_note = format!("；HiMarket 已登录（{}）", hm.username);
+                    log::info!("[activation] HiMarket SSO 登录成功：{}", hm.username);
+                }
+                Err(e) => {
+                    himarket_note = format!("；⚠️ HiMarket 令牌写入失败：{e}");
+                    log::warn!("[activation] HiMarket 令牌写入失败：{e}");
+                }
+            }
+        }
+        Err(e) => {
+            himarket_note = format!("；⚠️ HiMarket 登录失败（可稍后重试）：{e}");
+            log::warn!("[activation] HiMarket SSO 换票失败：{e}");
+        }
+    }
+
     ActivationResult {
         ok: true,
-        message: format!("数字分身已激活：{user_id}（{}）", if created { "新建" } else { "已找回" }),
+        message: format!(
+            "数字分身已激活：{user_id}（{}）{himarket_note}",
+            if created { "新建" } else { "已找回" }
+        ),
         user_id,
         access_token,
         created,
+    }
+}
+
+/// 独立的「HiMarket 一键登录」：只跑 SSO 换票 + 写 settings.yaml，不碰数字分身。
+///
+/// 用途：developer token 7 天过期后，用户从托盘点「🔑 HiMarket 一键登录」重新登录，
+/// 无需重新认领分身。
+pub fn run_himarket_login<R: Runtime>(app: &AppHandle<R>) -> ActivationResult {
+    let cfg = load_cached();
+    let acfg = read_activation_config(app, &cfg);
+
+    if acfg.issuer.is_empty() || acfg.client_id.is_empty() {
+        return ActivationResult {
+            ok: false,
+            message: "登录配置缺失（issuer/clientId），请联系管理员下发".to_string(),
+            user_id: String::new(),
+            access_token: String::new(),
+            created: false,
+        };
+    }
+    if acfg.himarket_base_url.trim().is_empty() {
+        return ActivationResult {
+            ok: false,
+            message: "未配置 HiMarket 地址（himarket.baseUrl）".to_string(),
+            user_id: String::new(),
+            access_token: String::new(),
+            created: false,
+        };
+    }
+
+    // ① 本地回调 ② PKCE ③ 打开浏览器 ④ 等回调（与激活流程完全一致）
+    let mut callback = match start_callback_server() {
+        Ok(c) => c,
+        Err(e) => {
+            return ActivationResult {
+                ok: false,
+                message: format!("启动本地回调失败：{e}"),
+                user_id: String::new(),
+                access_token: String::new(),
+                created: false,
+            }
+        }
+    };
+    let state = callback.state.clone();
+    let verifier = callback.verifier.clone();
+    let challenge = pkce_challenge(&verifier);
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", callback.port);
+    let auth_url = build_auth_url(&acfg, &redirect_uri, &state, &challenge);
+    log::info!("[himarket-login] 打开浏览器授权：{}", auth_url);
+    if let Err(e) = open_browser(app, &auth_url) {
+        stop_callback_server(&mut callback);
+        return ActivationResult {
+            ok: false,
+            message: e,
+            user_id: String::new(),
+            access_token: String::new(),
+            created: false,
+        };
+    }
+    let code = match wait_for_callback(&callback, 120) {
+        Ok(c) => c,
+        Err(e) => {
+            stop_callback_server(&mut callback);
+            return ActivationResult {
+                ok: false,
+                message: e,
+                user_id: String::new(),
+                access_token: String::new(),
+                created: false,
+            };
+        }
+    };
+    stop_callback_server(&mut callback);
+
+    // ⑤ 换 id_token ⑥ 换 HiMarket token ⑦ 写 settings
+    let id_token = match exchange_code(&acfg, &redirect_uri, &code, &verifier) {
+        Ok(t) => t,
+        Err(e) => {
+            return ActivationResult {
+                ok: false,
+                message: format!("换取身份令牌失败：{e}"),
+                user_id: String::new(),
+                access_token: String::new(),
+                created: false,
+            }
+        }
+    };
+    let hm = match exchange_himarket_token(&acfg, &id_token) {
+        Ok(t) => t,
+        Err(e) => {
+            return ActivationResult {
+                ok: false,
+                message: format!("HiMarket 登录失败：{e}"),
+                user_id: String::new(),
+                access_token: String::new(),
+                created: false,
+            }
+        }
+    };
+    let login = crate::matrix_setup::HimarketLogin {
+        base_url: acfg.himarket_base_url.clone(),
+        username: hm.username.clone(),
+        token: hm.access_token,
+    };
+    if let Err(e) = crate::matrix_setup::write_himarket_login(app, &cfg, &login) {
+        return ActivationResult {
+            ok: false,
+            message: format!("HiMarket 已登录但写入配置失败：{e}"),
+            user_id: String::new(),
+            access_token: String::new(),
+            created: false,
+        };
+    }
+    ActivationResult {
+        ok: true,
+        message: format!("HiMarket 已登录：{}", hm.username),
+        user_id: String::new(),
+        access_token: String::new(),
+        created: false,
     }
 }
 
@@ -575,6 +737,93 @@ fn call_activate(acfg: &ActivationConfig, id_token: &str) -> Result<(String, Str
     Ok((user_id, access_token, created))
 }
 
+// ---------- HiMarket SSO 换票 ----------
+
+/// HiMarket SSO 换票结果：developer token + 展示用用户名。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HimarketToken {
+    pub access_token: String,
+    pub username: String,
+}
+
+/// 用 Keycloak id_token 调 HiMarket JWT Bearer 端点换 developer token。
+///
+/// 契约（已实测，2026-09-20）：
+///   POST {base}/api/v1/developers/oauth2/token
+///   form: grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=<id_token>
+///   → { code:"SUCCESS", data:{ access_token, token_type, expires_in } }
+///
+/// 前置（服务端已配好）：
+///   · Keycloak 的 matrix-twin-activation client 带 provider/portal 两个 claim mapper；
+///   · HiMarket portal 的 oauth2Configs 配了 JWT_BEARER + realm 公钥。
+/// 任一缺失都会返回可读错误，由调用方决定是否阻断。
+fn exchange_himarket_token(acfg: &ActivationConfig, id_token: &str) -> Result<HimarketToken, String> {
+    let base = acfg.himarket_base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("未配置 HiMarket 地址".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("dsh-harness-launcher-activation")
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!("{base}/api/v1/developers/oauth2/token");
+    let resp = client
+        .post(&url)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", id_token),
+        ])
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+
+    if status != 200 {
+        let msg = json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&text)
+            .to_string();
+        return Err(format!("HTTP {status}: {}", msg.chars().take(200).collect::<String>()));
+    }
+    // HiMarket 统一包装 { code, message, data }
+    if let Some(code) = json.get("code").and_then(|v| v.as_str()) {
+        if code != "SUCCESS" {
+            let msg = json.get("message").and_then(|v| v.as_str()).unwrap_or(code);
+            return Err(msg.chars().take(200).collect::<String>());
+        }
+    }
+    let data = json.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let access_token = data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if access_token.is_empty() {
+        return Err("换票成功但响应没有 access_token".to_string());
+    }
+    // username 从 id_token 的 preferred_username 取（换票响应不含用户名）
+    let username = id_token_claim(id_token, "preferred_username").unwrap_or_default();
+    Ok(HimarketToken { access_token, username })
+}
+
+/// 从 JWT（id_token）中取一个字符串 claim（**不验签**，仅取展示用字段）。
+/// 安全说明：这里只用于取 `preferred_username` 做界面展示；授权判定由服务端完成
+/// （HiMarket 用 JWKS 验签 + sub 绑定身份）。
+fn id_token_claim(jwt: &str, name: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get(name).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
 // ---------- 测试 ----------
 
 #[cfg(test)]
@@ -628,5 +877,36 @@ mod tests {
         assert_ne!(a, b);
         // 无 base64 填充字符、无 + /
         assert!(!a.contains('=') && !a.contains('+') && !a.contains('/'));
+    }
+
+    #[test]
+    fn id_token_claim_extracts_preferred_username() {
+        use base64::Engine;
+        // 构造一个只有 payload 的假 JWT（不验签，仅测解析）
+        let payload = serde_json::json!({
+            "preferred_username": "niukunliang",
+            "sub": "1d8e8759-6e1f-4edf-89e6-ab7bb1e931cd",
+            "provider": "corp-sso"
+        });
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(payload.to_string().as_bytes());
+        let jwt = format!("header.{enc}.sig");
+        assert_eq!(
+            id_token_claim(&jwt, "preferred_username").as_deref(),
+            Some("niukunliang")
+        );
+        assert_eq!(id_token_claim(&jwt, "provider").as_deref(), Some("corp-sso"));
+        assert_eq!(id_token_claim(&jwt, "missing"), None);
+        // 畸形输入不应 panic
+        assert_eq!(id_token_claim("not-a-jwt", "sub"), None);
+        assert_eq!(id_token_claim("", "sub"), None);
+    }
+
+    #[test]
+    fn default_config_has_himarket_base_url() {
+        let c = ActivationConfig::default();
+        assert_eq!(c.himarket_base_url, "http://market.ai.ict.cmcc");
+        // 与 env_defaults 的 himarket.baseUrl 保持一致（换票与插件必须同一后端）
+        assert_eq!(c.issuer, "https://auth.ict.cmcc/realms/employees");
     }
 }

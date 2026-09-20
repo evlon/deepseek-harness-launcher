@@ -245,6 +245,18 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             }
         }
     }
+
+    // HiMarket 登录状态：SSO 一键登录（developer token 7 天过期后重新登录用）。
+    // 与 dsh-himarket 插件共用 settings.yaml 的 himarket namespace。
+    match crate::matrix_setup::himarket_token_state(app, &cfg0) {
+        crate::matrix_setup::HimarketTokenState::LoggedIn { .. } => {
+            owned.push(MenuItem::with_id(app, "hm-login", "🔑 HiMarket 重新登录", true, None::<&str>)?);
+        }
+        crate::matrix_setup::HimarketTokenState::NotLoggedIn => {
+            owned.push(MenuItem::with_id(app, "hm-warn", "⚠️ HiMarket 未登录（点击下方「一键登录」）", false, None::<&str>)?);
+            owned.push(MenuItem::with_id(app, "hm-login", "🔑 HiMarket 一键登录", true, None::<&str>)?);
+        }
+    }
     // Harness 运行状态：菜单项按状态动态可用
     // 运行中 → 只能「停止」「打开页面」；未运行 → 只能「启动」
     let running = crate::workflow::is_running();
@@ -752,6 +764,30 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     Ok(()) => {}
                     Err(e) => notify(&h, "无法打开配置向导", &e),
                 }
+            });
+        }
+        "hm-login" => {
+            // HiMarket 一键登录（SSO）：走系统浏览器 + 本地回调，成功后写
+            // settings.yaml 的 himarket.token。不碰数字分身进程，无需重启。
+            if crate::ops::has_running() {
+                notify(app, "HiMarket 登录", "已有操作进行中，请稍候");
+                return;
+            }
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "himarket-login", "HiMarket 一键登录", &["浏览器授权", "登录 HiMarket", "写入配置"]);
+                crate::ops::mark_step_running(&h, 0);
+                crate::ops::update_step(&h, "等待浏览器授权…");
+                crate::ops::append_log(&h, "已打开浏览器，请在浏览器中完成公司 SSO 登录…");
+                let r = crate::activation::run_himarket_login(&h);
+                if r.ok {
+                    crate::ops::finish_op(&h, &r.message);
+                    notify(&h, "HiMarket 已登录", "岗位同步 / 安装技能现在可用");
+                } else {
+                    crate::ops::fail_op(&h, &r.message);
+                    notify(&h, "HiMarket 登录失败", &r.message);
+                }
+                refresh_sync_menu(&h);
             });
         }
         "install" => {
