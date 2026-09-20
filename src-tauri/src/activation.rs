@@ -909,4 +909,35 @@ mod tests {
         // 与 env_defaults 的 himarket.baseUrl 保持一致（换票与插件必须同一后端）
         assert_eq!(c.issuer, "https://auth.ict.cmcc/realms/employees");
     }
+
+    /// 真实环境集成测试：用真 id_token 走 reqwest 的 form 编码调 HiMarket 换票。
+    ///
+    /// 默认 `#[ignore]`（需外网 + 真实凭据），显式运行：
+    ///   HIMARKET_TEST_BASE=https://market.ai.ict.cmcc \
+    ///   HIMARKET_TEST_ID_TOKEN=<真实 id_token> \
+    ///   cargo test --release --bin deepseek-harness-launcher -- --ignored himarket_exchange
+    ///
+    /// 价值：验证 reqwest `.form()` 产生的 **application/x-www-form-urlencoded**
+    /// 与 HiMarket 契约一致（curl 类比不能覆盖客户端的实际编码行为）。
+    #[test]
+    #[ignore]
+    fn himarket_exchange_real_endpoint() {
+        let base = std::env::var("HIMARKET_TEST_BASE").unwrap_or_default();
+        let idt = std::env::var("HIMARKET_TEST_ID_TOKEN").unwrap_or_default();
+        if base.is_empty() || idt.is_empty() {
+            eprintln!("跳过：需要 HIMARKET_TEST_BASE 与 HIMARKET_TEST_ID_TOKEN");
+            return;
+        }
+        let acfg = ActivationConfig {
+            himarket_base_url: base,
+            ..ActivationConfig::default()
+        };
+        match exchange_himarket_token(&acfg, &idt) {
+            Ok(tok) => {
+                assert!(!tok.access_token.is_empty(), "access_token 不应为空");
+                println!("✅ 换票成功：username={:?} token 长度={}", tok.username, tok.access_token.len());
+            }
+            Err(e) => panic!("换票失败：{e}"),
+        }
+    }
 }
