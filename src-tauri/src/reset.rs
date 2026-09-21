@@ -90,22 +90,19 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         let ty = entry.file_type()?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        if ty.is_dir() {
+        // ⚠️ 必须先判 symlink 再判 dir。
+        // Windows junction 在 DirEntry::file_type() 下 is_symlink()=true、is_dir()=false，
+        // 但若改用 Path::is_dir()（跟随 reparse point）则 is_dir()=true。
+        // 一旦先判 is_dir()，junction 会被当作真实目录递归复制 → **解引用物化**，
+        // 破坏 dsh 的 .dsh-module-fallback（它要求该层必须是 symlink）。
+        if ty.is_symlink() {
+            // 符号链接（如 node_modules 的 junction）复制链接本身而非内容。
+            // 用 junction 重建：symlink_dir 需要管理员权限（os error 1314），
+            // 而同事机器是普通用户，必须走免特权的 mklink /J。
+            let target = std::fs::read_link(&from)?;
+            crate::config::create_dir_link(&target, &to).map_err(std::io::Error::other)?;
+        } else if ty.is_dir() {
             copy_dir_all(&from, &to)?;
-        } else if ty.is_symlink() {
-            // 符号链接（如 node_modules 的 junction）复制链接本身而非内容
-            #[cfg(windows)]
-            {
-                let target = std::fs::read_link(&from)?;
-                std::os::windows::fs::symlink_dir(&target, &to).or_else(|_| {
-                    std::os::windows::fs::symlink_file(&target, &to)
-                })?;
-            }
-            #[cfg(not(windows))]
-            {
-                let target = std::fs::read_link(&from)?;
-                std::os::unix::fs::symlink(&target, &to)?;
-            }
         } else {
             std::fs::copy(&from, &to)?;
         }
@@ -336,5 +333,41 @@ mod tests {
         // 未被清单收录的目录应保留（模拟「只清 DSH 用户数据，不动其它」）
         assert!(home.join("keep-me").exists());
         std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
+    /// 回归测试：复制目录时必须**保留 junction**，不能解引用物化。
+    ///
+    /// 背景（2026-09-21 真实事故）：备份/恢复 `profiles` 后，dsh 启动报
+    /// `...\.dsh-module-fallback\node_modules\@evlon\dsh-bridge exists and is not
+    /// a symlink or dsh-managed module proxy`，导致 launcher 启动 Harness 失败。
+    /// 根因是 `copy_dir_all` 用 `ty.is_dir()` 先判、junction 被当真实目录递归复制。
+    #[test]
+    #[cfg(windows)]
+    fn copy_dir_preserves_junction() {
+        let src = tmp().join("src");
+        let real = src.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.txt"), "x").unwrap();
+
+        // 造 junction：src/link -> src/real
+        let link = src.join("link");
+        crate::config::create_dir_link(&real, &link).expect("造 junction 失败");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "前置条件：link 应是 junction"
+        );
+
+        let dst = tmp().join("dst");
+        copy_dir_all(&src, &dst).unwrap();
+
+        let copied = dst.join("link");
+        assert!(
+            std::fs::symlink_metadata(&copied).unwrap().file_type().is_symlink(),
+            "复制后 link 仍应是 junction（被物化会让 dsh 拒绝启动）"
+        );
+        // 内容经链接可达
+        assert!(dst.join("real/a.txt").exists());
+
+        std::fs::remove_dir_all(src.parent().unwrap()).unwrap();
     }
 }

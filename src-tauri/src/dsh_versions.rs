@@ -442,13 +442,24 @@ fn safe_remove_dir(path: &Path) -> Result<(), String> {
 }
 
 /// 复制目录（递归，覆盖已有）。
+///
+/// ⚠️ 必须先判 symlink 再判 dir：`Path::is_dir()` 跟随 reparse point，
+/// 会把 Windows junction 当作真实目录递归复制（**解引用物化**）。
+/// 用 `symlink_metadata` 拿「不跟随」类型，链接原样复制。
 fn copy_dir_all(src: &Path, dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let from = entry.path();
         let to = dest.join(entry.file_name());
-        if from.is_dir() {
+        let ty = std::fs::symlink_metadata(&from)
+            .map_err(|e| e.to_string())?
+            .file_type();
+        if ty.is_symlink() {
+            // 用 junction 重建（symlink_dir 需管理员权限，普通用户会 1314）
+            let target = std::fs::read_link(&from).map_err(|e| e.to_string())?;
+            crate::config::create_dir_link(&target, &to)?;
+        } else if ty.is_dir() {
             copy_dir_all(&from, &to)?;
         } else {
             if let Some(parent) = to.parent() {

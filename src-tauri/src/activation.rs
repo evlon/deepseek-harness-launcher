@@ -285,6 +285,7 @@ pub fn run_activation<R: Runtime>(app: &AppHandle<R>) -> ActivationResult {
             let login = crate::matrix_setup::HimarketLogin {
                 base_url: acfg.himarket_base_url.clone(),
                 username: hm.username.clone(),
+                display_name: hm.display_name.clone(),
                 token: hm.access_token,
             };
             match crate::matrix_setup::write_himarket_login(app, &cfg, &login) {
@@ -415,6 +416,7 @@ pub fn run_himarket_login<R: Runtime>(app: &AppHandle<R>) -> ActivationResult {
     let login = crate::matrix_setup::HimarketLogin {
         base_url: acfg.himarket_base_url.clone(),
         username: hm.username.clone(),
+        display_name: hm.display_name.clone(),
         token: hm.access_token,
     };
     if let Err(e) = crate::matrix_setup::write_himarket_login(app, &cfg, &login) {
@@ -739,11 +741,14 @@ fn call_activate(acfg: &ActivationConfig, id_token: &str) -> Result<(String, Str
 
 // ---------- HiMarket SSO 换票 ----------
 
-/// HiMarket SSO 换票结果：developer token + 展示用用户名。
+/// HiMarket SSO 换票结果：developer token + 展示用用户名 + 员工姓名。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HimarketToken {
     pub access_token: String,
+    /// Keycloak `preferred_username`（登录账号，如 niukunliang）。
     pub username: String,
+    /// Keycloak `name`（中文姓名，如 牛昆亮）；realm 未配该 claim 时为空。
+    pub display_name: String,
 }
 
 /// 用 Keycloak id_token 调 HiMarket JWT Bearer 端点换 developer token。
@@ -808,7 +813,11 @@ fn exchange_himarket_token(acfg: &ActivationConfig, id_token: &str) -> Result<Hi
     }
     // username 从 id_token 的 preferred_username 取（换票响应不含用户名）
     let username = id_token_claim(id_token, "preferred_username").unwrap_or_default();
-    Ok(HimarketToken { access_token, username })
+    // 员工姓名：`name` 优先，回落 `given_name`（realm 未配 mapper 时为空串，不影响登录）
+    let display_name = id_token_claim(id_token, "name")
+        .or_else(|| id_token_claim(id_token, "given_name"))
+        .unwrap_or_default();
+    Ok(HimarketToken { access_token, username, display_name })
 }
 
 /// 从 JWT（id_token）中取一个字符串 claim（**不验签**，仅取展示用字段）。

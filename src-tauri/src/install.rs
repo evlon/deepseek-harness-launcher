@@ -500,6 +500,10 @@ fn copy_launcher_brand<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) {
 }
 
 /// 递归复制目录（覆盖）。
+///
+/// ⚠️ 必须先判 symlink 再判 dir：Windows junction 用 `Path::is_dir()` 判定为 true
+/// （跟随 reparse point），会被当作真实目录递归复制 → **解引用物化**。
+/// 用 `symlink_metadata` 拿到「不跟随」的类型，才能把链接原样复制。
 fn copy_dir_recursive(src: &PathBuf, dest: &PathBuf) -> Result<(), String> {
     if dest.exists() {
         std::fs::remove_dir_all(dest).map_err(|e| e.to_string())?;
@@ -509,13 +513,26 @@ fn copy_dir_recursive(src: &PathBuf, dest: &PathBuf) -> Result<(), String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let from = entry.path();
         let to = dest.join(entry.file_name());
-        if from.is_dir() {
+        let ty = std::fs::symlink_metadata(&from)
+            .map_err(|e| e.to_string())?
+            .file_type();
+        if ty.is_symlink() {
+            copy_link(&from, &to)?;
+        } else if ty.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else {
             std::fs::copy(&from, &to).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
+}
+
+/// 复制一个符号链接/junction 本身（不解引用）。
+/// 用 junction 重建：`symlink_dir` 需要管理员权限（os error 1314），
+/// 普通同事机器上会失败，故走免特权的 mklink /J。
+fn copy_link(from: &PathBuf, to: &PathBuf) -> Result<(), String> {
+    let target = std::fs::read_link(from).map_err(|e| e.to_string())?;
+    crate::config::create_dir_link(&target, to)
 }
 
 /// 内嵌的内网根 CA 证书（编译期 include_str!）。

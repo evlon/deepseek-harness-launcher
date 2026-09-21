@@ -249,8 +249,15 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // HiMarket 登录状态：SSO 一键登录（developer token 7 天过期后重新登录用）。
     // 与 dsh-himarket 插件共用 settings.yaml 的 himarket namespace。
     match crate::matrix_setup::himarket_token_state(app, &cfg0) {
-        crate::matrix_setup::HimarketTokenState::LoggedIn { .. } => {
-            owned.push(MenuItem::with_id(app, "hm-login", "🔑 HiMarket 重新登录", true, None::<&str>)?);
+        crate::matrix_setup::HimarketTokenState::LoggedIn { username, display_name } => {
+            // 已登录：菜单项直接显示「谁已登录」（姓名优先，回落账号）
+            let who = if display_name.trim().is_empty() { username } else { display_name };
+            let label = if who.trim().is_empty() {
+                "🔑 HiMarket 重新登录".to_string()
+            } else {
+                format!("🔑 HiMarket 已登录：{who}")
+            };
+            owned.push(MenuItem::with_id(app, "hm-login", label, true, None::<&str>)?);
         }
         crate::matrix_setup::HimarketTokenState::NotLoggedIn => {
             owned.push(MenuItem::with_id(app, "hm-warn", "⚠️ HiMarket 未登录（点击下方「一键登录」）", false, None::<&str>)?);
@@ -307,6 +314,19 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let cert_item = MenuItem::with_id(app, "cert-reinstall", "🔐 重装内网证书", true, None::<&str>)?;
     let reset_item = MenuItem::with_id(app, "reset", "🗑 重置（清空数字分身数据）", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    // launcher 自身版本 + 更新入口（启动时自检的结果显示在这里）
+    let launcher_ver_item = MenuItem::with_id(
+        app,
+        "launcher-version",
+        crate::self_update::last_check()
+            .map(|(o, _)| o.menu_label())
+            .unwrap_or_else(|| format!("launcher v{}", env!("CARGO_PKG_VERSION"))),
+        false,
+        None::<&str>,
+    )?;
+    let launcher_check_item = MenuItem::with_id(app, "launcher-check-update", "🔄 检查 launcher 更新", true, None::<&str>)?;
+    items.push(&launcher_ver_item);
+    items.push(&launcher_check_item);
     items.push(&log_item);
     items.push(&logpack_item);
     items.push(&cert_item);
@@ -682,8 +702,11 @@ fn installed_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<S
     sorted.get(index).map(|(name, _)| (*name).clone())
 }
 
-/// 供菜单点击时取「第 i 个待装插件名」（与 build_sync_submenu 的索引一致）。
-fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<String> {
+/// 取「第 i 个待装/待更新插件」的完整条目（含 name/installed/latest/action），
+/// 与 `build_sync_submenu` 的索引一致。
+///
+/// 更新向导需要展示「0.1.7 → 0.1.8」这类信息，仅名字不够，故返回整个 JSON 条目。
+fn pending_entry_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<serde_json::Value> {
     let cfg = load_cached();
     let current_profile = resolve_profile(&cfg);
     let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
@@ -695,7 +718,7 @@ fn pending_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<Str
             let cur = crate::sync::plugins_for_profile(c, &current_profile);
             crate::sync::pending_with_updates(&cur, &installed_with_ver, &state.plugin_latest_versions)
                 .get(index)
-                .and_then(|p| p["name"].as_str().map(|s| s.to_string()))
+                .cloned()
         })
 }
 
@@ -743,6 +766,48 @@ fn confirm_uninstall(name: &str, reason: &str) -> bool {
     {
         let _ = (name, reason);
         true
+    }
+}
+
+/// 插件安装/更新后自动重启 Harness，使新版本生效（Q3：用户不必再手点「停止+启动」）。
+///
+/// 语义与用户诉求一致：
+/// - Harness **本来就在运行** → 停止并重启（新插件版本需重载才生效）；
+/// - Harness **本来没运行** → 不动它（不替用户决定要启动）；
+/// - 重启失败 → 返回 false 并写日志，由调用方在结果里如实体现（不谎报成功）。
+///
+/// 返回是否真的完成了「重启」。
+async fn auto_restart_harness<R: Runtime>(app: &AppHandle<R>, plugin: &str) -> bool {
+    if !crate::workflow::is_running() {
+        crate::ops::append_log(app, "Harness 未在运行，跳过重启（下次启动即加载新版本）");
+        return false;
+    }
+    // 第 1 步：重启 Harness（含停止 + 启动 + 等端口就绪）
+    crate::ops::mark_step_running(app, 1);
+    crate::ops::update_step(app, "正在重启 Harness 使新版本生效…");
+    crate::ops::append_log(app, "更新后需重载插件：正在重启 Harness…");
+
+    let profile = crate::workflow::current_profile().unwrap_or_else(|| resolve_profile(&load_cached()));
+    crate::workflow::stop();
+    match crate::workflow::launch_with_profile(app, &profile) {
+        Ok(port) => {
+            let url = crate::workflow::access_url(port);
+            crate::ops::append_log(app, &format!("✓ Harness 已重启，访问 {url}"));
+            crate::ops::update_step(app, &format!("✓ {plugin} 已生效"));
+            true
+        }
+        Err(e) => {
+            // 重启失败不掩盖：明确告知 + 引导用户手动启动（不谎报「已就绪」）
+            log::error!("插件更新后重启 Harness 失败：{e}");
+            crate::ops::append_log(app, &format!("✗ 自动重启失败：{e}"));
+            crate::ops::mark_step_failed(app, 1);
+            notify(
+                app,
+                "插件已更新，但 Harness 重启失败",
+                &format!("{plugin} 已安装。请手动点托盘「启动 Harness」。\n\n原因：{e}"),
+            );
+            false
+        }
     }
 }
 
@@ -941,6 +1006,33 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 Err(e) => notify(app, "切换失败", &e),
             }
         }
+        "launcher-check-update" => {
+            // 手动检查 launcher 更新：先只检查并**如实报告结果**（有/无/失败三种都提示），
+            // 再决定是否下载。绝不静默——「点了没反应」正是本轮要修的问题。
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::ops::start_op(&h, "launcher-check", "检查 launcher 更新", &["查询服务端发布"]);
+                crate::ops::mark_step_running(&h, 0);
+                crate::ops::update_step(&h, "查询服务端版本…");
+                let outcome = crate::self_update::check_only(&h).await;
+                let msg = outcome.message();
+                match &outcome {
+                    crate::self_update::CheckOutcome::Failed { .. } => {
+                        crate::ops::fail_op(&h, &msg);
+                        notify(&h, "launcher 更新检查失败", &msg);
+                    }
+                    _ => {
+                        crate::ops::finish_op(&h, &msg);
+                        notify(&h, "launcher 更新检查", &msg);
+                    }
+                }
+                refresh_sync_menu(&h);
+                // 发现新版 → 继续走下载/替换（进度窗口会切成「更新 launcher」四步）
+                if outcome.has_update() {
+                    let _ = crate::self_update::check_and_update(&h).await;
+                }
+            });
+        }
         "dsh-check-update" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -1113,25 +1205,71 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 .strip_prefix("sync-install-")
                 .and_then(|s| s.parse::<usize>().ok());
             if let Some(idx) = idx {
-                if let Some(name) = pending_plugin_at(app, idx) {
+                if let Some(entry) = pending_entry_at(app, idx) {
+                    let name = entry["name"].as_str().unwrap_or("").to_string();
+                    let action = entry["action"].as_str().unwrap_or("install").to_string();
+                    let installed_v = entry["installed"].as_str().unwrap_or("").to_string();
+                    let latest_v = entry["latest"].as_str().unwrap_or("").to_string();
+                    let is_update = action == "update";
+                    // Harness 是否在运行，决定向导是否有「重启」这一步（如实展示，不摆空步骤）
+                    let was_running = crate::workflow::is_running();
                     let h = app.clone();
                     let name_clone = name.clone();
                     tauri::async_runtime::spawn(async move {
-                        crate::ops::start_op(&h, "plugin-install", "安装插件", &["安装插件"]);
+                        // ── 更新向导（Q1/Q3）：不再黑盒执行 ──────────────────
+                        // ① 先展示「将要更新什么」，② 逐步显示进度，③ 完成后自动重启
+                        let title = if is_update { "更新插件" } else { "安装插件" };
+                        let steps: Vec<&str> = if was_running {
+                            vec!["安装插件", "重启 Harness 使其生效"]
+                        } else {
+                            vec!["安装插件"]
+                        };
+                        crate::ops::start_op(&h, "plugin-install", title, &steps);
+                        // ① 让用户看到要更新的内容（名称/版本/来源）
+                        let plan = if is_update {
+                            format!("{name_clone}：{installed_v} → {latest_v}")
+                        } else {
+                            format!("{name_clone}：新安装（{latest_v}）")
+                        };
+                        let mut details = vec![plan.clone(), format!("目标 profile：{}", resolve_profile(&load_cached()))];
+                        if was_running {
+                            details.push("安装完成后将自动重启 Harness 使新版本生效".to_string());
+                        }
+                        crate::ops::set_details(&h, &details);
+                        // 弹出向导窗口（旧实现只有 install 分支弹窗，sync-install 不弹 →
+                        // 用户点「更新」后什么都看不到，这正是「更新成功没有任何提示」的根因）
+                        if let Err(e) = crate::console::open_console(&h) {
+                            log::warn!("更新向导窗口打开失败（降级为通知）：{e}");
+                        }
                         crate::ops::mark_step_running(&h, 0);
                         crate::ops::update_step(&h, &format!("正在安装 {name_clone}…"));
                         match crate::sync::install_plugin(&h, &name).await {
                             Ok(()) => {
-                                crate::ops::finish_op(&h, &format!("{} 已就绪", name_clone));
-                                notify(&h, "插件已安装", &format!("{} 已就绪", name_clone));
+                                crate::ops::append_log(&h, &format!("✓ {name_clone} 已安装"));
+                                // ③ 更新插件后必须重启 Harness 才生效 —— 自动完成，
+                                //    不再让用户自己摸索「停止 + 启动」两次。
+                                let restarted = if was_running {
+                                    auto_restart_harness(&h, &name_clone).await
+                                } else {
+                                    crate::ops::append_log(&h, "Harness 未在运行，无需重启（下次启动即加载新版本）");
+                                    false
+                                };
+                                let summary = if restarted {
+                                    format!("{name_clone} 已就绪，Harness 已自动重启生效")
+                                } else {
+                                    format!("{name_clone} 已就绪")
+                                };
+                                crate::ops::finish_op(&h, &summary);
+                                notify(&h, title, &summary);
                                 // 安装后立即同步一次（刷新状态 + 上报服务端；用缓存 TTL，不强制）
                                 let cfg = load_cached();
                                 let _ = crate::sync::sync_once(&h, &cfg, None, false).await;
                                 refresh_sync_menu(&h);
                             }
                             Err(e) => {
+                                // 失败必须可见：既有窗口展示，也有系统通知
                                 crate::ops::fail_op(&h, &e);
-                                notify(&h, "插件安装失败", &e);
+                                notify(&h, &format!("{title}失败"), &e);
                                 refresh_sync_menu(&h);
                             }
                         }

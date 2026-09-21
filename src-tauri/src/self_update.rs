@@ -98,6 +98,112 @@ pub fn has_newer(remote: &str) -> bool {
     }
 }
 
+/// 一次「检查更新」的结果（**只描述发现，不含任何下载/替换动作**）。
+///
+/// 抽出来是为了让三条路径（启动自检 / 托盘手动 / 周期轮询）共用同一份判定，
+/// 且托盘菜单能在不发起网络请求的情况下渲染上次结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckOutcome {
+    /// 已是最新。
+    UpToDate { current: String },
+    /// 发现新版（尚未下载）。
+    Available { current: String, version: String, notes: String, size: u64 },
+    /// 服务端尚无任何发布（未部署该端点也算）。
+    NoRelease { current: String },
+    /// 检查失败（网络不可达等）。**不视为「已是最新」**——两者对用户含义不同。
+    Failed { error: String },
+}
+
+impl CheckOutcome {
+    /// 托盘菜单里的一行摘要。
+    pub fn menu_label(&self) -> String {
+        match self {
+            CheckOutcome::UpToDate { current } => format!("launcher v{current}（已是最新）"),
+            CheckOutcome::Available { version, .. } => format!("🚀 发现新版 v{version}（点击更新）"),
+            CheckOutcome::NoRelease { current } => format!("launcher v{current}（服务端无发布）"),
+            CheckOutcome::Failed { .. } => "launcher 更新检查失败（点击重试）".to_string(),
+        }
+    }
+
+    /// 面向用户的完整文案（通知/进度窗口用）。
+    pub fn message(&self) -> String {
+        match self {
+            CheckOutcome::UpToDate { current } => format!("当前已是最新版本 v{current}"),
+            CheckOutcome::Available { current, version, notes, size } => {
+                let mb = size / 1024 / 1024;
+                let n = if notes.is_empty() { String::new() } else { format!("（{notes}）") };
+                format!("发现新版本 v{version}{n}，当前 v{current}，约 {mb} MB，将自动更新")
+            }
+            CheckOutcome::NoRelease { current } => {
+                format!("当前 v{current}；服务端暂未发布 launcher 版本")
+            }
+            CheckOutcome::Failed { error } => format!("检查更新失败：{error}"),
+        }
+    }
+
+    /// 是否发现了可更新的新版。
+    pub fn has_update(&self) -> bool {
+        matches!(self, CheckOutcome::Available { .. })
+    }
+}
+
+/// 最近一次检查结果（进程内缓存，托盘菜单渲染用）。值为 (结果, 检查时间 ISO)。
+static LAST_CHECK: std::sync::Mutex<Option<(CheckOutcome, String)>> = std::sync::Mutex::new(None);
+
+/// 记录一次检查结果（供托盘读取）。
+fn remember(outcome: &CheckOutcome) {
+    if let Ok(mut g) = LAST_CHECK.lock() {
+        *g = Some((outcome.clone(), chrono::Utc::now().to_rfc3339()));
+    }
+}
+
+/// 读最近一次检查结果（含时间）。尚未检查过返回 None。
+pub fn last_check() -> Option<(CheckOutcome, String)> {
+    LAST_CHECK.lock().ok().and_then(|g| g.clone())
+}
+
+/// 测试用：清空缓存的结果。
+#[cfg(test)]
+pub fn reset_last_check() {
+    if let Ok(mut g) = LAST_CHECK.lock() {
+        *g = None;
+    }
+}
+
+/// **只检查、不下载**：拉服务端元数据并判定是否需要更新。
+///
+/// 与 `check_and_update` 的区别：本函数永不触发下载/替换/退出，可安全地用于
+/// 「启动时看一眼有没有新版」以及托盘菜单渲染。结果同时写入进程内缓存。
+pub async fn check_only<R: Runtime>(app: &AppHandle<R>) -> CheckOutcome {
+    let (outcome, _) = fetch_and_classify(app).await;
+    outcome
+}
+
+/// 拉一次元数据并分类，**同时返回原始元数据**（避免调用方二次请求）。
+/// 结果写入进程内缓存。
+async fn fetch_and_classify<R: Runtime>(app: &AppHandle<R>) -> (CheckOutcome, Option<ReleaseMeta>) {
+    let (outcome, meta) = match fetch_latest(app).await {
+        Ok(None) => (CheckOutcome::NoRelease { current: current_version() }, None),
+        Ok(Some(meta)) => {
+            let outcome = if has_newer(&meta.version) {
+                CheckOutcome::Available {
+                    current: current_version(),
+                    version: meta.version.clone(),
+                    notes: meta.notes.clone(),
+                    size: meta.size,
+                }
+            } else {
+                CheckOutcome::UpToDate { current: current_version() }
+            };
+            (outcome, Some(meta))
+        }
+        Err(e) => (CheckOutcome::Failed { error: e }, None),
+    };
+    remember(&outcome);
+    log::info!("launcher 更新检查：{}", outcome.message());
+    (outcome, meta)
+}
+
 /// 从服务端下载新版 exe 到目标路径并做 sha256 校验。
 /// 返回下载字节数。
 pub async fn download_release<R: Runtime>(
@@ -239,14 +345,21 @@ pub fn run_update_self(update_file: &str) -> i32 {
     0
 }
 
-/// 周期自更新检查循环：每 6 小时查一次服务端 /api/launcher/latest（复用 sync 间隔的
-/// 服务端可达性，离线仅日志）。发现新版（版本严格更大）→ 下载 + sha256 校验 →
-/// spawn 更新助手（新 exe 自举）→ 请求本进程退出 → 助手完成替换后重启新 exe。
+/// 周期自更新检查循环：**启动后立即检查一次**（这是用户要的「每次启动检查更新」），
+/// 之后每 6 小时查一次服务端 /api/launcher/latest。
+///
+/// 启动那一轮做两件事：
+///   ① `check_only` 先判定并写缓存 —— 让托盘菜单立刻能显示「已是最新 / 发现新版」；
+///   ② 若发现新版，走自动下载替换（`check_and_update`），并**全程可见**：
+///      操作进度窗口 + 托盘状态行 + 系统通知。
+///
+/// 启动延迟 30s：先等 sync 完成一轮（同步会 apply_server_defaults 等），
+/// 避免启动瞬间与同步抢网络/文件。
 ///
 /// 触发点设计（避免打断用户正在进行的操作）：仅当无镜像上传进行中时自动更新；
-/// 失败一律仅日志，下次周期重试。
+/// 失败一律仅日志 + 托盘可见状态，下次周期重试。
 pub async fn spawn_self_update_loop<R: Runtime>(app: &AppHandle<R>) {
-    // 启动延迟：先等 sync 完成一轮（同步会 apply_server_defaults 等），避免启动即抢
+    // 启动延迟：先等 sync 完成一轮，避免启动即抢
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     const CHECK_INTERVAL: u64 = 6 * 60 * 60; // 6 小时
 
@@ -254,70 +367,126 @@ pub async fn spawn_self_update_loop<R: Runtime>(app: &AppHandle<R>) {
         if let Err(e) = check_and_update(app).await {
             log::warn!("launcher 自更新检查失败（下次重试）：{e}");
         }
+        // 刷新托盘：让「检查更新」项显示最新判定结果
+        crate::tray::refresh_sync_menu(app);
         tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL)).await;
     }
 }
 
 /// 单轮检查 + 更新（独立函数便于 CLI/测试复用）。
+///
+/// 检查阶段用 `check_only`（只判定、写缓存），发现新版才进入下载/替换。
+/// **每一步都有可见反馈**：进度窗口的步骤 + 托盘状态 + 系统通知。
 pub async fn check_and_update<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let Some(meta) = fetch_latest(app).await? else {
-        log::info!("launcher 自更新：服务端无新发布");
-        return Ok(());
-    };
-    if !has_newer(&meta.version) {
-        log::info!("launcher 自更新：已是最新（{}）", current_version());
-        return Ok(());
-    }
-    // 镜像上传进行中不打断（文件操作与网络都被占用）
-    let cfg = crate::config::load_cached();
-    if crate::mirror::load_progress(app, &cfg).state == "running" {
-        log::info!("launcher 自更新：镜像上传进行中，跳过本轮（下轮再试）");
-        return Ok(());
-    }
-    log::info!(
-        "发现 launcher 新版 v{}（当前 v{}，{} MB{}），开始下载…",
-        meta.version,
-        current_version(),
-        meta.size / 1024 / 1024,
-        if meta.notes.is_empty() { String::new() } else { format!("，说明：{}", meta.notes) }
-    );
-    let notify_msg = if meta.notes.is_empty() {
-        format!("发现新版本 v{}，正在自动更新…", meta.version)
-    } else {
-        format!("发现新版本 v{}（{}），正在自动更新…", meta.version, meta.notes)
-    };
-    crate::notify::notify(app, "DeepSeek Harness Launcher", &notify_msg);
-
-    // 下载到 exe 同目录的临时名（同文件系统，rename 原子）
-    let exe_dir = current_exe().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-    let tmp = exe_dir.join(format!("launcher-{}.new.exe", meta.version));
-    download_release(app, &meta, &tmp).await?;
-    log::info!(
-        "下载完成：v{} {} MB（发布 {}{}）",
-        meta.version,
-        meta.size / 1024 / 1024,
-        meta.published_at.as_deref().unwrap_or("未知"),
-        if meta.notes.is_empty() { String::new() } else { format!("，说明：{}", meta.notes) }
-    );
-
-    // 防呆：若发布物与本机 exe 内容相同（sha256 一致，如误发布同二进制），跳过更新，
-    // 避免「换汤不换药」导致无限下载-替换循环
-    if let Ok(cur_bytes) = std::fs::read(current_exe()) {
-        let cur_sha = format!("{:x}", Sha256::digest(&cur_bytes));
-        if !meta.sha256.is_empty() && cur_sha == meta.sha256.to_ascii_lowercase() {
-            log::warn!("发布物与本机 exe 内容相同（sha256 一致 v{}），跳过无意义更新", meta.version);
-            let _ = std::fs::remove_file(&tmp);
+    let (outcome, meta) = fetch_and_classify(app).await;
+    match outcome {
+        CheckOutcome::NoRelease { current } => {
+            log::info!("launcher 自更新：服务端无新发布（当前 v{current}）");
             return Ok(());
         }
-    }
+        CheckOutcome::Failed { error } => {
+            log::warn!("launcher 自更新：检查失败 {error}");
+            return Ok(()); // 失败不抛错：下次周期重试，不打扰用户
+        }
+        CheckOutcome::UpToDate { current } => {
+            log::info!("launcher 自更新：已是最新（{current}）");
+            return Ok(());
+        }
+        CheckOutcome::Available { version, notes, size, .. } => {
+            // 镜像上传进行中不打断（文件操作与网络都被占用）
+            let cfg = crate::config::load_cached();
+            if crate::mirror::load_progress(app, &cfg).state == "running" {
+                log::info!("launcher 自更新：镜像上传进行中，跳过本轮（下轮再试）");
+                return Ok(());
+            }
+            log::info!(
+                "发现 launcher 新版 v{}（当前 v{}，{} MB{}），开始下载…",
+                version,
+                current_version(),
+                size / 1024 / 1024,
+                if notes.is_empty() { String::new() } else { format!("，说明：{notes}") }
+            );
+            // 进度窗口：把「下载 → 校验 → 替换 → 重启」四步摊开给用户看
+            crate::ops::start_op(
+                app,
+                "launcher-update",
+                "更新 launcher",
+                &["下载新版本", "校验完整性", "替换程序", "重启 launcher"],
+            );
+            crate::ops::set_details(
+                app,
+                &[format!(
+                    "launcher {} → {version}{}",
+                    current_version(),
+                    if notes.is_empty() { String::new() } else { format!("（{notes}）") }
+                )],
+            );
+            crate::ops::mark_step_running(app, 0);
+            crate::ops::update_step(app, &format!("下载 v{version}（{} MB）…", size / 1024 / 1024));
+            let notify_msg = format!("发现新版本 v{version}，正在自动更新…");
+            crate::notify::notify(app, "DeepSeek Harness Launcher", &notify_msg);
+            crate::tray::refresh_sync_menu(app);
 
-    // 触发替换：spawn 新 exe 自举（--cmd update-self --update-file <新exe>），
-    // 然后本进程退出（助手会把它 rename 成正式名并重启）
-    spawn_update_self(app, &tmp)?;
-    log::info!("launcher 自更新：助手已启动，本进程退出");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    crate::tray::request_quit(app);
-    Ok(())
+            // 下载到 exe 同目录的临时名（同文件系统，rename 原子）
+            let exe_dir = current_exe().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            let tmp = exe_dir.join(format!("launcher-{version}.new.exe"));
+            // fetch_and_classify 已带回完整元数据（含 sha256/file）；理论上 Available
+            // 必然伴随 Some(meta)，缺失时构造最小元数据兜底（下载仍需 file 字段）。
+            let full_meta = meta.unwrap_or(ReleaseMeta {
+                version: version.clone(),
+                file: format!("launcher-{version}.exe"),
+                sha256: String::new(),
+                notes: notes.clone(),
+                size,
+                published_at: None,
+                no_release: false,
+            });
+            if let Err(e) = download_release(app, &full_meta, &tmp).await {
+                crate::ops::fail_op(app, &format!("下载失败：{e}"));
+                crate::notify::notify(app, "launcher 更新失败", &format!("下载失败：{e}\n可稍后重试"));
+                crate::tray::refresh_sync_menu(app);
+                return Err(e);
+            }
+            crate::ops::mark_step_running(app, 1);
+            crate::ops::update_step(app, "校验 sha256…");
+            log::info!(
+                "下载完成：v{} {} MB（发布 {}）",
+                version,
+                size / 1024 / 1024,
+                full_meta.published_at.as_deref().unwrap_or("未知")
+            );
+
+            // 防呆：若发布物与本机 exe 内容相同（sha256 一致，如误发布同二进制），跳过更新，
+            // 避免「换汤不换药」导致无限下载-替换循环
+            if let Ok(cur_bytes) = std::fs::read(current_exe()) {
+                let cur_sha = format!("{:x}", Sha256::digest(&cur_bytes));
+                if !full_meta.sha256.is_empty() && cur_sha == full_meta.sha256.to_ascii_lowercase() {
+                    log::warn!("发布物与本机 exe 内容相同（sha256 一致 v{version}），跳过无意义更新");
+                    let _ = std::fs::remove_file(&tmp);
+                    crate::ops::finish_op(app, "已是最新（发布物与本机相同，无需更新）");
+                    crate::tray::refresh_sync_menu(app);
+                    return Ok(());
+                }
+            }
+
+            crate::ops::mark_step_running(app, 2);
+            crate::ops::update_step(app, "替换程序并重启…");
+            // 触发替换：spawn 新 exe 自举（--cmd update-self --update-file <新exe>），
+            // 然后本进程退出（助手会把它 rename 成正式名并重启）
+            if let Err(e) = spawn_update_self(app, &tmp) {
+                crate::ops::fail_op(app, &format!("启动更新助手失败：{e}"));
+                crate::notify::notify(app, "launcher 更新失败", &e);
+                crate::tray::refresh_sync_menu(app);
+                return Err(e);
+            }
+            crate::ops::mark_step_running(app, 3);
+            crate::ops::update_step(app, "正在重启 launcher…");
+            log::info!("launcher 自更新：助手已启动，本进程退出");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            crate::tray::request_quit(app);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +518,51 @@ mod tests {
         // 远程非 semver → 保守视为需要更新
         assert!(has_newer("not-a-version"));
         assert!(has_newer(""));
+    }
+
+    #[test]
+    fn check_outcome_labels_and_messages() {
+        let up = CheckOutcome::UpToDate { current: "0.4.1".into() };
+        assert!(up.menu_label().contains("已是最新"));
+        assert!(up.message().contains("0.4.1"));
+        assert!(!up.has_update(), "已是最新不应触发更新");
+
+        let avail = CheckOutcome::Available {
+            current: "0.4.1".into(),
+            version: "0.4.2".into(),
+            notes: "修更新提示".into(),
+            size: 6 * 1024 * 1024,
+        };
+        assert!(avail.menu_label().contains("0.4.2"));
+        assert!(avail.message().contains("修更新提示"));
+        assert!(avail.message().contains("6 MB"));
+        assert!(avail.has_update(), "发现新版必须触发更新");
+
+        // 无发布 ≠ 已是最新（对用户含义不同：一个是「服务端没发过」，一个是「你已最新」）
+        let none = CheckOutcome::NoRelease { current: "0.4.1".into() };
+        assert!(none.menu_label().contains("服务端无发布"));
+        assert!(!none.has_update());
+
+        // 失败 ≠ 已是最新：绝不能把「查不到」显示成「已是最新」
+        let failed = CheckOutcome::Failed { error: "连接超时".into() };
+        assert!(failed.menu_label().contains("失败"));
+        assert!(failed.message().contains("连接超时"));
+        assert!(!failed.has_update());
+        assert!(
+            !failed.message().contains("已是最新"),
+            "检查失败不得谎报已是最新"
+        );
+    }
+
+    #[test]
+    fn last_check_cache_roundtrip() {
+        reset_last_check();
+        assert!(last_check().is_none(), "初始应无缓存");
+
+        remember(&CheckOutcome::UpToDate { current: "9.9.9".into() });
+        let (o, at) = last_check().expect("写入后应能读到");
+        assert_eq!(o, CheckOutcome::UpToDate { current: "9.9.9".into() });
+        assert!(!at.is_empty(), "应带检查时间戳");
+        reset_last_check();
     }
 }

@@ -109,6 +109,15 @@ fn main() {
                     .body(body.into_bytes())
                     .unwrap_or_default();
             }
+            // /history → 已完成操作历史（供向导「历史记录」折叠区展示）
+            if path == "/history" {
+                let body = serde_json::to_string(&ops::history(ops::MAX_HISTORY))
+                    .unwrap_or_else(|_| "[]".to_string());
+                return Response::builder()
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .body(body.into_bytes())
+                    .unwrap_or_default();
+            }
             // 其他 → 内嵌 HTML
             let html = console::console_html();
             Response::builder()

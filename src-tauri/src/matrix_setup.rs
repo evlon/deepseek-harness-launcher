@@ -262,6 +262,10 @@ pub struct HimarketLogin {
     pub base_url: String,
     /// Keycloak preferred_username（展示用；SSO 登录时非密码账号）
     pub username: String,
+    /// 员工中文姓名（Keycloak `name` claim）；realm 未配 mapper 时为空。
+    ///
+    /// ⚠️ 只作**展示**用（管理页「谁在用这台机器」），不参与任何鉴权判定。
+    pub display_name: String,
     /// 开发者 JWT（7 天有效，来自 /developers/oauth2/token）
     pub token: String,
 }
@@ -307,6 +311,9 @@ fn write_himarket_login_to_file(path: &Path, login: &HimarketLogin) -> Result<()
     set(m, "baseUrl", &login.base_url);
     set(m, "username", &login.username);
     set(m, "token", &login.token);
+    // 员工姓名（管理页展示「谁在用这台机器」）。独立键 displayName，
+    // 不与 username 混用：username 是登录账号（niukunliang），displayName 是中文姓名（牛昆亮）。
+    set(m, "displayName", &login.display_name);
     let out = serde_yaml::to_string(&Value::Mapping(root))
         .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
     atomic_write(path, out.as_bytes())
@@ -315,10 +322,92 @@ fn write_himarket_login_to_file(path: &Path, login: &HimarketLogin) -> Result<()
 /// HiMarket 登录态（托盘菜单展示用）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum HimarketTokenState {
-    /// 已登录：携带展示用用户名（可为空）。
-    LoggedIn { username: String },
+    /// 已登录：携带展示用用户名（可为空）与员工姓名（可为空）。
+    LoggedIn { username: String, display_name: String },
     /// 未登录（token 为空/缺失）。
     NotLoggedIn,
+}
+
+/// 员工身份（上报给中心管理页「谁在用这台机器」）。
+///
+/// 来源三处，按可信度排序：
+///   1. `himarket.username` / `himarket.displayName` —— SSO 登录写入（Keycloak 权威）
+///   2. `dsh-matrix.owner` —— 数字分身的主人 Matrix userId（如 `@niukunliang:im.ai.ict.cmcc`）
+///   3. `dsh-matrix.userId` —— 分身自身 userId（如 `@ai-niukunliang:...`）
+///
+/// ⚠️ 纯展示字段，**不参与鉴权**。管理页只读它来回答「这台机器是谁的」。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientIdentity {
+    /// 登录账号（Keycloak preferred_username，如 niukunliang）
+    pub username: String,
+    /// 员工中文姓名（Keycloak name，如 牛昆亮）；未配 claim 时为空
+    pub display_name: String,
+    /// 分身主人的 Matrix userId（如 @niukunliang:im.ai.ict.cmcc）
+    pub owner: String,
+    /// 数字分身自身 Matrix userId（如 @ai-niukunliang:im.ai.ict.cmcc）
+    pub twin_user_id: String,
+}
+
+impl ClientIdentity {
+    /// 是否拿到任何可用身份信息（全空则管理页显示「未登录」）。
+    pub fn any(&self) -> bool {
+        !self.username.trim().is_empty()
+            || !self.display_name.trim().is_empty()
+            || !self.owner.trim().is_empty()
+            || !self.twin_user_id.trim().is_empty()
+    }
+}
+
+/// 读本机员工身份（纯文件读取，失败返回空身份，绝不阻断上报）。
+pub fn read_identity<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> ClientIdentity {
+    let path = settings_yaml_path(app, cfg);
+    read_identity_from_file(&path)
+}
+
+/// 从 settings.yaml 读员工身份（纯逻辑，单测用）。
+pub fn read_identity_from_file(path: &Path) -> ClientIdentity {
+    use serde_yaml::Value;
+    let mut out = ClientIdentity::default();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    let Ok(root) = serde_yaml::from_str::<Value>(&text) else {
+        return out;
+    };
+    let get = |ns: &str, k: &str| -> String {
+        root.get(ns)
+            .and_then(|s| s.as_mapping())
+            .and_then(|m| m.get(Value::String(k.to_string())))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    out.username = get(HIMARKET_NS, "username");
+    out.display_name = get(HIMARKET_NS, "displayName");
+    out.owner = get(MATRIX_NS, "owner");
+    out.twin_user_id = get(MATRIX_NS, "userId");
+    // 兜底：SSO 未登录（无 username）但分身已配置时，从 owner userId 反推账号名。
+    // 形如 `@niukunliang:im.ai.ict.cmcc` → `niukunliang`；分身自身 userId 带 `ai-` 前缀，
+    // 那是机器账号不是人，故只在 owner 上做这个反推。
+    if out.username.is_empty() {
+        out.username = localpart_of(&out.owner);
+    }
+    out
+}
+
+/// 从 Matrix userId（`@name:server`）取 localpart（`name`）。
+/// 非该形状（空串 / 缺 `@` 或 `:`）返回空串。
+fn localpart_of(user_id: &str) -> String {
+    let t = user_id.trim();
+    let Some(rest) = t.strip_prefix('@') else {
+        return String::new();
+    };
+    match rest.split_once(':') {
+        Some((name, _)) if !name.is_empty() => name.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// 读 HiMarket 登录态：读 settings.yaml 的 `himarket.token`。
@@ -347,12 +436,17 @@ fn himarket_token_state_in_file(path: &Path) -> HimarketTokenState {
     if token.trim().is_empty() {
         return HimarketTokenState::NotLoggedIn;
     }
-    let username = section
-        .get(Value::String("username".to_string()))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    HimarketTokenState::LoggedIn { username }
+    let s = |k: &str| -> String {
+        section
+            .get(Value::String(k.to_string()))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    HimarketTokenState::LoggedIn {
+        username: s("username"),
+        display_name: s("displayName"),
+    }
 }
 
 /// 清理 HiMarket 登录态：token/username 置空（保留 baseUrl 与其它键）。
@@ -998,12 +1092,14 @@ mod tests {
         let login = HimarketLogin {
             base_url: "http://market.ai.ict.cmcc".into(),
             username: "niukunliang".into(),
+            display_name: "牛昆亮".into(),
             token: "tok-abc".into(),
         };
         write_himarket_login_to_file(&path, &login).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("token: tok-abc"));
         assert!(text.contains("username: niukunliang"));
+        assert!(text.contains("displayName: 牛昆亮"));
         assert!(text.contains("baseUrl: http://market.ai.ict.cmcc"));
         // 非登录键必须原样保留
         assert!(text.contains("gatewayUrl: http://job.example"));
@@ -1022,6 +1118,7 @@ mod tests {
         let login = HimarketLogin {
             base_url: String::new(),
             username: String::new(),
+            display_name: String::new(),
             token: "tok-new".into(),
         };
         write_himarket_login_to_file(&path, &login).unwrap();
@@ -1049,9 +1146,107 @@ mod tests {
         std::fs::write(&path, "himarket:\n  token: 't'\n  username: 'niukunliang'\n").unwrap();
         assert_eq!(
             himarket_token_state_in_file(&path),
-            HimarketTokenState::LoggedIn { username: "niukunliang".into() }
+            HimarketTokenState::LoggedIn {
+                username: "niukunliang".into(),
+                display_name: String::new(),
+            }
+        );
+
+        // 带中文姓名（SSO 登录后）→ 一并读出
+        std::fs::write(&path, "himarket:\n  token: 't'\n  username: 'niukunliang'\n  displayName: 牛昆亮\n").unwrap();
+        assert_eq!(
+            himarket_token_state_in_file(&path),
+            HimarketTokenState::LoggedIn {
+                username: "niukunliang".into(),
+                display_name: "牛昆亮".into(),
+            }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- 员工身份（管理页「谁在用这台机器」）----------
+
+    #[test]
+    fn identity_reads_sso_username_and_display_name() {
+        let dir = std::env::temp_dir().join(format!("dsh-id-sso-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.yaml");
+        std::fs::write(
+            &path,
+            "himarket:\n  username: niukunliang\n  displayName: 牛昆亮\n  token: t\n\
+             dsh-matrix:\n  userId: '@ai-niukunliang:im.ai.ict.cmcc'\n  owner: '@niukunliang:im.ai.ict.cmcc'\n",
+        )
+        .unwrap();
+        let id = read_identity_from_file(&path);
+        assert_eq!(id.username, "niukunliang");
+        assert_eq!(id.display_name, "牛昆亮");
+        assert_eq!(id.owner, "@niukunliang:im.ai.ict.cmcc");
+        assert_eq!(id.twin_user_id, "@ai-niukunliang:im.ai.ict.cmcc");
+        assert!(id.any());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_falls_back_to_owner_when_not_sso_logged_in() {
+        // 未 SSO 登录（himarket 无 username），但分身已配置 → 从 owner 反推账号名
+        let dir = std::env::temp_dir().join(format!("dsh-id-owner-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.yaml");
+        std::fs::write(
+            &path,
+            "dsh-matrix:\n  userId: '@ai-niukunliang:im.ai.ict.cmcc'\n  owner: '@niukunliang:im.ai.ict.cmcc'\n",
+        )
+        .unwrap();
+        let id = read_identity_from_file(&path);
+        assert_eq!(id.username, "niukunliang", "owner 反推账号名");
+        assert!(id.display_name.is_empty(), "无 SSO 时没有中文姓名");
+        assert!(id.any());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_empty_when_nothing_configured() {
+        let dir = std::env::temp_dir().join(format!("dsh-id-none-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.yaml");
+
+        // 文件不存在 → 空身份，且 any()=false（管理页显示「未登录」）
+        let id = read_identity_from_file(&path);
+        assert!(!id.any(), "无文件时不应报告身份");
+
+        // 文件存在但无关键 → 同样空身份
+        std::fs::write(&path, "llm:\n  retries: 3\n").unwrap();
+        let id = read_identity_from_file(&path);
+        assert!(!id.any());
+        assert_eq!(id, ClientIdentity::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_ignores_twin_account_prefix_in_owner_fallback() {
+        // 反推只在 owner 上做：分身 userId 是机器账号（@ai-xxx），不能当人名用
+        assert_eq!(localpart_of("@niukunliang:im.ai.ict.cmcc"), "niukunliang");
+        assert_eq!(localpart_of("@ai-niukunliang:im.ai.ict.cmcc"), "ai-niukunliang");
+        // 非 Matrix userId 形状 → 空串（不猜）
+        assert_eq!(localpart_of(""), "");
+        assert_eq!(localpart_of("niukunliang"), "");
+        assert_eq!(localpart_of("@nocolon"), "");
+        assert_eq!(localpart_of("@:im.ai.ict.cmcc"), "");
+    }
+
+    #[test]
+    fn identity_json_uses_camel_case() {
+        // 上报给中心服务端的字段名是 camelCase（与 sync.rs 的 json! 一致）
+        let id = ClientIdentity {
+            username: "niukunliang".into(),
+            display_name: "牛昆亮".into(),
+            owner: "@niukunliang:im.ai.ict.cmcc".into(),
+            twin_user_id: "@ai-niukunliang:im.ai.ict.cmcc".into(),
+        };
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(json.contains("\"displayName\":\"牛昆亮\""), "got {json}");
+        assert!(json.contains("\"twinUserId\""), "got {json}");
+        assert!(json.contains("\"username\":\"niukunliang\""), "got {json}");
     }
 
     #[test]

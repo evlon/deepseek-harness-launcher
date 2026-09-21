@@ -772,6 +772,8 @@ pub struct SyncReport<'a> {
     pub config_state: &'a ClientConfigState,
     /// 管理能力状态（外网代理网关是否开启 + 端口）。
     pub bridge_status: &'a BridgeStatus,
+    /// 员工身份（管理页「谁在用这台机器」）。纯展示，不参与鉴权。
+    pub identity: &'a crate::matrix_setup::ClientIdentity,
 }
 
 /// 管理能力（外网代理网关）状态，上报给服务端管理页探测用。
@@ -828,6 +830,14 @@ pub async fn report_sync(report: SyncReport<'_>) -> Result<(), String> {
         "bridgeStatus": {
             "enabled": report.bridge_status.enabled,
             "port": report.bridge_status.port,
+        },
+        // 员工身份：管理页客户端卡片显示「谁在用这台机器」。
+        // 全空时上报空对象，服务端据此显示「未登录」而非空白。
+        "identity": {
+            "username": report.identity.username,
+            "displayName": report.identity.display_name,
+            "owner": report.identity.owner,
+            "twinUserId": report.identity.twin_user_id,
         },
     });
     let mut req = http_client().post(&url).json(&body);
@@ -976,6 +986,20 @@ pub async fn sync_once<R: Runtime>(
             enabled: crate::admin_bridge::is_running(),
             port: crate::admin_bridge::port().unwrap_or(0),
         };
+        // 员工身份：settings.yaml 的 himarket.username/displayName + dsh-matrix.owner/userId。
+        // 读取失败返回空身份，绝不阻断上报。
+        let identity = crate::matrix_setup::read_identity(app, cfg);
+        if identity.any() {
+            log::info!(
+                "上报员工身份：{}（{}）owner={} twin={}",
+                identity.display_name,
+                identity.username,
+                identity.owner,
+                identity.twin_user_id
+            );
+        } else {
+            log::info!("上报员工身份：未登录（无 SSO 账号且分身未配置）");
+        }
         let report = SyncReport {
             server_url: &server_url,
             token: &token,
@@ -992,6 +1016,7 @@ pub async fn sync_once<R: Runtime>(
             profiles: &profiles,
             config_state: &config_state,
             bridge_status: &bridge_status,
+            identity: &identity,
         };
         let _ = report_sync(report).await.map_err(|e| log::warn!("上报同步状态失败：{e}"));
     }
@@ -1201,11 +1226,28 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
         .map_err(|e| format!("INSTALL_SPAWN_FAILED: {e}"))?;
     let output = output.map_err(|e| format!("INSTALL_LAUNCH_FAILED: {e}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         log::error!("安装插件 {spec} 失败（exit={}）：{}", output.status, stderr.trim());
+        // ⚠️ 关键：pnpm 的真实错误打在 **stdout**（实测 ERR_PNPM_* 全部走 stdout），
+        // 而 dsh 只在 stderr 写一行 "pnpm failed in profile directory"。
+        // 旧实现只读 stderr → 真正原因被整条丢弃，用户只看到「详情见日志」。
+        // 必须同时读 stdout，并把可诊断的那几行透传给用户。
+        let detail = extract_pnpm_detail(&stdout, &stderr);
+        if !detail.is_empty() {
+            log::error!("pnpm 输出（{spec}）：{detail}");
+        }
         // pnpm 11 supply-chain 策略：新发布的包被 minimumReleaseAge 拦截 →
         // 自动把该包加进 profile 的 pnpm-workspace.yaml exclude 并重试一次。
-        if stderr.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION") {
+        //
+        // ⚠️ 两个真实踩到的坑（本机实测）：
+        // ① 该错误打在 **stdout**，不在 stderr —— 旧代码 `stderr.contains(...)`
+        //    永不成立，自动豁免从未触发过；
+        // ② pnpm 11.7+ 报的是 `ERR_PNPM_NO_MATURE_MATCHING_VERSION`，
+        //    而不是旧代码匹配的 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`。
+        // 两者叠加 ⇒ 用户只能看到「exit=1，详情见日志」。
+        let combined = format!("{stderr}\n{stdout}");
+        if is_min_release_age_error(&combined) {
             log::warn!("检测到 pnpm minimumReleaseAge 拦截 {spec}，自动加入豁免并重试…");
             ensure_pnpm_min_release_exclude(app, &cfg, &spec);
             // 重试一次
@@ -1228,17 +1270,81 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
                 .map_err(|e| format!("INSTALL_SPAWN_FAILED: {e}"))?;
             let output = output.map_err(|e| format!("INSTALL_LAUNCH_FAILED: {e}"))?;
             if !output.status.success() {
-                let stderr2 = String::from_utf8_lossy(&output.stderr);
+                let stderr2 = String::from_utf8_lossy(&output.stderr).to_string();
+                let stdout2 = String::from_utf8_lossy(&output.stdout).to_string();
                 log::error!("重试安装插件 {spec} 仍失败：{}", stderr2.trim());
-                return Err(format!("PLUGIN_INSTALL_FAILED: {name}（exit={}），详情见日志", output.status));
+                let detail2 = extract_pnpm_detail(&stdout2, &stderr2);
+                return Err(format!(
+                    "PLUGIN_INSTALL_FAILED: {name}（exit={}）{}",
+                    output.status,
+                    if detail2.is_empty() { "，详情见日志".to_string() } else { format!("：{detail2}") }
+                ));
             }
             log::info!("插件已安装（重试成功）：{spec}（profile={profile}）");
             return Ok(());
         }
-        return Err(format!("PLUGIN_INSTALL_FAILED: {name}（exit={}），详情见日志", output.status));
+        return Err(format!(
+            "PLUGIN_INSTALL_FAILED: {name}（exit={}）{}",
+            output.status,
+            if detail.is_empty() { "，详情见日志".to_string() } else { format!("：{detail}") }
+        ));
     }
     log::info!("插件已安装：{spec}（profile={profile}）");
     Ok(())
+}
+
+/// 判断 pnpm 输出是否属于「被 minimumReleaseAge（供应链年龄门槛）拦截」。
+///
+/// 需同时兼容 pnpm 各版本的不同错误码（实测 pnpm 11.7 报的是 NO_MATURE_MATCHING_VERSION）：
+/// - `ERR_PNPM_NO_MATURE_MATCHING_VERSION`（pnpm 11.7+，本机实测）
+/// - `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`（较早版本）
+/// - 兜底：正文出现 `minimumReleaseAge` 且提到 cutoff/constraint
+pub fn is_min_release_age_error(output: &str) -> bool {
+    output.contains("ERR_PNPM_NO_MATURE_MATCHING_VERSION")
+        || output.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION")
+        || (output.contains("minimumReleaseAge")
+            && (output.contains("cutoff") || output.contains("constraint")))
+}
+
+/// 从 pnpm 输出里提取「真正能说明问题」的行，用于展示给用户。
+///
+/// pnpm 把可诊断的错误打在 **stdout**（`ERR_PNPM_*` 段），而 `dsh` 只在 stderr
+/// 写一句无信息量的 "pnpm failed in profile directory"。因此两个流都要看，
+/// 并按优先级挑选：错误码行 > 首个非空说明行。
+///
+/// 返回单行（过长按字符边界截断），便于直接进 `result` 展示。
+pub fn extract_pnpm_detail(stdout: &str, stderr: &str) -> String {
+    let pick = |text: &str| -> Option<String> {
+        let mut code: Option<String> = None;
+        let mut first_meaningful: Option<String> = None;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // 优先 ERR_PNPM_* / ELIFECYCLE 等错误码
+            if code.is_none() && (line.starts_with("[ERR_") || line.starts_with("ERR_PNPM") || line.starts_with("[ELIFECYCLE")) {
+                code = Some(line.to_string());
+                continue;
+            }
+            // 其次：第一行有信息量的话（跳过纯进度/噪声）
+            if first_meaningful.is_none()
+                && !line.starts_with("Progress:")
+                && !line.starts_with("dsh: ")
+                && !line.starts_with("Packages:")
+                && !line.starts_with("+")
+                && !line.starts_with("?")
+                && !line.starts_with("[WARN]")
+                && !line.starts_with("Done in")
+            {
+                first_meaningful = Some(line.to_string());
+            }
+        }
+        code.or(first_meaningful)
+    };
+    let detail = pick(stdout).or_else(|| pick(stderr)).unwrap_or_default();
+    // 截断到 300 字符（按字符边界，避免切坏中文）
+    crate::config::truncate_utf8(&detail, 300).to_string()
 }
 
 /// 把包加进 profile 的 pnpm-workspace.yaml 的 minimumReleaseAgeExclude
@@ -1300,6 +1406,103 @@ pub fn hash_list(items: &[String]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 核心回归（Q2 根因）：pnpm 的真实错误在 **stdout**，必须被提取出来。
+    /// 线上实测：dsh 只在 stderr 写 "pnpm failed in profile directory"，
+    /// 旧实现只读 stderr → 用户永远看不到 "ERR_PNPM_UNEXPECTED_VIRTUAL_STORE" 这类真因。
+    #[test]
+    fn pnpm_detail_extracted_from_stdout() {
+        // 真实复现输出（本机实测）：错误码在 stdout，stderr 只有 dsh 的包装消息
+        let stdout = "[ERR_PNPM_UNEXPECTED_VIRTUAL_STORE] Unexpected virtual store location\n\n\
+                      The dependencies at \"X\" are currently symlinked...\n";
+        let stderr = "dsh: pnpm failed in profile directory C:\\x\\profiles\\matrix\n";
+        let d = extract_pnpm_detail(stdout, stderr);
+        assert!(
+            d.contains("ERR_PNPM_UNEXPECTED_VIRTUAL_STORE"),
+            "必须提取 stdout 里的错误码，实际：{d}"
+        );
+        // 不能把无信息量的 dsh 包装消息当详情
+        assert!(!d.contains("pnpm failed in profile directory"), "不应回退到无信息量的 stderr 包装行");
+    }
+
+    /// stderr 里如果有错误码（部分 pnpm 版本走 stderr），也要能取到。
+    #[test]
+    fn pnpm_detail_falls_back_to_stderr_code() {
+        let d = extract_pnpm_detail("", "[ERR_PNPM_NO_MATCHING_VERSION] No matching version\n");
+        assert!(d.contains("ERR_PNPM_NO_MATCHING_VERSION"), "实际：{d}");
+    }
+
+    /// 只有噪声时返回空串 → 调用方回退为「详情见日志」，不展示垃圾。
+    #[test]
+    fn pnpm_detail_empty_on_noise_only() {
+        let stdout = "Progress: resolved 1, reused 0, downloaded 0\n[WARN] Issues with peer dependencies found.\nDone in 500ms\n";
+        let stderr = "dsh: pnpm failed in profile directory C:\\x\n";
+        assert_eq!(extract_pnpm_detail(stdout, stderr), "");
+    }
+
+    /// 没有错误码时，取第一行有信息量的说明（如网络/权限错误）。
+    #[test]
+    fn pnpm_detail_takes_first_meaningful_line() {
+        let stdout = "Progress: resolved 1\n\nERR_PNPM_FETCH_404  GET https://registry/x: Not Found - 404\n";
+        let d = extract_pnpm_detail(stdout, "");
+        assert!(d.contains("Not Found"), "实际：{d}");
+    }
+
+    /// 长输出按字符边界截断，不能切坏中文/产生非法 UTF-8。
+    #[test]
+    fn pnpm_detail_truncates_safely() {
+        let long = format!("[ERR_PNPM_X] {}", "中文错误说明".repeat(100));
+        let d = extract_pnpm_detail(&long, "");
+        assert!(d.len() <= 300, "应截断到 300 字节内，实际 {}", d.len());
+        // 能正常按 UTF-8 再解析（未切坏字符）
+        assert!(std::str::from_utf8(d.as_bytes()).is_ok());
+    }
+
+    /// 核心回归（Q2 真根因）：supply-chain 年龄门槛错误的识别。
+    ///
+    /// 本机用 launcher 自带 pnpm 11.7.0 实测拿到的**原文**：
+    /// 错误码是 NO_MATURE_MATCHING_VERSION（不是旧代码匹配的 ..._VIOLATION），
+    /// 且打在 stdout。旧实现两个条件都不满足 ⇒ 自动豁免从未触发。
+    #[test]
+    fn detects_real_pnpm_maturity_error() {
+        let real = "Progress: resolved 1, reused 0, downloaded 0, added 0\n\
+                    [ERR_PNPM_NO_MATURE_MATCHING_VERSION] 1 version does not meet the minimumReleaseAge constraint:\n  \
+                    dsh-himarket@0.1.8 was published at 2026-09-21T04:01:02.914Z, within the minimumReleaseAge cutoff (2026-09-14T05:26:46.181Z)\n";
+        assert!(is_min_release_age_error(real), "必须识别 pnpm 11.7 的真实错误码");
+    }
+
+    /// 较早 pnpm 版本的错误码也要兼容。
+    #[test]
+    fn detects_legacy_maturity_error() {
+        assert!(is_min_release_age_error("[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] blocked\n"));
+    }
+
+    /// 兜底匹配：正文含 minimumReleaseAge + cutoff/constraint。
+    #[test]
+    fn detects_maturity_error_by_text() {
+        assert!(is_min_release_age_error(
+            "some error mentioning minimumReleaseAge cutoff at 2026-09-14\n"
+        ));
+    }
+
+    /// 不相关错误不能被误判（否则会无谓改写用户的 pnpm-workspace.yaml）。
+    #[test]
+    fn does_not_misdetect_other_errors() {
+        assert!(!is_min_release_age_error("[ERR_PNPM_UNEXPECTED_VIRTUAL_STORE] x\n"));
+        assert!(!is_min_release_age_error("[ERR_PNPM_FETCH_404] Not Found\n"));
+        assert!(!is_min_release_age_error(""));
+        // 只提到名字但没有 cutoff/constraint 关键字 → 不判为年龄门槛
+        assert!(!is_min_release_age_error("read minimumReleaseAge from config\n"));
+    }
+
+    /// 提取真实错误码作为用户可见详情（Q2：不再是「详情见日志」）。
+    #[test]
+    fn detail_shows_real_maturity_code() {
+        let stdout = "[ERR_PNPM_NO_MATURE_MATCHING_VERSION] 1 version does not meet the minimumReleaseAge constraint\n";
+        let stderr = "dsh: pnpm failed in profile directory C:\\x\n";
+        let d = extract_pnpm_detail(stdout, stderr);
+        assert!(d.contains("ERR_PNPM_NO_MATURE_MATCHING_VERSION"), "实际：{d}");
+    }
 
     #[test]
     fn pending_is_recommended_minus_installed() {

@@ -35,6 +35,8 @@ pub struct CliArgs {
     pub token: String,
     pub tag: String,
     pub update_file: String,
+    /// `update-check --check-only`：只检查并报告，不下载/替换（自动化断言用）。
+    pub check_only: bool,
     pub help: bool,
 }
 
@@ -46,6 +48,7 @@ pub fn parse_args() -> CliArgs {
         token: String::new(),
         tag: String::new(),
         update_file: String::new(),
+        check_only: false,
         help: false,
     };
     let mut iter = std::env::args().skip(1);
@@ -57,6 +60,7 @@ pub fn parse_args() -> CliArgs {
             "--token" => args.token = iter.next().unwrap_or_default(),
             "--tag" => args.tag = iter.next().unwrap_or_default(),
             "--update-file" => args.update_file = iter.next().unwrap_or_default(),
+            "--check-only" => args.check_only = true,
             "-h" | "--help" | "help" => args.help = true,
             _ => {}
         }
@@ -89,7 +93,7 @@ fn print_help() {
     println!("  dsh-install   下载安装指定 dsh 版本（需 --tag <版本>）");
     println!("  dsh-switch    切换 dsh 版本（需 --tag <版本>，停→换→重启）");
     println!("  update-self   自更新 exe（需 --update-file <新exe路径>）");
-    println!("  update-check  检查 launcher 更新");
+    println!("  update-check  检查 launcher 更新（加 --check-only 则只检查不下载）");
     println!("  test          全流程自测（install → launch → status → stop）");
     println!();
     println!("选项：");
@@ -220,13 +224,22 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
         "himarket-status" => {
             let cfg = crate::config::load_cached();
             let st = crate::matrix_setup::himarket_token_state(app, &cfg);
-            let (state, username) = match &st {
-                crate::matrix_setup::HimarketTokenState::LoggedIn { username } => {
-                    ("logged-in".to_string(), username.clone())
+            let (state, username, display_name) = match &st {
+                crate::matrix_setup::HimarketTokenState::LoggedIn { username, display_name } => {
+                    ("logged-in".to_string(), username.clone(), display_name.clone())
                 }
-                crate::matrix_setup::HimarketTokenState::NotLoggedIn => ("not-logged-in".to_string(), String::new()),
+                crate::matrix_setup::HimarketTokenState::NotLoggedIn => {
+                    ("not-logged-in".to_string(), String::new(), String::new())
+                }
             };
-            let json = serde_json::json!({ "status": state, "username": username });
+            // 员工身份（管理页「谁在用这台机器」的数据源，同上报口径）
+            let id = crate::matrix_setup::read_identity(app, &cfg);
+            let json = serde_json::json!({
+                "status": state,
+                "username": username,
+                "displayName": display_name,
+                "identity": id,
+            });
             println!("[himarket-status] {}", serde_json::to_string_pretty(&json).unwrap_or_default());
             0
         }
@@ -317,11 +330,48 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
             }
         }
         "update-check" => {
-            // 手动检查 launcher 更新（发现新版即下载并替换重启）
+            // 手动检查 launcher 更新。
+            // `--check-only`：只检查并打印结果（不下载、不替换）——供自动化断言。
+            // 缺省：检查后若有新版则下载并替换重启。
+            if args.check_only {
+                let outcome = tauri_async_block(app, crate::self_update::check_only(app));
+                let (kind, extra) = match &outcome {
+                    crate::self_update::CheckOutcome::UpToDate { current } => {
+                        ("up-to-date", serde_json::json!({ "current": current }))
+                    }
+                    crate::self_update::CheckOutcome::Available { current, version, notes, size } => (
+                        "available",
+                        serde_json::json!({
+                            "current": current, "version": version, "notes": notes, "size": size
+                        }),
+                    ),
+                    crate::self_update::CheckOutcome::NoRelease { current } => {
+                        ("no-release", serde_json::json!({ "current": current }))
+                    }
+                    crate::self_update::CheckOutcome::Failed { error } => {
+                        ("failed", serde_json::json!({ "error": error }))
+                    }
+                };
+                let mut obj = serde_json::json!({
+                    "status": kind,
+                    "message": outcome.message(),
+                });
+                if let (Some(o), Some(e)) = (obj.as_object_mut(), extra.as_object()) {
+                    for (k, v) in e {
+                        o.insert(k.clone(), v.clone());
+                    }
+                }
+                println!("[update-check] {}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+                return 0;
+            }
             let r = tauri_async_block(app, crate::self_update::check_and_update(app));
             match r {
                 Ok(()) => {
-                    println!("[update-check] 检查完成（无更新或已触发更新流程）");
+                    // 如实报告本轮判定，而不是笼统的「检查完成」
+                    let detail = crate::self_update::last_check()
+                        .map(|(o, _)| o.message())
+                        .unwrap_or_else(|| "未执行检查".to_string());
+                    println!("[update-check] {detail}");
                     0
                 }
                 Err(e) => {
@@ -473,6 +523,7 @@ mod tests {
             token: String::new(),
             tag: String::new(),
             update_file: String::new(),
+            check_only: false,
             help: false,
         }
     }
@@ -500,9 +551,27 @@ mod tests {
             token: String::new(),
             tag: String::new(),
             update_file: "C:\\tmp\\new.exe".to_string(),
+            check_only: false,
             help: false,
         };
         assert_eq!(args.update_file, "C:\\tmp\\new.exe");
+    }
+
+    #[test]
+    fn parse_check_only_flag() {
+        // --check-only 只对 update-check 有意义；解析层只负责记录该开关
+        let a = CliArgs {
+            cmd: Some("update-check".to_string()),
+            json: false,
+            registry: String::new(),
+            token: String::new(),
+            tag: String::new(),
+            update_file: String::new(),
+            check_only: true,
+            help: false,
+        };
+        assert!(a.check_only);
+        assert!(is_cli_mode(&a));
     }
 
     #[test]

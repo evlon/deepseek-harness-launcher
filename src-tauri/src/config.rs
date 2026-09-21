@@ -1164,6 +1164,45 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// 创建一个目录链接，**不需要管理员权限**。
+///
+/// ⚠️ 为什么不用 `std::os::windows::fs::symlink_dir`：它创建的是「符号链接」，
+/// 在未开启开发者模式且非管理员的普通同事机器上会失败
+/// （实测 `os error 1314: 客户端没有所需的特权`）。
+/// `cmd mklink /J`（junction）对应用透明且**无需特权**，故统一走它。
+///
+/// 用途：复制目录时保留 `node_modules` 里的链接结构。dsh 的
+/// `.dsh-module-fallback` 要求该层必须是 symlink，一旦被物化成真实目录，
+/// dsh 启动即报 "exists and is not a symlink or dsh-managed module proxy"。
+pub fn create_dir_link(target: &Path, link: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 隐藏控制台窗口，避免复制时闪窗
+        let status = std::process::Command::new("cmd")
+            .creation_flags(0x08000000)
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("创建目录链接失败（无法启动 mklink）：{e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "创建目录链接失败：mklink /J {} {}",
+                link.display(),
+                target.display()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link).map_err(|e| format!("创建符号链接失败：{e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

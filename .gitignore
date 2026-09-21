@@ -2,6 +2,13 @@
 /target
 **/target
 
+# 备用 cargo target 目录（绕开运行中进程对默认 target 的文件锁时使用）
+# 见 docs/ 发版说明：publish-launcher.sh 固定读默认 target，用别的目录构建时
+# 必须先把新 exe 复制回去，否则会把旧 exe 当新版本上传。
+/build-target/
+/release-target/
+/r040/
+
 # Tauri 构建生成的 schema（编辑器提示用，构建自动重建）
 src-tauri/gen/
 

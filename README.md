@@ -49,10 +49,19 @@
   目标 registry 已存在同版本视为已同步（幂等，E409 不再报错）；
   进度轮询带超时与失败重试，管理页刷新后自动恢复显示。
 - **launcher 自身自动更新（内网自托管）**：管理员把新版 exe 发布到中心服务端
-  （`data/launcher-releases/`，管理页「Launcher 发布」tab 上传），launcher 周期
-  （6 小时）轮询 `GET {serverUrl}/api/launcher/latest` 发现新版（版本严格更大）→
+  （`data/launcher-releases/`，管理页「Launcher 发布」tab 上传），launcher **每次启动即检查**
+  （启动 30s 后）并每 6 小时轮询 `GET {serverUrl}/api/launcher/latest` 发现新版（版本严格更大）→
   自动下载 → sha256 校验 → 替换自身 exe → 重启。绿色版分发无需重装；
-  同内容发布（sha256 一致）自动跳过防循环。`--cmd update-check` 手动检查。
+  同内容发布（sha256 一致）自动跳过防循环。`--cmd update-check` 手动检查
+  （加 `--check-only` 只报告不下载）。
+  **检查结果全程可见**：托盘菜单显示「launcher vX（已是最新）／🚀 发现新版 vX（点击更新）／
+  服务端无发布／检查失败」；更新过程走操作进度窗口（下载 → 校验 → 替换 → 重启 四步），
+  成功失败都有通知——**绝不静默**。⚠️ 三种结果语义不同，**检查失败不会显示成「已是最新」**。
+- **员工身份上报**：SSO 登录时一并取 Keycloak 的 `name` claim（中文姓名）写入
+  `settings.yaml` 的 `himarket.displayName`，随同步上报给中心服务端，管理页客户端卡片
+  显示「谁在用这台机器」（姓名 / 账号 / 数字分身 userId），并支持按姓名、账号、主机名筛选。
+  未 SSO 登录时回落用 `dsh-matrix.owner` 反推账号名；都没有则显示「未登录」。
+  **纯展示字段，不参与任何鉴权判定**。
 - **CLI / IPC 双通道控制**：`--cmd` 一次性执行（install/launch/stop/sync/speedtest/mirror/status/open-console/test/update-check/update-self），
   IPC 命令供常驻实例调用——自动化测试闭环（`--cmd test` 全流程自测）。
 - **数据隔离**：依赖装在自身 AppData 下，`$DSH_HOME` 默认 `~/.dsh-launcher`，与桌面端 `~/.dsh` 互不影响。
@@ -147,6 +156,8 @@ cargo build --release  # 发布版
 ./deepseek-harness-launcher.exe --cmd speedtest        # 测速
 ./deepseek-harness-launcher.exe --cmd mirror --registry http://registry.ict.cmcc --token xxx   # 镜像上传（等待全部上传完成才退出）
 ./deepseek-harness-launcher.exe --cmd open-console     # 打开进度窗口
+./deepseek-harness-launcher.exe --cmd update-check     # 检查 launcher 更新（有则下载替换重启）
+./deepseek-harness-launcher.exe --cmd update-check --check-only   # 只检查并报告，不下载
 ./deepseek-harness-launcher.exe --cmd test             # 全流程自测
 ```
 
