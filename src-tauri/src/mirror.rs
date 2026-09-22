@@ -147,12 +147,22 @@ pub async fn resolve_dependency_tree(
 ///
 /// 国内环境 npmjs 直连慢且易截断（zod 元信息 1MB+，`res.json()` 流式解析
 /// 中途断流报 "error decoding response body"）——用 `res.bytes()` 整包读取再解析。
-async fn fetch_meta(client: &reqwest::Client, name: &str) -> Result<serde_json::Value, String> {
-    let encoded = name.replace('/', "%2F");
-    let registries = vec![
+/// 解析源 registry 列表（仅外网：npmmirror → npmjs）。
+///
+/// ⚠️ 刻意**不含内网 mirror registry**（如 `http://registry.ict.cmcc`）：镜像上传的
+/// 解析源必须只从外网取「最新」元信息，否则内网对已镜像过的包返回 200 → 永远命中
+/// 内网旧版，形成自环。内网 registry 只在 publish 阶段作为 `--registry` 传入，与解析
+/// 源完全分离。此函数独立成纯函数以便单测钉死（见 `source_registries_excludes_internal`）。
+fn source_registries() -> Vec<String> {
+    vec![
         "https://registry.npmmirror.com".to_string(),
         "https://registry.npmjs.org".to_string(),
-    ];
+    ]
+}
+
+async fn fetch_meta(client: &reqwest::Client, name: &str) -> Result<serde_json::Value, String> {
+    let encoded = name.replace('/', "%2F");
+    let registries = source_registries();
 
     let mut last_err = String::new();
     for reg in registries {
@@ -834,6 +844,25 @@ mod tests {
         assert_eq!(resolve_version(&meta, "0.1.0").unwrap(), "0.1.0");
         assert_eq!(resolve_version(&meta, "latest").unwrap(), "0.2.2");
         assert_eq!(resolve_version(&meta, "*").unwrap(), "0.2.2");
+    }
+
+    #[test]
+    fn source_registries_excludes_internal() {
+        // 防线 3：解析源只允许外网 npm，绝不含内网 mirror registry。
+        // 否则镜像上传会命中内网旧版，形成自环（见 source_registries 注释）。
+        let regs = source_registries();
+        assert!(!regs.is_empty(), "解析源不应为空");
+        for r in &regs {
+            assert!(
+                !r.contains("ict.cmcc") && !r.contains("registry.ict"),
+                "解析源绝不能含内网 registry，实际: {r}"
+            );
+        }
+        // 也显式断言不存在任何以 http:// 开头的内网源（内网 Verdaccio 均为 http）。
+        assert!(
+            !regs.iter().any(|r| r.starts_with("http://")),
+            "解析源必须全部 https 外网源，实际: {regs:?}"
+        );
     }
 
     #[test]
