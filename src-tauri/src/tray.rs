@@ -822,6 +822,19 @@ async fn auto_restart_harness<R: Runtime>(app: &AppHandle<R>, plugin: &str, step
     }
 }
 
+/// 批量向导的步骤列表（纯函数，便于测试）。
+///
+/// 长度 = 插件数（+1：仅当 Harness 原本在运行时才追加「重启」一步）。
+/// ⚠️ 这个「+1」是 `auto_restart_harness` 的 step_index 依据（重启步下标 = 插件数），
+/// 少算一步会把重启标到错误的行上，用户看到的进度就与事实不符。
+fn batch_steps(labels: &[String], restart: bool) -> Vec<String> {
+    let mut v = labels.to_vec();
+    if restart {
+        v.push("重启 Harness 使其生效".to_string());
+    }
+    v
+}
+
 /// 「一键全部」菜单项的文案（纯函数，便于测试）。
 ///
 /// 更新与安装要分开计数：只说「全部处理（3 个）」用户不知道有几个是升级。
@@ -1289,9 +1302,8 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                         batch_step_label(name, installed_v, latest_v, *is_update)
                     })
                     .collect();
-                if was_running {
-                    step_labels.push("重启 Harness 使其生效".to_string());
-                }
+                // 末尾在 Harness 原本运行时追加「重启」一步（只重启一次）
+                step_labels = batch_steps(&step_labels, was_running);
                 let step_refs: Vec<&str> = step_labels.iter().map(|s| s.as_str()).collect();
 
                 crate::ops::start_op(&h, "plugin-install-all", &format!("一键处理 {total} 个插件"), &step_refs);
@@ -1336,8 +1348,11 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 }
 
                 // ③ 收尾：只有真的装成了东西才重启（全失败就没必要打断用户）
+                // 重启步下标 = 插件步数（batch_steps 把「重启」追加在末尾）；
+                // 用 step_labels.len()-1 而非 total，避免将来改动步骤构造时静默错位。
+                let restart_step_index = step_labels.len().saturating_sub(1);
                 let restarted = if was_running && !ok.is_empty() {
-                    auto_restart_harness(&h, &format!("{} 个插件", ok.len()), total).await
+                    auto_restart_harness(&h, &format!("{} 个插件", ok.len()), restart_step_index).await
                 } else {
                     if was_running {
                         crate::ops::append_log(&h, "没有任何插件成功，跳过重启");
@@ -1781,6 +1796,27 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 批量步骤列表：重启步只在 Harness 原本运行时追加，且一定在末尾。
+    /// 这个下标是 auto_restart_harness 的 step_index 依据，算错会把重启标错行。
+    #[test]
+    fn batch_steps_appends_restart_only_when_running() {
+        let labels = vec![
+            "更新 dsh-a（0.1.0 → 0.1.1）".to_string(),
+            "安装 dsh-b（0.2.0）".to_string(),
+        ];
+        // Harness 没运行：只有 2 步，没有重启步
+        let not_running = batch_steps(&labels, false);
+        assert_eq!(not_running.len(), 2);
+        assert!(!not_running.iter().any(|s| s.contains("重启")));
+
+        // Harness 在运行：追加重启步，且必须是最后一步
+        let running = batch_steps(&labels, true);
+        assert_eq!(running.len(), 3);
+        assert_eq!(running.last().unwrap(), "重启 Harness 使其生效");
+        // 重启步下标 = 插件数
+        assert_eq!(running.len() - 1, 2);
+    }
 
     /// 批量菜单文案：三种组合都要说清「更新几个 / 安装几个」。
     #[test]
