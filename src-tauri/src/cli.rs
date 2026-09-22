@@ -83,6 +83,7 @@ fn print_help() {
     println!("  speedtest     测速（输出各源延迟）");
     println!("  mirror        镜像上传到内网 registry（需 --registry --token）");
     println!("  status        查询状态（运行中/端口/上次操作/测速结果）");
+    println!("  plugin-pending 查询待装/待更新插件清单（含「一键全部」是否会出现的判定）");
     println!("  open-console  打开进度窗口");
     println!("  matrix-setup-status  查询数字分身配置状态（unconfigured/configured + 缺哪些字段）");
     println!("  matrix-setup-reset   清除数字分身配置（回未配置态，可重走向导）");
@@ -182,6 +183,35 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
         "status" => {
             let r = crate::commands::cmd_status(app.clone());
             print_result("status", &r);
+            0
+        }
+        // 待装/待更新清单 + 「一键全部」的判定结果（与托盘菜单同一口径）。
+        // 用于运维核对「菜单说有几个要更新」与「批量真的会处理几个」是否一致。
+        "plugin-pending" => {
+            let cfg = crate::config::load_cached();
+            let profile = crate::config::resolve_profile(&cfg);
+            let installed = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
+            let state = crate::sync::load_state(app, &cfg);
+            let entries = state
+                .cached_config
+                .as_ref()
+                .map(|c| {
+                    let cur = crate::sync::plugins_for_profile(c, &profile);
+                    crate::sync::pending_with_updates(&cur, &installed, &state.plugin_latest_versions)
+                })
+                .unwrap_or_default();
+            let updates = entries.iter().filter(|e| e["action"].as_str() == Some("update")).count();
+            let installs = entries.len() - updates;
+            let json = serde_json::json!({
+                "profile": profile,
+                "total": entries.len(),
+                "updates": updates,
+                "installs": installs,
+                // >1 才出现「一键全部」入口（与托盘菜单一致）
+                "batchEntryVisible": entries.len() > 1,
+                "entries": entries,
+            });
+            println!("[plugin-pending] {}", serde_json::to_string_pretty(&json).unwrap_or_default());
             0
         }
         "matrix-setup-status" => {

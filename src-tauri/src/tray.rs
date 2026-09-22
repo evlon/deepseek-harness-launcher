@@ -537,21 +537,10 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     // 待装/待更新清单：优先用缓存的服务端配置（离线也可显示）。
     // 判断口径 = 当前 profile 已装 + registry 最新版本（已装旧版 → 提示更新）。
     // 清单按当前 profile 精确取（profilePlugins[当前] 优先，回落全局 plugins）。
-    let current_profile = resolve_profile(&cfg);
-    let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
+    // 与「一键全部」共用 pending_entries()，避免两处口径漂移。
+    let pending_entries: Vec<serde_json::Value> = pending_entries(app);
+    // 服务端缓存状态（下架清单等）仍需要
     let state = crate::sync::load_state(app, &cfg);
-    let pending_entries: Vec<serde_json::Value> = state
-        .cached_config
-        .as_ref()
-        .map(|c| {
-            let cur = crate::sync::plugins_for_profile(c, &current_profile);
-            crate::sync::pending_with_updates(
-                &cur,
-                &installed_with_ver,
-                &state.plugin_latest_versions,
-            )
-        })
-        .unwrap_or_default();
 
     let mut status_items: Vec<MenuItem<R>> = Vec::new();
     let mut install_items: Vec<MenuItem<R>> = Vec::new();
@@ -599,6 +588,17 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     if pending_entries.is_empty() {
         status_items.push(MenuItem::with_id(app, "sync-uptodate", "已是最新（无待装/待更新推荐）", false, None::<&str>)?);
     } else {
+        // ⚡ 批量入口：待处理 >1 个时提供「一键全部」，不必逐个点。
+        // 排在各单项之前（最省事的入口放最上）。
+        if pending_entries.len() > 1 {
+            let upd = pending_entries
+                .iter()
+                .filter(|e| e["action"].as_str() == Some("update"))
+                .count();
+            let ins = pending_entries.len() - upd;
+            let label = batch_menu_label(pending_entries.len(), upd, ins);
+            install_items.push(MenuItem::with_id(app, "sync-install-all", label, true, None::<&str>)?);
+        }
         for (i, entry) in pending_entries.iter().enumerate() {
             let name = entry["name"].as_str().unwrap_or("").to_string();
             let action = entry["action"].as_str().unwrap_or("install");
@@ -707,6 +707,15 @@ fn installed_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<S
 ///
 /// 更新向导需要展示「0.1.7 → 0.1.8」这类信息，仅名字不够，故返回整个 JSON 条目。
 fn pending_entry_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<serde_json::Value> {
+    pending_entries(app).get(index).cloned()
+}
+
+/// 当前 profile 的完整待装/待更新清单（与 `build_sync_submenu` 同一口径）。
+///
+/// 单独抽出是为了让「一键全部」与逐个入口**共用同一份判定**：两处若各自
+/// 计算，一旦口径漂移（如批量入口漏了 profile 过滤），用户会看到菜单列出 3 个、
+/// 实际只处理 2 个，且难以察觉。
+fn pending_entries<R: Runtime>(app: &AppHandle<R>) -> Vec<serde_json::Value> {
     let cfg = load_cached();
     let current_profile = resolve_profile(&cfg);
     let installed_with_ver = crate::sync::installed_plugins_current_profile_with_versions(app, &cfg);
@@ -714,12 +723,11 @@ fn pending_entry_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<serd
     state
         .cached_config
         .as_ref()
-        .and_then(|c| {
+        .map(|c| {
             let cur = crate::sync::plugins_for_profile(c, &current_profile);
             crate::sync::pending_with_updates(&cur, &installed_with_ver, &state.plugin_latest_versions)
-                .get(index)
-                .cloned()
         })
+        .unwrap_or_default()
 }
 
 /// 供菜单点击时取「第 i 个建议卸载插件名」（与 build_sync_submenu 的索引一致）。
@@ -776,14 +784,17 @@ fn confirm_uninstall(name: &str, reason: &str) -> bool {
 /// - Harness **本来没运行** → 不动它（不替用户决定要启动）；
 /// - 重启失败 → 返回 false 并写日志，由调用方在结果里如实体现（不谎报成功）。
 ///
+/// `step_index` = 本次操作里「重启」那一步的下标。单个更新是 1；
+/// 批量更新时步骤列表长度 = 插件数 + 1（重启），故不能写死。
+///
 /// 返回是否真的完成了「重启」。
-async fn auto_restart_harness<R: Runtime>(app: &AppHandle<R>, plugin: &str) -> bool {
+async fn auto_restart_harness<R: Runtime>(app: &AppHandle<R>, plugin: &str, step_index: usize) -> bool {
     if !crate::workflow::is_running() {
         crate::ops::append_log(app, "Harness 未在运行，跳过重启（下次启动即加载新版本）");
         return false;
     }
     // 第 1 步：重启 Harness（含停止 + 启动 + 等端口就绪）
-    crate::ops::mark_step_running(app, 1);
+    crate::ops::mark_step_running(app, step_index);
     crate::ops::update_step(app, "正在重启 Harness 使新版本生效…");
     crate::ops::append_log(app, "更新后需重载插件：正在重启 Harness…");
 
@@ -800,7 +811,7 @@ async fn auto_restart_harness<R: Runtime>(app: &AppHandle<R>, plugin: &str) -> b
             // 重启失败不掩盖：明确告知 + 引导用户手动启动（不谎报「已就绪」）
             log::error!("插件更新后重启 Harness 失败：{e}");
             crate::ops::append_log(app, &format!("✗ 自动重启失败：{e}"));
-            crate::ops::mark_step_failed(app, 1);
+            crate::ops::mark_step_failed(app, step_index);
             notify(
                 app,
                 "插件已更新，但 Harness 重启失败",
@@ -809,6 +820,49 @@ async fn auto_restart_harness<R: Runtime>(app: &AppHandle<R>, plugin: &str) -> b
             false
         }
     }
+}
+
+/// 「一键全部」菜单项的文案（纯函数，便于测试）。
+///
+/// 更新与安装要分开计数：只说「全部处理（3 个）」用户不知道有几个是升级。
+fn batch_menu_label(total: usize, updates: usize, installs: usize) -> String {
+    match (updates, installs) {
+        (_, 0) => format!("⬆️ 全部更新（{updates} 个）"),
+        (0, _) => format!("⬇️ 全部安装（{installs} 个）"),
+        _ => format!("⚡ 全部处理（{total} 个：更新 {updates} / 安装 {installs}）"),
+    }
+}
+
+/// 批量向导里「单个插件」那一步的文案（纯函数，便于测试）。
+///
+/// 更新与安装必须能一眼区分：只写插件名，用户看不出这次是升级还是首装。
+fn batch_step_label(name: &str, installed_v: &str, latest_v: &str, is_update: bool) -> String {
+    if is_update {
+        format!("更新 {name}（{installed_v} → {latest_v}）")
+    } else {
+        format!("安装 {name}（{latest_v}）")
+    }
+}
+
+/// 批量处理的最终结论（纯函数，便于测试）。
+///
+/// 三条硬要求：
+/// 1. **有失败就绝不说「全部完成」** —— 否则用户以为全好了，实际有几个没装上；
+/// 2. 失败项**逐条列出含真因**，不能只给个数（用户要据此决定下一步）；
+/// 3. 只有真的重启了才说「已自动重启生效」，不谎报。
+fn batch_summary(total: usize, ok: usize, failed: &[(String, String)], restarted: bool) -> String {
+    let mut s = if failed.is_empty() {
+        format!("{total} 个插件全部处理完成")
+    } else {
+        format!("完成 {ok} 个，失败 {} 个", failed.len())
+    };
+    if restarted {
+        s.push_str("，Harness 已自动重启生效");
+    }
+    for (name, err) in failed {
+        s.push_str(&format!("\n✗ {name}：{err}"));
+    }
+    s
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
@@ -1200,6 +1254,114 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                 }
             });
         }
+        id if id == "sync-install-all" => {
+            // ⚡ 一键全部：把待装/待更新清单**在一个向导里**逐个处理完。
+            // 用户诉求原文：「显示多余 1 个插件需要更新，现在只能一个一个更新，
+            // 建议有更新所有菜单」——逐点 N 次既费事，又每次都触发一次重启。
+            let entries = pending_entries(app);
+            if entries.is_empty() {
+                notify(app, "无需处理", "当前没有待安装/待更新的推荐插件");
+                return;
+            }
+            // 快照成纯数据（entry 是 serde_json::Value，可安全 move 进 async 块）
+            let items: Vec<(String, String, String, String, bool)> = entries
+                .iter()
+                .map(|e| {
+                    let action = e["action"].as_str().unwrap_or("install").to_string();
+                    (
+                        e["name"].as_str().unwrap_or("").to_string(),
+                        action.clone(),
+                        e["installed"].as_str().unwrap_or("").to_string(),
+                        e["latest"].as_str().unwrap_or("").to_string(),
+                        action == "update",
+                    )
+                })
+                .collect();
+            let total = items.len();
+            let was_running = crate::workflow::is_running();
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                // 步骤列表：每个插件一步（带名字，用户能看到「正在更新哪个、哪些已完成」），
+                // 末尾在 Harness 原本运行时追加「重启」一步。
+                let mut step_labels: Vec<String> = items
+                    .iter()
+                    .map(|(name, _, installed_v, latest_v, is_update)| {
+                        batch_step_label(name, installed_v, latest_v, *is_update)
+                    })
+                    .collect();
+                if was_running {
+                    step_labels.push("重启 Harness 使其生效".to_string());
+                }
+                let step_refs: Vec<&str> = step_labels.iter().map(|s| s.as_str()).collect();
+
+                crate::ops::start_op(&h, "plugin-install-all", &format!("一键处理 {total} 个插件"), &step_refs);
+                // ① 计划区：逐个列出「将要做什么」，点之前就看得见
+                let mut details = vec![format!("共 {total} 个待处理（目标 profile：{}）", resolve_profile(&load_cached()))];
+                for (name, _, installed_v, latest_v, is_update) in &items {
+                    details.push(if *is_update {
+                        format!("{name}：{installed_v} → {latest_v}")
+                    } else {
+                        format!("{name}：新安装（{latest_v}）")
+                    });
+                }
+                if was_running {
+                    details.push("全部完成后自动重启 Harness 使新版本生效（只重启一次）".to_string());
+                }
+                crate::ops::set_details(&h, &details);
+                if let Err(e) = crate::console::open_console(&h) {
+                    log::warn!("批量更新向导窗口打开失败（降级为通知）：{e}");
+                }
+
+                // ② 逐个处理：成功一个标一个 ✓，失败一个标一个 ✗，**不中断**后续
+                let mut ok: Vec<String> = Vec::new();
+                let mut failed: Vec<(String, String)> = Vec::new();
+                for (i, (name, _, _installed_v, _latest_v, is_update)) in items.iter().enumerate() {
+                    let verb = if *is_update { "更新" } else { "安装" };
+                    crate::ops::mark_step_running(&h, i);
+                    crate::ops::update_step(&h, &format!("正在{verb} {name}（{}/{total}）…", i + 1));
+                    match crate::sync::install_plugin(&h, name).await {
+                        Ok(()) => {
+                            crate::ops::append_log(&h, &format!("✓ {name} 已{verb}"));
+                            crate::ops::mark_step_done(&h, i);
+                            ok.push(name.clone());
+                        }
+                        Err(e) => {
+                            // 单个失败不阻断其余：用户要的是「一次点完」，不是「一错全停」。
+                            // 失败如实标红 + 进结论，绝不混进成功里。
+                            crate::ops::append_log(&h, &format!("✗ {name} {verb}失败：{e}"));
+                            crate::ops::mark_step_failed(&h, i);
+                            failed.push((name.clone(), e));
+                        }
+                    }
+                }
+
+                // ③ 收尾：只有真的装成了东西才重启（全失败就没必要打断用户）
+                let restarted = if was_running && !ok.is_empty() {
+                    auto_restart_harness(&h, &format!("{} 个插件", ok.len()), total).await
+                } else {
+                    if was_running {
+                        crate::ops::append_log(&h, "没有任何插件成功，跳过重启");
+                    } else {
+                        crate::ops::append_log(&h, "Harness 未在运行，无需重启（下次启动即加载新版本）");
+                    }
+                    false
+                };
+
+                // 结论：成功 N / 失败 M，失败项逐条列出（含真因），不笼统说「已完成」
+                let summary = batch_summary(total, ok.len(), &failed, restarted);
+                if failed.is_empty() {
+                    crate::ops::finish_op(&h, &summary);
+                    notify(&h, "插件已全部处理", &summary);
+                } else {
+                    // 有失败 → 整体算失败（否则用户会以为全好了）
+                    crate::ops::fail_op(&h, &summary);
+                    notify(&h, "部分插件处理失败", &summary);
+                }
+                let cfg = load_cached();
+                let _ = crate::sync::sync_once(&h, &cfg, None, false).await;
+                refresh_sync_menu(&h);
+            });
+        }
         id if id.starts_with("sync-install-") => {
             let idx = id
                 .strip_prefix("sync-install-")
@@ -1249,7 +1411,7 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                                 // ③ 更新插件后必须重启 Harness 才生效 —— 自动完成，
                                 //    不再让用户自己摸索「停止 + 启动」两次。
                                 let restarted = if was_running {
-                                    auto_restart_harness(&h, &name_clone).await
+                                    auto_restart_harness(&h, &name_clone, 1).await
                                 } else {
                                     crate::ops::append_log(&h, "Harness 未在运行，无需重启（下次启动即加载新版本）");
                                     false
@@ -1614,4 +1776,76 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     clipboard
         .set_text(text.to_string())
         .map_err(|e| format!("写入剪贴板失败：{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 批量菜单文案：三种组合都要说清「更新几个 / 安装几个」。
+    #[test]
+    fn batch_menu_label_covers_three_cases() {
+        // 全是更新
+        let all_upd = batch_menu_label(3, 3, 0);
+        assert!(all_upd.contains("全部更新") && all_upd.contains('3'), "{all_upd}");
+        // 全是安装
+        let all_ins = batch_menu_label(2, 0, 2);
+        assert!(all_ins.contains("全部安装") && all_ins.contains('2'), "{all_ins}");
+        // 混合：必须同时报出两个数，否则用户不知道有几个是升级
+        let mixed = batch_menu_label(3, 2, 1);
+        assert!(mixed.contains("更新 2") && mixed.contains("安装 1"), "{mixed}");
+    }
+
+    /// 批量步骤文案：更新与安装必须可区分（用户要看出这次是升级还是首装）。
+    #[test]
+    fn batch_step_label_distinguishes_update_and_install() {
+        let upd = batch_step_label("dsh-himarket", "0.1.7", "0.1.8", true);
+        assert_eq!(upd, "更新 dsh-himarket（0.1.7 → 0.1.8）");
+        let ins = batch_step_label("dsh-new", "", "1.0.0", false);
+        assert_eq!(ins, "安装 dsh-new（1.0.0）");
+        assert_ne!(upd, ins);
+    }
+
+    /// ⭐ 核心红线：有失败时**绝不能**说「全部处理完成」。
+    /// 否则用户以为全好了，实际有插件没装上——这正是「更新成功却没提示」的同类问题。
+    #[test]
+    fn batch_summary_never_claims_success_when_any_failed() {
+        let failed = vec![("dsh-b".to_string(), "PLUGIN_INSTALL_FAILED: exit=1".to_string())];
+        let s = batch_summary(3, 2, &failed, false);
+        assert!(!s.contains("全部处理完成"), "有失败却说全部完成：{s}");
+        assert!(s.contains("完成 2 个，失败 1 个"), "缺少计数：{s}");
+        // 失败项必须带名字和真因，用户要据此决策
+        assert!(s.contains("dsh-b"), "失败项未列出名字：{s}");
+        assert!(s.contains("PLUGIN_INSTALL_FAILED"), "失败项未带真因：{s}");
+    }
+
+    /// 全成功时才说「全部处理完成」。
+    #[test]
+    fn batch_summary_all_success() {
+        let s = batch_summary(3, 3, &[], false);
+        assert!(s.contains("3 个插件全部处理完成"), "{s}");
+        assert!(!s.contains("失败"), "{s}");
+    }
+
+    /// 只有真的重启了才说「已自动重启生效」，不谎报。
+    #[test]
+    fn batch_summary_reports_restart_honestly() {
+        let no = batch_summary(2, 2, &[], false);
+        assert!(!no.contains("已自动重启"), "没重启却说重启了：{no}");
+        let yes = batch_summary(2, 2, &[], true);
+        assert!(yes.contains("Harness 已自动重启生效"), "{yes}");
+    }
+
+    /// 多个失败项逐条列出（不能只给个数）。
+    #[test]
+    fn batch_summary_lists_every_failure() {
+        let failed = vec![
+            ("dsh-a".to_string(), "err-a".to_string()),
+            ("dsh-b".to_string(), "err-b".to_string()),
+        ];
+        let s = batch_summary(2, 0, &failed, false);
+        assert!(s.contains("失败 2 个"), "{s}");
+        assert!(s.contains("dsh-a") && s.contains("err-a"), "{s}");
+        assert!(s.contains("dsh-b") && s.contains("err-b"), "{s}");
+    }
 }

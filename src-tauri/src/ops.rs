@@ -200,6 +200,11 @@ pub fn update_step<R: Runtime>(app: &AppHandle<R>, step: &str) {
 }
 
 /// 标记第 i 个步骤为进行中（前置步骤标记完成）。
+///
+/// ⚠️ 前置步骤里**已经失败的保持失败**，不能被后续推进抹成「完成」。
+/// 批量场景（一键更新全部插件）必须做到这一点：第 2 个插件失败后，
+/// 第 3、4 个仍要继续更新，此时推进到第 3 步不能把第 2 步的 ✗ 改写成 ✓
+/// —— 否则界面会谎报成功，用户以为全好了。
 pub fn mark_step_running<R: Runtime>(app: &AppHandle<R>, index: usize) {
     if let Some(op) = lock_current().as_mut() {
         if op.state != OpState::Running {
@@ -207,12 +212,28 @@ pub fn mark_step_running<R: Runtime>(app: &AppHandle<R>, index: usize) {
         }
         for (i, step) in op.steps.iter_mut().enumerate() {
             if i < index {
-                step.state = StepState::Done;
+                // 已失败的不覆盖（如实保留），其余前置步骤视为完成
+                if step.state != StepState::Failed {
+                    step.state = StepState::Done;
+                }
             } else if i == index {
                 step.state = StepState::Running;
             } else {
                 step.state = StepState::Pending;
             }
+        }
+    }
+    emit_update(app);
+}
+
+/// 标记第 i 个步骤为已完成。
+///
+/// 批量流程需要「逐个插件独立收尾」（成功一个标一个），而 `mark_step_running(i+1)`
+/// 只在还有下一步时才顺带标记前一步；最后一步之后没有 i+1，故需显式接口。
+pub fn mark_step_done<R: Runtime>(app: &AppHandle<R>, index: usize) {
+    if let Some(op) = lock_current().as_mut() {
+        if let Some(step) = op.steps.get_mut(index) {
+            step.state = StepState::Done;
         }
     }
     emit_update(app);
@@ -631,5 +652,45 @@ mod tests {
     fn garbage_state_returns_none() {
         assert!(parse_state("not json at all").is_none());
         assert!(parse_state("").is_none());
+    }
+
+    /// ⭐ 批量场景红线：推进到下一步时，**已失败的步骤不能被抹成「完成」**。
+    ///
+    /// 一键更新 3 个插件，第 2 个失败、第 3 个继续：推进到第 3 步时，
+    /// 第 2 步必须仍是 ✗。旧实现会把所有 i<index 无条件置 Done，
+    /// 界面于是谎报成功——用户以为全装上了。
+    #[test]
+    fn mark_step_running_preserves_failed_predecessor() {
+        let _guard = serial_lock();
+        let app = fake_app();
+        reset_for_test();
+        start_op(&app, "plugin-install-all", "一键处理 3 个插件", &["装 A", "装 B", "装 C"]);
+
+        mark_step_running(&app, 0);
+        mark_step_done(&app, 0);
+        mark_step_running(&app, 1);
+        mark_step_failed(&app, 1);
+        // 继续处理第 3 个（失败不阻断后续）
+        mark_step_running(&app, 2);
+
+        let op = current().unwrap();
+        assert_eq!(op.steps[0].state, StepState::Done, "成功项应保持完成");
+        assert_eq!(op.steps[1].state, StepState::Failed, "失败项被抹成完成了（谎报成功）");
+        assert_eq!(op.steps[2].state, StepState::Running);
+    }
+
+    /// mark_step_done：最后一步之后没有 i+1，必须能显式收尾。
+    #[test]
+    fn mark_step_done_works_on_last_step() {
+        let _guard = serial_lock();
+        let app = fake_app();
+        reset_for_test();
+        start_op(&app, "batch", "批量", &["装 A", "装 B"]);
+        mark_step_running(&app, 0);
+        mark_step_done(&app, 0);
+        mark_step_running(&app, 1);
+        mark_step_done(&app, 1);
+        let op = current().unwrap();
+        assert!(op.steps.iter().all(|s| s.state == StepState::Done), "{:?}", op.steps);
     }
 }

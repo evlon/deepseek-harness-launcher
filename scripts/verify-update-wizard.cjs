@@ -147,10 +147,45 @@ setTimeout(() => {
         check('HTML 被转义（&lt;img）', els.opHist.innerHTML.includes('&lt;img'), '未转义');
         check('无未转义的 <script>', !els.opHist.innerHTML.includes('<script>'));
 
-        console.log(`\n${'='.repeat(50)}`);
-        console.log(`结果：${pass} 通过 / ${fail} 失败`);
-        console.log('='.repeat(50));
-        process.exit(fail === 0 ? 0 : 1);
+        // ── 批量：一键全部（本轮新增） ──────────────────────────────
+        console.log('\n【⑧ 批量：中间失败不能被抹成成功，结论不得谎报】');
+        // 3 个插件：A 成功、B 失败、C 成功，最后重启成功。
+        // 有失败 ⇒ Rust 侧调用 fail_op ⇒ state=failed（不是 done）——
+        // 这里必须照实模拟，否则测的是不存在的状态。
+        stateJson = JSON.stringify({
+          id: 'plugin-install-all', label: '一键处理 3 个插件', state: 'failed',
+          current_step: '失败',
+          steps: [
+            { label: '更新 dsh-a（0.1.0 → 0.1.1）', state: 'done' },
+            { label: '更新 dsh-b（0.2.0 → 0.2.1）', state: 'failed' },
+            { label: '更新 dsh-c（0.3.0 → 0.3.1）', state: 'done' },
+            { label: '重启 Harness 使其生效', state: 'done' },
+          ],
+          log: ['[开始] 一键处理 3 个插件', '✓ dsh-a 已更新', '✗ dsh-b 更新失败：exit=1'],
+          result: '完成 2 个，失败 1 个，Harness 已自动重启生效\n✗ dsh-b：PLUGIN_INSTALL_FAILED: exit=1',
+          details: ['共 3 个待处理（目标 profile：matrix）', 'dsh-a：0.1.0 → 0.1.1', 'dsh-b：0.2.0 → 0.2.1'],
+          started_at: '2026-09-21 13:00:00', finished_at: '2026-09-21 13:02:00',
+        });
+        intervals.forEach((fn) => fn());
+        setTimeout(() => {
+          check('计划区列出全部待处理项', els.opPlan.innerHTML.includes('dsh-a') && els.opPlan.innerHTML.includes('dsh-b'));
+          check('4 个步骤全部渲染', (els.opSteps.innerHTML.match(/class="step/g) || []).length === 4,
+            'steps=' + els.opSteps.innerHTML);
+          check('中间失败步骤渲染为 ✗', els.opSteps.innerHTML.includes('✗'), els.opSteps.innerHTML);
+          check('失败步骤为 failed 类', els.opSteps.innerHTML.includes('class="step failed"'));
+          check('前后成功步骤仍为 ✓', (els.opSteps.innerHTML.match(/✓/g) || []).length === 3,
+            '成功标记数=' + (els.opSteps.innerHTML.match(/✓/g) || []).length);
+          // ⭐ 最关键：结论不得谎报「全部完成」
+          check('结论不谎报全部完成', !els.opStatus.textContent.includes('全部处理完成'), els.opStatus.textContent);
+          check('结论含「完成 2 个，失败 1 个」', els.opStatus.textContent.includes('完成 2 个，失败 1 个'));
+          check('失败项带真因', els.opStatus.textContent.includes('PLUGIN_INSTALL_FAILED'));
+          check('整体状态为失败（部分失败不得显示为成功）', els.opStatus.textContent.includes('失败'));
+
+          console.log(`\n${'='.repeat(50)}`);
+          console.log(`结果：${pass} 通过 / ${fail} 失败`);
+          console.log('='.repeat(50));
+          process.exit(fail === 0 ? 0 : 1);
+        }, 60);
       }, 60);
     }, 60);
   }, 60);
