@@ -53,7 +53,7 @@ impl Default for ActivationConfig {
             issuer: "https://auth.ict.cmcc/realms/employees".to_string(),
             client_id: "matrix-twin-activation".to_string(),
             client_secret: String::new(),
-            activate_endpoint: "http://im.ai.ict.cmcc/_matrix/activate".to_string(),
+            activate_endpoint: "https://im.ai.ict.cmcc/_matrix/activate".to_string(),
             // homeserver 不硬编码默认：服务端 envDefaults 下发；未下发则留空，
             // 激活/连接时因 homeserverUrl 缺失而明确失败提示，绝不静默回落旧域名。
             homeserver_url: String::new(),

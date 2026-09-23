@@ -95,7 +95,7 @@ pub const ENV_DEFAULTS: &[EnvDefault] = &[
     // 不经这里下发（从环境变量 DSH_TWIN_CLIENT_SECRET 读）。
     EnvDefault { namespace: "matrix-activation", key: "keycloakIssuer", value: "https://auth.ict.cmcc/realms/employees" },
     EnvDefault { namespace: "matrix-activation", key: "clientId", value: "matrix-twin-activation" },
-    EnvDefault { namespace: "matrix-activation", key: "activateEndpoint", value: "http://im.ai.ict.cmcc/_matrix/activate" },
+    EnvDefault { namespace: "matrix-activation", key: "activateEndpoint", value: "https://im.ai.ict.cmcc/_matrix/activate" },
     // homeserver 不硬编码默认：服务端 envDefaults 下发；未下发则留空（激活时因
     // homeserverUrl 缺失明确失败提示，不静默回落旧域名）。
     EnvDefault { namespace: "matrix-activation", key: "homeserverUrl", value: "" },
