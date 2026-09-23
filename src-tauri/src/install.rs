@@ -14,6 +14,16 @@ use crate::download::Component;
 /// - launcher-brand：内置品牌名称覆盖插件（file: 引用，随 launcher 分发）
 pub const MATRIX_PROFILE: &str = "matrix";
 
+/// matrix profile 必需的 bundle（两个，缺一不可，见 ensure_matrix_profile 文档）：
+/// - `@deepseek-ai/dsh-base`：核心 service（sessionPersistence/sessions/commands/llm 等），
+///   随 dsh 核心安装目录分发，由 fallback 软链，无需 plugin add。
+/// - `@deepseek-ai/dsh-web-app`：前端/agent-presets/webserver 等 host 服务，独立 npm 包，
+///   需真正 `dsh plugin add` 安装（本常量即其安装 spec）。
+///
+/// 版本选择：与 dsh 核心同一代（dsh 0.1.5-rc.1 ↔ 0.1.5-rc.2，均 0.1.5 线）。
+/// 内网 Verdaccio（registry.ict.cmcc）实测有 0.1.5-rc.2，可装出完整依赖树。
+pub const MATRIX_WEB_APP: &str = "@deepseek-ai/dsh-web-app@0.1.5-rc.2";
+
 /// 安装 / 修复全部组件 + 预置 profile 插件。
 pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let cfg = load_cached();
@@ -802,6 +812,7 @@ pub async fn preset_current_profile<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
     let _ = crate::plugin::ensure_profile_npmrc_for(app, cfg, &profile);
 
     // matrix profile：额外做结构性骨架（launcher-brand 释放已在 install_all 前置完成）
+    // 注意：ensure_matrix_profile 现在会真正安装 web-app（不只是写 bundles 声明）。
     if profile == MATRIX_PROFILE {
         preset_matrix_profile(app, cfg).await?;
     }
@@ -810,11 +821,11 @@ pub async fn preset_current_profile<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
     Ok(())
 }
 
-/// matrix profile 的结构性骨架（不含插件安装）：
-/// 1. 把 `@deepseek-ai/dsh-web-app` 加进 bundles（dsh 内置 bundle，从安装目录解析，
-///    agent-presets / webserver 等 host 服务，dsh-matrix-agent 依赖它们）
-/// 2. 写 cordis.patch.yml（配置品牌名称）
-/// 3. 下发环境默认配置（各内网服务地址等统一值）到 settings.yaml
+/// matrix profile 的结构性骨架（含 web-app 真正安装）：
+/// 1. 把 `@deepseek-ai/dsh-web-app` 加进 bundles（声明）
+/// 2. 真正 `dsh plugin add` 安装 web-app（提供 agent-presets / webserver 等 host 服务）
+/// 3. 写 cordis.patch.yml（配置品牌名称）
+/// 4. 下发环境默认配置（各内网服务地址等统一值）到 settings.yaml
 ///
 /// launcher-brand / dsh-matrix-agent 等插件本身由服务端 profilePlugins.matrix 清单
 /// 决定是否安装（见 install_server_recommended）。
@@ -837,10 +848,25 @@ pub async fn preset_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &Launche
 /// 幂等：profile 已存在则只补缺（add_builtin_bundle 检测 bundles 是否已含目标项；
 /// write_matrix_brand_patch 直接覆盖写；env_defaults 只填空缺不覆盖用户值）。
 pub fn ensure_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
-    // 把 @deepseek-ai/dsh-web-app 加入 bundles（dsh 内置，从安装目录解析；提供
-    // agent-presets / webserver 等 host 服务，dsh-matrix-agent 依赖它们）。
-    // 这一步同时负责：profile manifest 不存在时先建最小骨架。
+    // ⭐ 根因修复（2026-09-23 事故）：matrix profile 的 bundles 必须同时含
+    //    `@deepseek-ai/dsh-base` 和 `@deepseek-ai/dsh-web-app` 两个 bundle，缺一不可：
+    //    - dsh-base：提供 sessionPersistence / sessions / commands / credentials /
+    //      storageDomain / llm / tools 等**核心 service**。dsh 启动时 17 个官方插件
+    //      （dsh-agent / dsh-agent-loop / dsh-api-session-controller 等）都依赖这些 service。
+    //      缺 dsh-base → 全员 pending → assertEntriesActivated 报「17 entries did not
+    //      activate」→ 进程退出 → 端口 90s 不就绪（HARNESS_NOT_READY）。
+    //      dsh-base 随 dsh 核心安装目录分发（dsh/node_modules/@deepseek-ai/dsh-base），
+    //      由 healProfilesModuleFallback 软链到 profiles/node_modules，**无需 plugin add**。
+    //    - dsh-web-app：提供 agent-presets / webserver / 前端 UI 等 host 服务。它是**独立
+    //      npm 包**（不在 dsh 核心安装目录内），必须真正 `dsh plugin add` 安装（见
+    //      install_matrix_web_app）——旧注释「内置 bundle 从安装目录解析、不需要 pnpm 安装」
+    //      在 dsh@0.1.5-rc.1 上不成立。
+    //    顺序：dsh-base 在前（核心 service 先行），web-app 在后。
+    add_builtin_bundle(app, cfg, MATRIX_PROFILE, "@deepseek-ai/dsh-base")?;
     add_builtin_bundle(app, cfg, MATRIX_PROFILE, "@deepseek-ai/dsh-web-app")?;
+
+    // 真正安装 web-app（独立 npm 包，dsh-base 已随核心分发无需装）。
+    install_matrix_web_app(app, cfg)?;
 
     // 写品牌 patch（配置品牌名称）
     write_matrix_brand_patch(app, cfg)?;
@@ -862,10 +888,61 @@ pub fn ensure_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfi
     Ok(())
 }
 
+/// 真正安装 matrix profile 的 web-app bundle（同步执行 `dsh plugin add`）。
+///
+/// 与 `preset_profile`（async）不同，本函数同步阻塞执行——因为 `ensure_matrix_profile`
+/// 的调用点（first_run 的 spawn、/activate 与 /submit 的 spawn_blocking）本就在工作线程
+/// 上，阻塞等待插件安装完成是预期行为，且必须先装完再 launch，否则分身启动即失败。
+///
+/// 失败**阻断** ensure_matrix_profile（返回 Err）：web-app 缺失会导致分身 100% 启动失败，
+/// 属于硬前置，不能像普通推荐插件那样「失败不阻断」。调用方会记日志并提示用户。
+fn install_matrix_web_app<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+    let node = effective_node_path(app, cfg);
+    let dsh_bin = dsh_binary_path(app);
+    if !node.exists() || !dsh_bin.exists() {
+        log::warn!("Node 或 dsh 核心未就绪，跳过 web-app 安装（install_all 会兜底装）");
+        return Ok(());
+    }
+
+    let env = crate::workflow::child_env(app, cfg)?;
+    let mut cmd = Command::new(&node);
+    cmd.arg(&dsh_bin)
+        .arg("plugin")
+        .arg("--profile")
+        .arg(MATRIX_PROFILE)
+        .arg("add")
+        .arg(MATRIX_WEB_APP);
+    cmd.current_dir(dsh_install_path(app));
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    log::info!("安装 matrix profile web-app bundle：{MATRIX_WEB_APP}");
+    let output = cmd.output().map_err(|e| format!("WEBAPP_INSTALL_SPAWN_FAILED: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        log::error!(
+            "web-app 安装失败（exit={}）：stdout={} stderr={}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+        return Err(format!(
+            "WEBAPP_INSTALL_FAILED: 安装 @deepseek-ai/dsh-web-app 未完成（exit={}），数字分身依赖它才能启动",
+            output.status
+        ));
+    }
+    log::info!("matrix profile web-app bundle 安装完成");
+    Ok(())
+}
+
 /// 把 dsh 内置 bundle（如 dsh-web-app）加入 profile 的 `dsh.profile.bundles`。
 ///
-/// 内置 bundle 从 dsh 安装目录解析（`resolveBundleDir` 先查 installAnchor），
-/// 不需要也不应该 pnpm 安装（registry 上无对应新版）。
+/// 注意（2026-09-23 修正）：只写 bundles 声明**不足以保证 bundle 可用**。web-app 是独立
+/// npm 包（不在 dsh 核心安装目录内），必须在 bundles 声明之外再真正 `dsh plugin add`
+/// 安装——见 `install_matrix_web_app`。本函数仅负责 manifest 层声明，不负责安装。
 fn add_builtin_bundle<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
