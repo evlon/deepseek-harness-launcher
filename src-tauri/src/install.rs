@@ -819,8 +819,27 @@ pub async fn preset_current_profile<R: Runtime>(app: &AppHandle<R>, cfg: &Launch
 /// launcher-brand / dsh-matrix-agent 等插件本身由服务端 profilePlugins.matrix 清单
 /// 决定是否安装（见 install_server_recommended）。
 pub async fn preset_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+    ensure_matrix_profile(app, cfg)
+}
+
+/// 确保 matrix profile 存在（同步、幂等、可重复调用）。
+///
+/// 这是「数字分身能启动」的最小前置：dsh 启动 `--profile matrix` 时要求
+/// `profiles/matrix/package.json` 已存在，否则直接报
+/// `profile "matrix" does not exist`（进程秒退 → 端口不就绪 → HARNESS_NOT_READY）。
+///
+/// 背景（2026-09-23 同事故障）：0.4.7 把「dsh 已装但未激活」分流为「直接打开激活
+/// 向导」，跳过 `install_all`，导致 `preset_current_profile` 从未执行 → matrix profile
+/// 从未创建。激活流程（run_activation）只写 settings.yaml 账号、不建 profile，于是
+/// `launch_with_profile("matrix")` 报错。修复 = 在任何进入激活向导/启动分身的路径上，
+/// 先确保 profile 骨架存在。
+///
+/// 幂等：profile 已存在则只补缺（add_builtin_bundle 检测 bundles 是否已含目标项；
+/// write_matrix_brand_patch 直接覆盖写；env_defaults 只填空缺不覆盖用户值）。
+pub fn ensure_matrix_profile<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
     // 把 @deepseek-ai/dsh-web-app 加入 bundles（dsh 内置，从安装目录解析；提供
-    // agent-presets / webserver 等 host 服务，dsh-matrix-agent 依赖它们）
+    // agent-presets / webserver 等 host 服务，dsh-matrix-agent 依赖它们）。
+    // 这一步同时负责：profile manifest 不存在时先建最小骨架。
     add_builtin_bundle(app, cfg, MATRIX_PROFILE, "@deepseek-ai/dsh-web-app")?;
 
     // 写品牌 patch（配置品牌名称）

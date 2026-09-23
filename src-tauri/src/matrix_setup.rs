@@ -12,9 +12,18 @@
 //! - accessToken 属 settings.ts RESTART_KEYS，写配置后须重启 matrix profile 生效。
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tauri::{AppHandle, Runtime};
 
 use crate::config::*;
+
+/// 最近一次「自动激活」的失败信息（供向导前端轮询感知失败并恢复按钮）。
+///
+/// 背景：/activate 在后台 spawn_blocking 跑，HTTP 立即返回 ok:true，前端靠轮询
+/// /state 等 status=configured。失败时 status 永不变成 configured，前端只能静默
+/// 超时退出——按钮永远停在 disabled。这里记录失败文案，/state 带出，前端据此
+/// 显示错误 + 恢复按钮。
+static LAST_ACTIVATION_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 /// dsh-matrix-agent 的 settings namespace（与 @evlon/dsh-bridge settings.ts MATRIX_NS 一致）。
 pub const MATRIX_NS: &str = "dsh-matrix";
@@ -564,6 +573,12 @@ use tauri::{AppHandle as TauriAppHandle, Manager, Runtime as TauriRuntime, Webvi
 
 /// 打开（或聚焦）配置向导窗口。
 pub fn open_window<R: TauriRuntime>(app: &TauriAppHandle<R>) -> Result<(), String> {
+    // 打开向导前先确保 matrix profile 骨架存在（dsh 已装但未激活的路径会跳过
+    // install_all，导致 profile 从未创建——见 install::ensure_matrix_profile 文档）。
+    // 失败不阻断打开向导（用户仍可看到并触发激活），但记日志：激活时还会再兜底一次。
+    if let Err(e) = crate::install::ensure_matrix_profile(app, &load_cached()) {
+        log::warn!("打开激活向导前确保 matrix profile 失败（激活时兜底重试）：{e}");
+    }
     if let Some(win) = app.get_webview_window("matrix-setup") {
         let _ = win.show();
         let _ = win.set_focus();
@@ -634,8 +649,13 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                     crate::ops::mark_step_running(&h, 2);
                     crate::ops::update_step(&h, "已认领分身，写入配置…");
                     crate::ops::append_log(&h, &format!("✓ 已认领分身账号 {}", r.user_id));
-                    // 配置已由 run_activation 写入 settings.yaml，这里只需重启 + 等连接
+                    // 配置已由 run_activation 写入 settings.yaml，这里需确保 profile 骨架存在
+                    // 后再重启（dsh 启动 --profile matrix 要求 manifest 已建，否则报
+                    // "profile does not exist" → HARNESS_NOT_READY）。
                     let cfg_now = load_cached();
+                    if let Err(e) = crate::install::ensure_matrix_profile(&h, &cfg_now) {
+                        crate::ops::append_log(&h, &format!("⚠️ 确保数字分身运行环境失败：{e}"));
+                    }
                     let running = crate::workflow::is_running();
                     let cur_profile = crate::workflow::current_profile();
                     crate::ops::mark_step_running(&h, 3);
@@ -647,6 +667,8 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                     }
                     match crate::workflow::launch_with_profile(&h, MATRIX_PROFILE) {
                         Ok(port) => {
+                            // 启动成功：清空「最近激活失败」标记（前端轮询感知到 configured 即收尾）
+                            *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             crate::ops::append_log(&h, &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)));
                             crate::ops::mark_step_running(&h, 4);
                             crate::ops::update_step(&h, "等待 Matrix 连接…");
@@ -665,12 +687,18 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                         Err(e) => {
                             crate::ops::fail_op(&h, &format!("分身已激活但启动失败：{e}"));
                             crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置，但启动失败：{}。可在托盘「启动」重试。", r.user_id, e));
+                            // 记录失败文案，供向导前端轮询感知 + 恢复按钮（避免「失败后按钮锁死」）
+                            *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("分身已激活但启动失败：{e}"));
                         }
                     }
                 }
                 r => {
                     crate::ops::fail_op(&h, &r.message);
                     crate::notify::notify(&h, "自动激活失败", &r.message);
+                    // 记录失败文案，供向导前端轮询感知 + 恢复按钮
+                    *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(r.message.clone());
                 }
             }
         });
@@ -800,6 +828,10 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                 Ok(()) => {
                     crate::ops::append_log(&h, "✓ 已写入连接配置");
                     let cfg_now = load_cached();
+                    // 手动配置同样可能发生在「dsh 已装但 profile 未建」的路径，启动前兜底建骨架
+                    if let Err(e) = crate::install::ensure_matrix_profile(&h, &cfg_now) {
+                        crate::ops::append_log(&h, &format!("⚠️ 确保数字分身运行环境失败：{e}"));
+                    }
                     let running = crate::workflow::is_running();
                     let cur_profile = crate::workflow::current_profile();
                     crate::ops::mark_step_running(&h, 1);
@@ -809,6 +841,7 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                     }
                     match crate::workflow::launch_with_profile(&h, MATRIX_PROFILE) {
                         Ok(port) => {
+                            *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             crate::ops::append_log(&h, &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)));
                             crate::ops::mark_step_running(&h, 2);
                             match wait_matrix_ready(&h, &cfg_now, std::time::Duration::from_secs(45)) {
@@ -867,6 +900,8 @@ pub struct WizardState {
     pub job_presets: Vec<String>,
     /// 当前已落盘的默认岗位（himarket.defaultJob），空 = 未指定。
     pub default_job: String,
+    /// 最近一次自动激活的失败文案（无失败/未激活过 = 空串）。前端据此恢复按钮并提示。
+    pub last_activation_error: String,
 }
 
 /// 计算订阅/安装清单差异：服务端推荐清单 vs 本地已装清单。
@@ -934,6 +969,11 @@ pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherCon
         pending_plugins: pending_plugin_diff(app, cfg),
         job_presets: job_presets_from_sync(app, cfg),
         default_job: read_default_job(app, cfg),
+        last_activation_error: LAST_ACTIVATION_ERROR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default(),
     }
 }
 
@@ -1155,15 +1195,25 @@ pub fn wizard_html() -> String {
       const j=await r.json();
       if(j.ok){
         st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。完成后本窗口会引导你选择岗位。</span>';
-        // 轮询 /state，等激活完成（configured）后渲染岗位区块
+        // 轮询 /state，等激活完成（configured）后渲染岗位区块；
+        // 检测 last_activation_error 感知失败（恢复按钮 + 提示，避免「失败后按钮锁死」）
         let tries=0;
         const poll=setInterval(async()=>{
           tries++;
-          if(tries>90){ clearInterval(poll); return; }  // 最多 135s
+          if(tries>90){ clearInterval(poll); $("activateBtn").disabled=false; st.className="status err"; st.textContent="✗ 激活超时未完成，请重试。"; return; }  // 最多 135s
           try{
             const s=await (await fetch("http://matrix-setup.localhost/state")).json();
+            if(s.last_activation_error){
+              clearInterval(poll);
+              st.className="status err";
+              st.textContent="✗ "+(s.last_activation_error||"激活失败，请重试");
+              $("activateBtn").disabled=false;
+              return;
+            }
             if(s.status==="configured"){
               clearInterval(poll);
+              st.className="status ok";
+              st.textContent="✓ 已激活！";
               if(s.job_presets && s.job_presets.length){
                 renderJobSection(s);
               }

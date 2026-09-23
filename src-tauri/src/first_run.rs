@@ -136,13 +136,25 @@ pub fn handle_scheme_request<R: Runtime>(
                 serde_json::json!({"ok": true, "message": "正在安装依赖，随后自动进入激活"}),
             );
         }
-        // dsh 已装 → 直接打开激活向导
+        // dsh 已装 → 先确保 matrix profile 骨架 + 推荐插件就绪，再打开激活向导。
+        // 背景（2026-09-23 同事故障）：旧实现直接 open_window，跳过 install_all，
+        // 导致「dsh 已装但 matrix profile 从未创建」时，激活流程 launch 报
+        // "profile does not exist" → HARNESS_NOT_READY。
         tauri::async_runtime::spawn(async move {
+            let cfg = load_cached();
+            // 1) 同步建 matrix profile 骨架（manifest + bundles + 品牌 patch + env defaults）
+            if let Err(e) = crate::install::ensure_matrix_profile(&h, &cfg) {
+                log::warn!("激活前确保 matrix profile 骨架失败：{e}");
+            }
+            // 2) 异步装 matrix profile 推荐插件（dsh-matrix-agent 等，幂等，已装则跳过）
+            if let Err(e) = crate::install::install_server_recommended(&h, &cfg).await {
+                log::warn!("激活前装 matrix 推荐插件未完成（可在激活后托盘补装）：{e}");
+            }
             let _ = crate::matrix_setup::open_window(&h);
         });
         return json_resp(
             StatusCode::OK,
-            serde_json::json!({"ok": true, "message": "已打开激活向导"}),
+            serde_json::json!({"ok": true, "message": "正在准备数字分身运行环境，随后进入激活"}),
         );
     }
     if method == tauri::http::Method::POST && path == "/close" {
