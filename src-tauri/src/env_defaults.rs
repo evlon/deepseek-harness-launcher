@@ -296,6 +296,58 @@ pub fn apply_env_defaults_map_to_file(
     Ok((filled, skipped))
 }
 
+/// 把服务端下发的预装岗位清单（jobPresets 字符串数组）写入 settings.yaml 的
+/// `himarket.preinstallJobs`（JSON 数组字符串，如 `["pm","dev"]`）。
+///
+/// 为什么用 JSON 字符串而非 YAML 数组：dsh-himarket 的 preinstallJobs schema 是
+/// `Schema.string()`（数组会覆盖复杂配置，故走字符串通道），himarket 插件 apply 时
+/// JSON.parse 解析。写入语义是「强制覆盖」——服务端统一管理岗位清单，用户本地不手改此键。
+pub fn apply_job_presets_to_file(
+    path: &Path,
+    job_presets: &[String],
+) -> Result<usize, String> {
+    use serde_yaml::{Mapping, Value};
+
+    if job_presets.is_empty() {
+        return Ok(0); // 空清单不写（保留用户可能已有的值，避免误清空）
+    }
+
+    let mut root: Mapping = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let v: Value = serde_yaml::from_str(&text)
+                .map_err(|e| format!("SETTINGS_PARSE_FAILED: {e}"))?;
+            v.as_mapping().cloned().unwrap_or_default()
+        }
+        Err(_) => Mapping::new(),
+    };
+
+    // 序列化为 JSON 数组字符串（himarket 侧 JSON.parse 解析）。
+    let json = serde_json::to_string(job_presets)
+        .map_err(|e| format!("JOBPRESETS_SERIALIZE_FAILED: {e}"))?;
+
+    let section = root
+        .entry(Value::String("himarket".to_string()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let map = section
+        .as_mapping_mut()
+        .ok_or("SETTINGS_NS_NOT_MAP: himarket 不是 map")?;
+
+    let key = Value::String("preinstallJobs".to_string());
+    let changed = match map.get(&key) {
+        Some(Value::String(s)) => s.as_str() != json,
+        _ => true,
+    };
+    if changed {
+        map.insert(key, Value::String(json));
+        let out = serde_yaml::to_string(&Value::Mapping(root))
+            .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+        crate::matrix_setup::atomic_write_public(path, out.as_bytes())?;
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +536,62 @@ mod tests {
         let p = tmp_path("serverbad");
         let bad = serde_json::json!("not an object");
         assert!(apply_env_defaults_map_to_file(&p, &bad).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn job_presets_writes_json_string() {
+        let p = tmp_path("jobpresets");
+        let _ = std::fs::remove_file(&p);
+        let jobs = vec!["pm".to_string(), "dev".to_string(), "qa".to_string()];
+        let written = apply_job_presets_to_file(&p, &jobs).unwrap();
+        assert_eq!(written, 1);
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            txt.contains("preinstallJobs"),
+            "应写入 himarket.preinstallJobs：{txt}"
+        );
+        assert!(
+            txt.contains("[\"pm\",\"dev\",\"qa\"]"),
+            "应写入 JSON 数组字符串：{txt}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn job_presets_idempotent() {
+        let p = tmp_path("jobpresets-idem");
+        let _ = std::fs::remove_file(&p);
+        let jobs = vec!["pm".to_string(), "dev".to_string()];
+        let w1 = apply_job_presets_to_file(&p, &jobs).unwrap();
+        assert_eq!(w1, 1);
+        let w2 = apply_job_presets_to_file(&p, &jobs).unwrap();
+        assert_eq!(w2, 0, "值相同不该重复写");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn job_presets_empty_is_noop() {
+        let p = tmp_path("jobpresets-empty");
+        std::fs::write(&p, "himarket:\n  portalId: keep-me\n").unwrap();
+        let written = apply_job_presets_to_file(&p, &[]).unwrap();
+        assert_eq!(written, 0, "空清单不该写");
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("keep-me"), "空清单不该破坏既有配置");
+        assert!(!txt.contains("preinstallJobs"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn job_presets_overwrites_stale() {
+        let p = tmp_path("jobpresets-stale");
+        std::fs::write(&p, "himarket:\n  preinstallJobs: '[\"old\"]'\n").unwrap();
+        let jobs = vec!["pm".to_string()];
+        let written = apply_job_presets_to_file(&p, &jobs).unwrap();
+        assert_eq!(written, 1, "服务端清单应覆盖旧值");
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(!txt.contains("\"old\""), "旧清单应被覆盖：{txt}");
+        assert!(txt.contains("\"pm\""));
         let _ = std::fs::remove_file(&p);
     }
 }

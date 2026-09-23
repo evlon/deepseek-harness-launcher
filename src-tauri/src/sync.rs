@@ -59,6 +59,10 @@ pub struct ServerConfig {
     /// 遵循「只填空缺」——用户已显式设置过的不覆盖（同 clientDefaults 语义）。
     #[serde(default, rename = "envDefaults")]
     pub env_defaults: Option<serde_json::Value>,
+    /// 预装岗位清单（字符串数组）：服务端统一管理，新用户激活数字人后
+    /// himarket 插件按名自动下载落盘到 .agent-presets/。
+    #[serde(default, rename = "jobPresets")]
+    pub job_presets: Vec<String>,
 }
 
 /// 客户端已装插件详情（跨所有 profile，上报给服务端）。
@@ -1074,6 +1078,20 @@ fn apply_server_defaults<R: Runtime>(app: &AppHandle<R>, server: &ServerConfig) 
                 }
                 Err(e) => log::warn!("应用服务端环境默认配置失败（不阻断）：{e}"),
             }
+        }
+    }
+
+    // 4) jobPresets：预装岗位清单（字符串数组）→ settings.yaml 的 himarket.preinstallJobs
+    //    新用户激活数字人后，himarket 插件按名自动下载落盘到 .agent-presets/（即装即用）。
+    if !server.job_presets.is_empty() {
+        let settings_path = crate::matrix_setup::settings_yaml_path(app, &local);
+        match crate::env_defaults::apply_job_presets_to_file(&settings_path, &server.job_presets) {
+            Ok(written) => {
+                if written > 0 {
+                    log::info!("已下发预装岗位清单：{} 个岗位", server.job_presets.len());
+                }
+            }
+            Err(e) => log::warn!("下发预装岗位清单失败（不阻断）：{e}"),
         }
     }
 
