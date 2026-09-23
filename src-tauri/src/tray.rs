@@ -224,11 +224,11 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             owned.push(MenuItem::with_id(app, "op-view", "📋 查看进度 / 日志", true, None::<&str>)?);
         }
     }
-    // 首次运行（dsh 未安装）：顶部提示 + 「首次使用向导」入口
-    // （小白关掉欢迎窗口后仍能从托盘找回引导）
-    if crate::first_run::is_first_run(app) {
-        owned.push(MenuItem::with_id(app, "fr-warn", "👋 首次使用：请点下方「首次使用向导」", false, None::<&str>)?);
-        owned.push(MenuItem::with_id(app, "fr-open", "🚀 首次使用向导（安装）", true, None::<&str>)?);
+    // 首次使用引导（dsh 未装 或 数字分身未激活）：顶部提示 + 「激活数字分身」入口
+    // （小白关掉引导窗后仍能从托盘找回；统一用 needs_onboarding 覆盖盲区态）
+    if crate::first_run::needs_onboarding(app) {
+        owned.push(MenuItem::with_id(app, "fr-warn", "👋 首次使用：请点下方「激活数字分身」", false, None::<&str>)?);
+        owned.push(MenuItem::with_id(app, "fr-open", "🚀 激活数字分身", true, None::<&str>)?);
     }
 
     // 数字分身配置状态提示（未配置时顶部提示 + 入口；已配置隐藏提示）

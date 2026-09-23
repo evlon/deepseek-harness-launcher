@@ -1,8 +1,13 @@
-//! 首次运行引导窗口：解决「双击后没反应」——托盘图标被 Windows 折叠进 `^`，
-//! 小白看不到任何反馈。首次运行（dsh 未安装）主动弹欢迎窗口：
-//! 说明程序已在托盘运行 + 一键安装入口，装完自动衔接数字分身配置向导。
+//! 首次使用引导窗口：解决「双击后没反应」——托盘图标被 Windows 折叠进 `^`，
+//! 小白看不到任何反馈。首次运行主动弹引导窗口，作为「激活数字分身」的主流程首屏。
 //!
 //! 与 matrix_setup 同机制：Tauri 自定义协议窗口 + 内嵌 HTML（无需前端构建）。
+//!
+//! ⚠️ 关键盲区（2026-09-23 实测修复）：早期版本 `is_first_run` 只判「dsh 核心是否
+//! 安装」，而「dsh 已装但数字分身未激活」这一态（matrix profile 未建 / 未激活）
+//! 既不弹欢迎窗、也不弹激活向导，程序静默缩进托盘——同事双击后「啥也不知道」。
+//! 因此引入统一判定 `needs_onboarding`：只要「dsh 未装」**或**「数字分身未激活」，
+//! 都属于需要引导的首次态，双击后直接进入「激活数字分身」主流程。
 
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 
@@ -12,8 +17,28 @@ use crate::config::*;
 const WINDOW_LABEL: &str = "first-run";
 
 /// 是否首次运行（dsh 核心未安装 = 全新机器/未完成安装）。
+/// 仅用于「纯安装」判断；引导逻辑请统一用 [`needs_onboarding`]。
 pub fn is_first_run<R: Runtime>(app: &AppHandle<R>) -> bool {
     !dsh_binary_path(app).exists()
+}
+
+/// 是否处于「首次引导态」：dsh 核心未安装，**或**数字分身未激活。
+///
+/// 这是决定「双击后是否直接进入激活主流程」的统一判定，覆盖早期版本的两个盲区：
+/// - ① dsh 未装 → 需要引导（先装依赖再激活）；
+/// - ② dsh 已装但 matrix profile 未装 / 分身未配置 → 同样需要引导（直接激活）。
+///
+/// 只有「数字分身已激活（Configured）」才返回 false（此时用户已完成首次使用，
+/// 双击保持托盘常驻行为，不骚扰）。
+pub fn needs_onboarding<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if is_first_run(app) {
+        return true;
+    }
+    let cfg = load_cached();
+    !matches!(
+        crate::matrix_setup::status(app, &cfg),
+        crate::matrix_setup::MatrixStatus::Configured
+    )
 }
 
 /// 打开（或聚焦）首次运行欢迎窗口。
@@ -44,7 +69,11 @@ pub fn close_window<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// first-run scheme 协议处理：GET / → HTML；POST /install → 一键安装；POST /close → 关窗。
+/// first-run scheme 协议处理：
+///   GET  /          → 激活主流程首屏 HTML
+///   GET  /state     → 当前引导态（{ dshInstalled, activated, pendingPlugins }）
+///   POST /activate  → 开始「装依赖 + 激活数字分身」一条龙
+///   POST /close     → 关窗（用户主动「稍后再说」，缩回托盘）
 pub fn handle_scheme_request<R: Runtime>(
     ctx: &tauri::UriSchemeContext<'_, R>,
     request: tauri::http::Request<Vec<u8>>,
@@ -55,9 +84,9 @@ pub fn handle_scheme_request<R: Runtime>(
     let method = request.method().clone();
     log::info!("first-run:// 协议请求：{method} {path}");
 
-    let json_resp = |obj: serde_json::Value| -> Response<Vec<u8>> {
+    let json_resp = |status: StatusCode, obj: serde_json::Value| -> Response<Vec<u8>> {
         Response::builder()
-            .status(StatusCode::OK)
+            .status(status)
             .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
             .body(serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into()).into_bytes())
             .unwrap_or_default()
@@ -74,46 +103,71 @@ pub fn handle_scheme_request<R: Runtime>(
             .body(html.into_bytes())
             .unwrap_or_default();
     }
-    if method == tauri::http::Method::POST && path == "/install" {
-        // 后台跑安装（复用 install_all：含进度窗口 + 分步通知）
+    if method == tauri::http::Method::GET && path == "/state" {
+        let cfg = load_cached();
+        let dsh_installed = dsh_binary_path(app).exists();
+        let st = crate::matrix_setup::status(app, &cfg);
+        let activated = matches!(st, crate::matrix_setup::MatrixStatus::Configured);
+        return json_resp(
+            StatusCode::OK,
+            serde_json::json!({
+                "dshInstalled": dsh_installed,
+                "activated": activated,
+            }),
+        );
+    }
+    if method == tauri::http::Method::POST && path == "/activate" {
+        // 「激活数字分身」主流程：dsh 未装 → 先 install_all（含进度窗），
+        // 装完自动衔接激活向导；dsh 已装 → 直接打开激活向导。
+        // 激活向导（matrix-setup）内已有「自动激活 + 选岗位」完整步骤。
         let h = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = crate::install::install_all(&h).await;
-            // 装完关闭欢迎窗口 + 衔接数字分身配置向导（若仍未配置）
-            close_window(&h);
-            let cfg = load_cached();
-            if crate::matrix_setup::matrix_agent_installed(&h, &cfg)
-                && matches!(
-                    crate::matrix_setup::status(&h, &cfg),
-                    crate::matrix_setup::MatrixStatus::Unconfigured { .. }
-                )
-            {
-                log::info!("首次安装完成，自动打开数字分身配置向导");
+        let dsh_installed = dsh_binary_path(app).exists();
+        if !dsh_installed {
+            // 后台跑安装（复用 install_all：含进度窗口 + 分步通知）。
+            // 装完关闭本首屏，衔接数字分身激活向导（而非旧的「配置向导」）。
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::install::install_all(&h).await;
+                close_window(&h);
+                log::info!("首次安装完成，自动打开数字分身激活向导");
                 let _ = crate::matrix_setup::open_window(&h);
-            }
+            });
+            return json_resp(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "message": "正在安装依赖，随后自动进入激活"}),
+            );
+        }
+        // dsh 已装 → 直接打开激活向导
+        tauri::async_runtime::spawn(async move {
+            let _ = crate::matrix_setup::open_window(&h);
         });
-        return json_resp(serde_json::json!({"ok": true, "message": "安装已开始"}));
+        return json_resp(
+            StatusCode::OK,
+            serde_json::json!({"ok": true, "message": "已打开激活向导"}),
+        );
     }
     if method == tauri::http::Method::POST && path == "/close" {
         close_window(app);
-        return json_resp(serde_json::json!({"ok": true}));
+        return json_resp(StatusCode::OK, serde_json::json!({"ok": true}));
     }
-    json_resp(serde_json::json!({"ok": false, "error": "not found"}))
+    json_resp(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not found"}))
 }
 
-/// 欢迎窗口 HTML（小白向：先说明「我已在运行」，再给一键安装）。
+/// 激活主流程首屏 HTML（小白向：双击后第一眼就告诉他「点这里激活数字分身」）。
+///
+/// 文案目标：让用户**一眼看懂下一步**，不再需要「找托盘、问同事」。
+/// 主按钮 = 「开始激活」，后端按状态自动分流（未装 dsh 先装、已装直接激活）。
 fn welcome_html() -> String {
     r#"<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>数字分身 · 首次使用</title>
+<title>激活数字分身</title>
 <style>
   :root{--bg:#1a2233;--card:#232c40;--text:#e6eaf2;--muted:#8b95a9;--green:#4ade80;--blue:#60a5fa;--line:#2d3650}
   *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:22px;font-size:13.5px;line-height:1.7}
-  h1{font-size:19px;margin-bottom:6px}
-  .sub{font-size:12.5px;color:var(--muted);margin-bottom:16px}
+  body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:24px;font-size:13.5px;line-height:1.7}
+  h1{font-size:20px;margin-bottom:6px}
+  .sub{font-size:12.5px;color:var(--muted);margin-bottom:18px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:12px}
   .card h2{font-size:13px;color:var(--blue);margin-bottom:8px}
   .steps{list-style:none;counter-reset:s}
@@ -122,8 +176,8 @@ fn welcome_html() -> String {
     background:var(--blue);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
   .tip{background:#1f2937;border-left:3px solid var(--blue);border-radius:6px;padding:10px 12px;font-size:12.5px;color:var(--muted);margin-bottom:16px}
   .tip b{color:var(--text)}
-  .btn{width:100%;padding:12px;border-radius:9px;border:0;cursor:pointer;font-size:14.5px;font-weight:700;margin-bottom:9px}
-  .btn-primary{background:var(--blue);color:#fff}
+  .btn{width:100%;padding:13px;border-radius:9px;border:0;cursor:pointer;font-size:15px;font-weight:700;margin-bottom:9px}
+  .btn-primary{background:var(--green);color:#fff}
   .btn-primary:disabled{opacity:.55;cursor:not-allowed}
   .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--line);font-weight:500;font-size:13px}
   .btn-ghost:hover{color:var(--text)}
@@ -132,41 +186,41 @@ fn welcome_html() -> String {
 </style>
 </head>
 <body>
-  <h1>👋 欢迎使用数字分身</h1>
-  <div class="sub">程序已经启动了——它常驻在右下角托盘区，不会弹出主界面。</div>
-
-  <div class="tip">
-    <b>找不到它？</b>看屏幕右下角任务栏，点一下 <b>^</b> 小箭头展开隐藏图标，就能看到本程序的图标；
-    建议右键图标选「固定到任务栏」方便以后使用。
-  </div>
+  <h1>🤖 激活你的数字分身</h1>
+  <div class="sub">欢迎使用！点下面的按钮，用公司账号一键认领你的数字分身。</div>
 
   <div class="card">
-    <h2>接下来只需 3 步</h2>
+    <h2>接下来会自动完成</h2>
     <ol class="steps">
-      <li>点下面的「一键安装」，等待依赖下载完成（约几分钟）</li>
-      <li>安装完成后会自动弹出配置窗口，填入数字分身账号</li>
-      <li>配置完成即可在聊天工具里 @ 你的数字分身</li>
+      <li>下载并安装运行环境（首次约几分钟）</li>
+      <li>用公司账号登录，自动认领你的 @ai-xxx 数字分身</li>
+      <li>选择你的岗位，分身即可在聊天工具里 @ 使用</li>
     </ol>
   </div>
 
-  <button class="btn btn-primary" id="install">🚀 一键安装（首次必点）</button>
-  <button class="btn btn-ghost" id="close">稍后再说（可右键托盘图标随时安装）</button>
+  <div class="tip">
+    <b>小提示：</b>完成后数字分身常驻在右下角托盘区（点 <b>^</b> 可看到图标），
+    以后从托盘图标打开它。
+  </div>
+
+  <button class="btn btn-primary" id="activate">🚀 开始激活</button>
+  <button class="btn btn-ghost" id="close">稍后再说（可从托盘图标随时打开）</button>
   <div class="status" id="status"></div>
 
 <script>
 (function(){
   const $=id=>document.getElementById(id);
-  $("install").onclick=async()=>{
-    const st=$("status"); st.className="status"; st.textContent="正在开始安装…";
-    $("install").disabled=true;
+  $("activate").onclick=async()=>{
+    const st=$("status"); st.className="status"; st.textContent="正在准备…";
+    $("activate").disabled=true;
     try{
-      const r=await fetch("http://first-run.localhost/install",{method:"POST"});
+      const r=await fetch("http://first-run.localhost/activate",{method:"POST"});
       const j=await r.json();
       if(j.ok){
         st.className="status ok";
-        st.textContent="✓ 已开始安装——进度窗口即将弹出，本窗口会自动关闭。";
-      } else { st.className="status err"; st.textContent="✗ "+(j.error||"启动安装失败"); $("install").disabled=false; }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("install").disabled=false; }
+        st.textContent="✓ 已开始——接下来会自动安装环境并进入激活，请稍候。";
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"启动失败"); $("activate").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activate").disabled=false; }
   };
   $("close").onclick=()=>{ fetch("http://first-run.localhost/close",{method:"POST"}).catch(()=>{}); };
 })();

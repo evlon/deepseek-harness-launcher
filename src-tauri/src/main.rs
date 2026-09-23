@@ -27,10 +27,7 @@ mod sync;
 mod tray;
 mod workflow;
 
-/// 本次进程是否已自动弹过数字分身配置向导（防骚扰：只弹一次）。
-static AUTO_SETUP_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 本次进程是否已自动弹过「首次使用」欢迎窗口（防骚扰：只弹一次）。
+/// 本次进程是否已自动弹过「首次使用」激活主流程窗口（防骚扰：只弹一次）。
 static FIRST_RUN_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 本次进程是否已自动弹过「找回会话」询问（防骚扰：只弹一次）。
@@ -161,51 +158,35 @@ fn main() {
             // 托盘
             tray::build_tray(&handle)?;
 
-            // 首次运行 / 未配置引导（小白第一入口，仅一次）：
-            // ① dsh 未安装（全新机器）→ 弹「首次使用」欢迎窗口（说明程序已在托盘 + 一键安装），
-            //    解决「双击后没反应」（托盘图标被 Windows 折叠进 ^，用户看不到）。
-            // ② dsh 已装但数字分身未配置 → 弹配置向导。
-            // 放在 auto_start 之前：未配置时不自动启动数字分身（无意义），改弹向导引导。
+            // 首次使用引导（小白第一入口，仅一次）：
+            // 统一判定「dsh 未装 **或** 数字分身未激活」——只要还没激活，双击后
+            // 直接进入「激活数字分身」主流程首屏（first-run 窗口，内部按状态自动
+            // 分流：未装 dsh 先装再激活 / 已装直接激活）。
+            // 放在 auto_start 之前：未激活时不自动启动数字分身（无意义），改弹引导。
             {
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     // 稍延迟确保 Tauri Webview 就绪（窗口可正常创建）
                     std::thread::sleep(std::time::Duration::from_millis(1200));
                     let cfg = config::load_cached();
-                    // 首次运行：dsh 未装 → 欢迎窗口
-                    if crate::first_run::is_first_run(&h) {
+                    if crate::first_run::needs_onboarding(&h) {
                         if FIRST_RUN_SHOWN.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
-                            log::info!("检测到首次运行（dsh 未安装），弹出首次使用窗口");
+                            log::info!("检测到首次引导态（dsh 未装或数字分身未激活），弹出激活主流程");
                             crate::notify::notify(
                                 &h,
-                                "数字分身启动器已运行",
-                                "它在右下角托盘区（点 ^ 展开可见）。点此窗口完成首次安装。",
+                                "激活你的数字分身",
+                                "点击弹窗中的「开始激活」，用公司账号一键认领你的数字分身。",
                             );
                             match crate::first_run::open_window(&h) {
                                 Ok(()) => {}
-                                Err(e) => log::warn!("弹首次使用窗口失败：{e}"),
+                                Err(e) => log::warn!("弹激活主流程窗口失败：{e}"),
                             }
                         }
-                        return; // 首次运行不做后续配置检测（装完再引导）
-                    }
-                    // 已安装但数字分身未配置 → 配置向导
-                    let needs_setup = crate::matrix_setup::matrix_agent_installed(&h, &cfg)
-                        && matches!(
-                            crate::matrix_setup::status(&h, &cfg),
-                            crate::matrix_setup::MatrixStatus::Unconfigured { .. }
-                        );
-                    if needs_setup && AUTO_SETUP_SHOWN.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
-                        log::info!("检测到数字分身未配置，自动弹出配置向导");
-                        match crate::matrix_setup::open_window(&h) {
-                            Ok(()) => {
-                                crate::notify::notify(&h, "配置数字分身", "首次使用请先配置数字分身（填账号后即可用）");
-                            }
-                            Err(e) => log::warn!("自动弹配置向导失败：{e}"),
-                        }
+                        return; // 引导态不做后续配置检测（激活完成后自动衔接选岗位）
                     }
 
-                    // 找回会话：上次「一键重置」保留了会话历史，本次启动且当前无任何
-                    // DSH 用户数据（刚重置/重装完）→ 询问是否恢复。只问一次。
+                    // 已激活：找回会话（上次「一键重置」保留了会话历史，本次启动且当前
+                    // 无任何 DSH 用户数据 → 询问是否恢复。只问一次。）
                     if RESTORE_SHOWN.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
                         if let Some(backup) = crate::reset::detect_backup(&h) {
                             if crate::reset::has_no_user_data(&h, &cfg) {
