@@ -348,6 +348,63 @@ pub fn apply_job_presets_to_file(
     }
 }
 
+/// 把「默认岗位」写入 settings.yaml 的 `himarket.defaultJob`（单个岗位 id 字符串，如 "pm"）。
+///
+/// 语义：分身激活后**默认以哪个岗位人设开工**。与 `preinstallJobs`（预装哪些岗位）是
+/// 两回事——前者是「上岗后默认启用哪一个」，后者是「预装哪几个」。
+///
+/// 本轮只负责**落盘供后续使用**（dsh-himarket 读它决定默认岗位），不接「启动时自动
+/// 切换岗位」的复杂逻辑。空串 = 清除该键（用户选了「不指定默认岗位」）。
+pub fn apply_default_job_to_file(path: &Path, default_job: &str) -> Result<usize, String> {
+    use serde_yaml::{Mapping, Value};
+
+    let mut root: Mapping = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let v: Value = serde_yaml::from_str(&text)
+                .map_err(|e| format!("SETTINGS_PARSE_FAILED: {e}"))?;
+            v.as_mapping().cloned().unwrap_or_default()
+        }
+        Err(_) => Mapping::new(),
+    };
+
+    let section = root
+        .entry(Value::String("himarket".to_string()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let map = section
+        .as_mapping_mut()
+        .ok_or("SETTINGS_NS_NOT_MAP: himarket 不是 map")?;
+
+    let key = Value::String("defaultJob".to_string());
+    let value = default_job.trim();
+
+    if value.is_empty() {
+        // 清除：用户选了「不指定默认岗位」
+        match map.remove(&key) {
+            Some(_) => {
+                let out = serde_yaml::to_string(&Value::Mapping(root))
+                    .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+                crate::matrix_setup::atomic_write_public(path, out.as_bytes())?;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    } else {
+        let changed = match map.get(&key) {
+            Some(Value::String(s)) => s.as_str() != value,
+            _ => true,
+        };
+        if changed {
+            map.insert(key, Value::String(value.to_string()));
+            let out = serde_yaml::to_string(&Value::Mapping(root))
+                .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+            crate::matrix_setup::atomic_write_public(path, out.as_bytes())?;
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +649,40 @@ mod tests {
         let txt = std::fs::read_to_string(&p).unwrap();
         assert!(!txt.contains("\"old\""), "旧清单应被覆盖：{txt}");
         assert!(txt.contains("\"pm\""));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn default_job_writes_and_preserves_others() {
+        let p = tmp_path("defaultjob");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, "himarket:\n  preinstallJobs: '[\"pm\",\"dev\"]'\n").unwrap();
+        let written = apply_default_job_to_file(&p, "pm").unwrap();
+        assert_eq!(written, 1);
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("defaultJob: pm"), "应写入 himarket.defaultJob：{txt}");
+        assert!(txt.contains("preinstallJobs"), "不能破坏既有 preinstallJobs");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn default_job_idempotent() {
+        let p = tmp_path("defaultjob-idem");
+        std::fs::write(&p, "himarket:\n  defaultJob: pm\n").unwrap();
+        let w1 = apply_default_job_to_file(&p, "pm").unwrap();
+        assert_eq!(w1, 0, "值相同不该重复写");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn default_job_empty_clears_key() {
+        let p = tmp_path("defaultjob-clear");
+        std::fs::write(&p, "himarket:\n  defaultJob: pm\n  baseUrl: keep\n").unwrap();
+        let written = apply_default_job_to_file(&p, "").unwrap();
+        assert_eq!(written, 1, "空串应清除 defaultJob 键");
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(!txt.contains("defaultJob"), "defaultJob 应被移除：{txt}");
+        assert!(txt.contains("baseUrl: keep"), "其它键应保留");
         let _ = std::fs::remove_file(&p);
     }
 }

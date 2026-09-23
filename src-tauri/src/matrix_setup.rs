@@ -674,17 +674,82 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                 }
             }
         });
-        // 弹进度窗口 + 关闭向导（与 /submit 一致）
+        // 弹进度窗口；向导窗口是否关闭取决于「是否还有岗位待选」：
+        // - 服务端下发了岗位候选（jobPresets 非空）→ 保留向导窗口，切到「选岗位」步骤；
+        // - 无岗位候选 → 照旧关闭向导（进度走操作窗口）。
+        let has_jobs = !job_presets_from_sync(app, &cfg).is_empty();
         let h = app.clone();
         tauri::async_runtime::spawn(async move {
             std::thread::sleep(std::time::Duration::from_millis(400));
             let _ = crate::console::open_console(&h);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            if let Some(win) = h.get_webview_window("matrix-setup") {
-                let _ = win.close();
+            if !has_jobs {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if let Some(win) = h.get_webview_window("matrix-setup") {
+                    let _ = win.close();
+                }
             }
         });
         return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始自动激活"}));
+    }
+    if method == tauri::http::Method::POST && path == "/jobs" {
+        // 「选岗位」提交：用户勾选预装岗位 + 选默认岗位后落盘。
+        // body: { jobs: ["pm","dev"], defaultJob: "pm" }（jobs 可为空数组，defaultJob 可为空串）。
+        let body: serde_json::Value = match serde_json::from_slice(request.body()) {
+            Ok(v) => v,
+            Err(_) => {
+                return json_resp(
+                    StatusCode::OK,
+                    serde_json::json!({"ok": false, "error": "请求体不是合法 JSON"}),
+                )
+            }
+        };
+        let jobs: Vec<String> = body
+            .get("jobs")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let default_job: String = body
+            .get("defaultJob")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // 校验 defaultJob 若给值，必须属于已勾选的 jobs（或至少是合法岗位 id）
+        if !default_job.is_empty() && !jobs.iter().any(|j| j == &default_job) {
+            return json_resp(
+                StatusCode::OK,
+                serde_json::json!({"ok": false, "error": "默认岗位必须从已勾选的岗位里选"}),
+            );
+        }
+        let path = settings_yaml_path(app, &cfg);
+        // 落盘预装岗位清单（用户勾选的）+ 默认岗位
+        let jobs_result = crate::env_defaults::apply_job_presets_to_file(&path, &jobs);
+        let dj_result = crate::env_defaults::apply_default_job_to_file(&path, &default_job);
+        if let Err(e) = jobs_result {
+            log::warn!("[jobs] 落盘预装岗位清单失败：{e}");
+        }
+        if let Err(e) = dj_result {
+            log::warn!("[jobs] 落盘默认岗位失败：{e}");
+        }
+        log::info!(
+            "[jobs] 已保存岗位设置：预装 {} 个，默认岗位 {}",
+            jobs.len(),
+            if default_job.is_empty() { "（未指定）" } else { &default_job }
+        );
+        // 关闭向导窗口
+        if let Some(win) = app.get_webview_window("matrix-setup") {
+            let _ = win.close();
+        }
+        return json_resp(
+            StatusCode::OK,
+            serde_json::json!({"ok": true, "message": "岗位设置已保存"}),
+        );
     }
     if method == tauri::http::Method::POST && path == "/submit" {
         // 手动配置提交：默认禁用（连接参数由服务端下发 + 自动激活写入），
@@ -798,6 +863,10 @@ pub struct WizardState {
     pub manual_config_enabled: bool,
     /// 订阅/安装清单差异（待装或待更新的推荐插件），激活成功后引导去装。
     pub pending_plugins: Vec<serde_json::Value>,
+    /// 服务端下发的预装岗位候选清单（jobPresets），激活成功后让用户勾选预装 + 选默认岗位。
+    pub job_presets: Vec<String>,
+    /// 当前已落盘的默认岗位（himarket.defaultJob），空 = 未指定。
+    pub default_job: String,
 }
 
 /// 计算订阅/安装清单差异：服务端推荐清单 vs 本地已装清单。
@@ -814,6 +883,35 @@ fn pending_plugin_diff<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherC
     };
     let installed = crate::sync::installed_plugins_current_profile_with_versions(app, cfg);
     crate::sync::pending_with_updates(&recommended, &installed, &state.plugin_latest_versions)
+}
+
+/// 服务端下发的预装岗位候选清单（jobPresets）。
+fn job_presets_from_sync<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig) -> Vec<String> {
+    crate::sync::load_state(app, cfg)
+        .cached_config
+        .as_ref()
+        .map(|c| c.job_presets.clone())
+        .unwrap_or_default()
+}
+
+/// 读取当前 settings.yaml 里的 `himarket.defaultJob`（默认岗位），空 = 未指定。
+fn read_default_job<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig) -> String {
+    let path = settings_yaml_path(app, cfg);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    use serde_yaml::Value;
+    let root: Value = match serde_yaml::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    root.get("himarket")
+        .and_then(|s| s.as_mapping())
+        .and_then(|m| m.get(Value::String("defaultJob".to_string())))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }
 
 /// 收集向导初始数据（读当前配置 + 预置）。
@@ -834,6 +932,8 @@ pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherCon
         owner: acc.owner,
         manual_config_enabled: manual_config_enabled(&cfg),
         pending_plugins: pending_plugin_diff(app, cfg),
+        job_presets: job_presets_from_sync(app, cfg),
+        default_job: read_default_job(app, cfg),
     }
 }
 
@@ -873,6 +973,16 @@ pub fn wizard_html() -> String {
   .cfg-key{color:var(--muted);width:90px;white-space:nowrap}
   .cfg-val{color:var(--text);word-break:break-all}
   .cfg-val.empty{color:var(--muted)}
+  /* ① 选岗位：勾选预装 + 单选默认岗位 */
+  .job-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .job-chip{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border:1px solid var(--line);border-radius:16px;background:#161d2e;color:var(--text);font-size:12px;cursor:pointer;user-select:none}
+  .job-chip.checked{border-color:var(--green);color:var(--green);background:#1c2a24}
+  .job-chip .tick{width:14px;text-align:center}
+  .job-chip input{display:none}
+  .job-radio{display:inline-flex;align-items:center;gap:5px;margin-right:10px;font-size:12px;color:var(--text);cursor:pointer}
+  .job-radio input{margin:0}
+  .job-radio.radio{width:auto}
+  .job-hint{font-size:11px;color:var(--muted);margin:6px 0 8px}
 </style>
 </head>
 <body>
@@ -919,6 +1029,17 @@ pub fn wizard_html() -> String {
     <div id="pendingList" style="font-size:12px"></div>
   </div>
 
+  <div class="section" id="jobSection" style="display:none">
+    <h2 style="color:var(--blue)">💼 选择岗位（重点）</h2>
+    <div class="hint">勾选要**预装**的岗位（会下载对应岗位技能，默认全选，可去掉不需要的）；再选一个**默认岗位**（分身激活后默认以它开工）。</div>
+    <div class="job-hint">预装岗位：</div>
+    <div class="job-list" id="jobList"></div>
+    <div class="job-hint" style="margin-top:12px">默认岗位（上岗后默认启用哪一个）：</div>
+    <div id="defaultJobRadios" style="font-size:12px"></div>
+    <button class="btn btn-primary" id="saveJobsBtn" style="width:100%;margin-top:14px">💾 保存岗位设置并完成</button>
+    <div class="status" id="jobStatus"></div>
+  </div>
+
   <div class="status" id="status"></div>
 
 <script>
@@ -959,9 +1080,73 @@ pub fn wizard_html() -> String {
       });
       $("pendingSection").style.display="block";
     }
+    // 岗位选择：仅在「已激活」（status=configured）且有服务端下发的候选岗位时展示。
+    // 未激活时（unconfigured/not-installed）不展示——先完成激活再选岗位。
+    if(s.status==="configured"){ renderJobSection(s); }
   }).catch(()=>{});
 
-  // 自动激活：调本机服务，打开浏览器授权（窗口随后自动关闭，进度走操作窗口）
+  // 渲染岗位选择区块。candidates = 服务端 jobPresets；defaultJob = 当前已落盘默认岗位。
+  // 首次激活后：默认全选 + 默认岗位为空（等用户选）；已保存过：回显当前值。
+  let jobPresets = [];      // 服务端候选（默认全选基础）
+  let jobSelected = new Set();
+  let jobDefault = "";
+  let jobInitialized = false;
+  function renderJobSection(s){
+    const cands = s.job_presets || [];
+    if(!cands.length){ $("jobSection").style.display="none"; return; }
+    if(jobInitialized){ return; }  // 只初始化一次，避免轮询/重复渲染覆盖用户已选
+    jobPresets = cands;
+    jobSelected = new Set(cands);          // 默认全选
+    jobDefault = s.default_job || "";      // 回显当前默认岗位（可为空）
+    jobInitialized = true;
+    paintJobChips();
+    $("jobSection").style.display="block";
+  }
+  function paintJobChips(){
+    // 预装岗位勾选 chips
+    const list=$("jobList"); list.innerHTML="";
+    jobPresets.forEach(j=>{
+      const on=jobSelected.has(j);
+      const chip=document.createElement("div");
+      chip.className="job-chip"+(on?" checked":"");
+      chip.innerHTML='<span class="tick">'+(on?"✓":"○")+'</span>'+esc(j);
+      chip.onclick=()=>{
+        if(jobSelected.has(j)) jobSelected.delete(j); else jobSelected.add(j);
+        paintJobChips();
+      };
+      list.appendChild(chip);
+    });
+    // 默认岗位单选
+    const radios=$("defaultJobRadios"); radios.innerHTML="";
+    const mkRadio=(val,label,checked)=>{
+      const lab=document.createElement("label");
+      lab.className="job-radio";
+      lab.innerHTML='<input class="radio" type="radio" name="defaultJob" value="'+esc(val)+'"'+(checked?" checked":"")+'>'+esc(label);
+      const inp=lab.querySelector("input");
+      inp.onchange=()=>{ jobDefault=val; };
+      lab.style.marginRight="12px";
+      radios.appendChild(lab);
+    };
+    mkRadio("","不指定", jobDefault==="");
+    jobPresets.forEach(j=>{ mkRadio(j, j, jobDefault===j); });
+  }
+
+  // 保存岗位设置：勾选的预装清单 + 默认岗位 → POST /jobs → 关窗
+  $("saveJobsBtn").onclick=async()=>{
+    const st=$("jobStatus"); st.className="status info"; st.textContent="正在保存岗位设置…";
+    $("saveJobsBtn").disabled=true;
+    const payload={ jobs:Array.from(jobSelected), defaultJob:jobDefault };
+    try{
+      const r=await fetch("http://matrix-setup.localhost/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const j=await r.json();
+      if(j.ok){
+        st.innerHTML='<span class="ok">✓ 岗位设置已保存，向导即将关闭。</span>';
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"保存失败"); $("saveJobsBtn").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("saveJobsBtn").disabled=false; }
+  };
+
+  // 自动激活：调本机服务，打开浏览器授权。激活成功后，若有岗位候选则轮询 /state
+  // 等 status=configured 后展示「选岗位」步骤；无岗位候选则由后端关窗。
   $("activateBtn").onclick=async()=>{
     const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
     $("activateBtn").disabled=true;
@@ -969,7 +1154,22 @@ pub fn wizard_html() -> String {
       const r=await fetch("http://matrix-setup.localhost/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
       const j=await r.json();
       if(j.ok){
-        st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。本窗口会自动关闭，进度在操作窗口显示。</span>';
+        st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。完成后本窗口会引导你选择岗位。</span>';
+        // 轮询 /state，等激活完成（configured）后渲染岗位区块
+        let tries=0;
+        const poll=setInterval(async()=>{
+          tries++;
+          if(tries>90){ clearInterval(poll); return; }  // 最多 135s
+          try{
+            const s=await (await fetch("http://matrix-setup.localhost/state")).json();
+            if(s.status==="configured"){
+              clearInterval(poll);
+              if(s.job_presets && s.job_presets.length){
+                renderJobSection(s);
+              }
+            }
+          }catch(e){}
+        },1500);
       } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
     }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; }
   };
