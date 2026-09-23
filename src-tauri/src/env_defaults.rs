@@ -405,6 +405,49 @@ pub fn apply_default_job_to_file(path: &Path, default_job: &str) -> Result<usize
     }
 }
 
+/// 把「花名册开关」写入 settings.yaml 的 `roster.rosterEnabled`（bool）。
+///
+/// 语义：花名册（dsh-roster-consumer）是**独立能力**，不挂在某个岗位下。勾选=开启
+/// （写 `rosterEnabled: true`），取消=关闭（写 `false`）。与岗位枚举（preinstallJobs /
+/// defaultJob）解耦，避免「岗位 × 花名册」硬编码成 `*-roster` 笛卡尔积假岗位。
+///
+/// 注意：`rosterUrl` 已由 `apply_env_defaults_to_file` 强制下发（`http://roster.ai.ict.cmcc`），
+/// 本函数只控制 `rosterEnabled` 布尔开关，不改地址。
+pub fn apply_roster_enabled_to_file(path: &Path, enabled: bool) -> Result<usize, String> {
+    use serde_yaml::{Mapping, Value};
+
+    let mut root: Mapping = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let v: Value = serde_yaml::from_str(&text)
+                .map_err(|e| format!("SETTINGS_PARSE_FAILED: {e}"))?;
+            v.as_mapping().cloned().unwrap_or_default()
+        }
+        Err(_) => Mapping::new(),
+    };
+
+    let section = root
+        .entry(Value::String("roster".to_string()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let map = section
+        .as_mapping_mut()
+        .ok_or("SETTINGS_NS_NOT_MAP: roster 不是 map")?;
+
+    let key = Value::String("rosterEnabled".to_string());
+    let changed = match map.get(&key) {
+        Some(Value::Bool(b)) => *b != enabled,
+        _ => true,
+    };
+    if changed {
+        map.insert(key, Value::Bool(enabled));
+        let out = serde_yaml::to_string(&Value::Mapping(root))
+            .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+        crate::matrix_setup::atomic_write_public(path, out.as_bytes())?;
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +726,34 @@ mod tests {
         let txt = std::fs::read_to_string(&p).unwrap();
         assert!(!txt.contains("defaultJob"), "defaultJob 应被移除：{txt}");
         assert!(txt.contains("baseUrl: keep"), "其它键应保留");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn roster_enabled_writes_bool_and_preserves_url() {
+        let p = tmp_path("roster-on");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, "roster:\n  rosterUrl: http://roster.ai.ict.cmcc\n").unwrap();
+        let written = apply_roster_enabled_to_file(&p, true).unwrap();
+        assert_eq!(written, 1);
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("rosterEnabled: true"), "应写入 roster.rosterEnabled: true：{txt}");
+        assert!(txt.contains("rosterUrl: http://roster.ai.ict.cmcc"), "不能破坏 rosterUrl");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn roster_enabled_idempotent() {
+        let p = tmp_path("roster-idem");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, "roster:\n  rosterEnabled: true\n").unwrap();
+        let w1 = apply_roster_enabled_to_file(&p, true).unwrap();
+        assert_eq!(w1, 0, "值相同不该重复写");
+        // 切到 false 应写入
+        let w2 = apply_roster_enabled_to_file(&p, false).unwrap();
+        assert_eq!(w2, 1, "false 应触发写入");
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("rosterEnabled: false"), "应写入 false：{txt}");
         let _ = std::fs::remove_file(&p);
     }
 }

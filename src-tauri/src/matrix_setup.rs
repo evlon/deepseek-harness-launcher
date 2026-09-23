@@ -748,6 +748,11 @@ pub fn handle_scheme_request<R: TauriRuntime>(
             .unwrap_or("")
             .trim()
             .to_string();
+        // 花名册开关（独立能力，不挂岗位）：缺省 false（保持关闭，按分身显式开启）。
+        let roster_enabled: bool = body
+            .get("rosterEnabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // 校验 defaultJob 若给值，必须属于已勾选的 jobs（或至少是合法岗位 id）
         if !default_job.is_empty() && !jobs.iter().any(|j| j == &default_job) {
             return json_resp(
@@ -756,19 +761,24 @@ pub fn handle_scheme_request<R: TauriRuntime>(
             );
         }
         let path = settings_yaml_path(app, &cfg);
-        // 落盘预装岗位清单（用户勾选的）+ 默认岗位
+        // 落盘预装岗位清单（用户勾选的）+ 默认岗位 + 花名册开关
         let jobs_result = crate::env_defaults::apply_job_presets_to_file(&path, &jobs);
         let dj_result = crate::env_defaults::apply_default_job_to_file(&path, &default_job);
+        let roster_result = crate::env_defaults::apply_roster_enabled_to_file(&path, roster_enabled);
         if let Err(e) = jobs_result {
             log::warn!("[jobs] 落盘预装岗位清单失败：{e}");
         }
         if let Err(e) = dj_result {
             log::warn!("[jobs] 落盘默认岗位失败：{e}");
         }
+        if let Err(e) = roster_result {
+            log::warn!("[jobs] 落盘花名册开关失败：{e}");
+        }
         log::info!(
-            "[jobs] 已保存岗位设置：预装 {} 个，默认岗位 {}",
+            "[jobs] 已保存岗位设置：预装 {} 个，默认岗位 {}，花名册 {}",
             jobs.len(),
-            if default_job.is_empty() { "（未指定）" } else { &default_job }
+            if default_job.is_empty() { "（未指定）" } else { &default_job },
+            if roster_enabled { "开启" } else { "关闭" }
         );
         // 关闭向导窗口
         if let Some(win) = app.get_webview_window("matrix-setup") {
@@ -900,6 +910,8 @@ pub struct WizardState {
     pub job_presets: Vec<String>,
     /// 当前已落盘的默认岗位（himarket.defaultJob），空 = 未指定。
     pub default_job: String,
+    /// 当前已落盘的花名册开关（roster.rosterEnabled），缺省 false（关闭）。
+    pub roster_enabled: bool,
     /// 最近一次自动激活的失败文案（无失败/未激活过 = 空串）。前端据此恢复按钮并提示。
     pub last_activation_error: String,
 }
@@ -949,6 +961,25 @@ fn read_default_job<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConf
         .unwrap_or_default()
 }
 
+/// 读取当前 settings.yaml 里的 `roster.rosterEnabled`（花名册开关），缺省 false。
+fn read_roster_enabled<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig) -> bool {
+    let path = settings_yaml_path(app, cfg);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    use serde_yaml::Value;
+    let root: Value = match serde_yaml::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    root.get("roster")
+        .and_then(|s| s.as_mapping())
+        .and_then(|m| m.get(Value::String("rosterEnabled".to_string())))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// 收集向导初始数据（读当前配置 + 预置）。
 pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig) -> WizardState {
     let st = status(app, cfg);
@@ -969,6 +1000,7 @@ pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherCon
         pending_plugins: pending_plugin_diff(app, cfg),
         job_presets: job_presets_from_sync(app, cfg),
         default_job: read_default_job(app, cfg),
+        roster_enabled: read_roster_enabled(app, cfg),
         last_activation_error: LAST_ACTIVATION_ERROR
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1019,10 +1051,18 @@ pub fn wizard_html() -> String {
   .job-chip.checked{border-color:var(--green);color:var(--green);background:#1c2a24}
   .job-chip .tick{width:14px;text-align:center}
   .job-chip input{display:none}
-  .job-radio{display:inline-flex;align-items:center;gap:5px;margin-right:10px;font-size:12px;color:var(--text);cursor:pointer}
+  .job-radio{display:flex;align-items:center;gap:8px;padding:7px 10px;margin:0 0 6px;border:1px solid var(--line);border-radius:8px;font-size:13px;color:var(--text);cursor:pointer;background:#141a28}
+  .job-radio:hover{border-color:var(--blue)}
   .job-radio input{margin:0}
-  .job-radio.radio{width:auto}
+  .job-radio .job-label{font-weight:500}
+  .job-radio .job-desc{font-size:11px;color:var(--muted);flex:1}
+  .job-radio .job-id{margin-left:auto;font-size:11px;color:var(--muted)}
   .job-hint{font-size:11px;color:var(--muted);margin:6px 0 8px}
+  .roster-toggle{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--text);cursor:pointer;background:#141a28;margin-bottom:4px}
+  .roster-toggle:hover{border-color:var(--blue)}
+  .roster-toggle input{margin:0}
+  .roster-toggle .roster-label{font-weight:500;white-space:nowrap}
+  .roster-toggle .roster-desc{font-size:11px;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -1076,6 +1116,12 @@ pub fn wizard_html() -> String {
     <div class="job-list" id="jobList"></div>
     <div class="job-hint" style="margin-top:12px">默认岗位（上岗后默认启用哪一个）：</div>
     <div id="defaultJobRadios" style="font-size:12px"></div>
+    <div class="job-hint" style="margin-top:12px">附加能力：</div>
+    <label class="roster-toggle">
+      <input type="checkbox" id="rosterToggle">
+      <span class="roster-label">开启花名册</span>
+      <span class="roster-desc">对外登记「我在做什么」（当前工作 / 已完成），供同事查询你的数字分身动态</span>
+    </label>
     <button class="btn btn-primary" id="saveJobsBtn" style="width:100%;margin-top:14px">💾 保存岗位设置并完成</button>
     <div class="status" id="jobStatus"></div>
   </div>
@@ -1086,6 +1132,25 @@ pub fn wizard_html() -> String {
 (function(){
   const $=id=>document.getElementById(id);
   const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  // 岗位 id → 中文名映射（与服务端 dsh-launcher-center 的 BUILTIN_JOBS 保持一致）。
+  // 清单外的岗位（员工自建）没有中文名，就回退显示原始 id。
+  const JOB_LABELS = {
+    "pm":"产品经理","dev":"研发工程师","qa":"测试工程师","leader":"团队负责人",
+    "newbie":"新员工","general":"通用","secretary":"秘书","reception":"前台接待"
+  };
+  // 岗位中文描述（说明该岗位负责什么，帮小白选岗）。
+  const JOB_DESC = {
+    "pm":"产品需求、PRD、需求澄清与优先级",
+    "dev":"接口联调、告警定位、排期评估、技术方案",
+    "qa":"测试用例、缺陷跟踪、验收",
+    "leader":"任务分配、进度跟进、决策驱动",
+    "newbie":"新员工上手引导与答疑",
+    "general":"通用办公助手",
+    "secretary":"请示分级、决策回传、上呈主人、转达话术",
+    "reception":"访客接待、咨询分流"
+  };
+  const jobLabel=id=>JOB_LABELS[id] || id;
+  const jobDesc=id=>JOB_DESC[id] || "";
 
   // 只读展示：加载当前连接配置（服务端下发 + 激活写入），用于排查，不允许本地手改
   fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
@@ -1130,6 +1195,7 @@ pub fn wizard_html() -> String {
   let jobPresets = [];      // 服务端候选（默认全选基础）
   let jobSelected = new Set();
   let jobDefault = "";
+  let jobRosterEnabled = false;   // 花名册开关（独立能力，不挂岗位）
   let jobInitialized = false;
   function renderJobSection(s){
     const cands = s.job_presets || [];
@@ -1138,6 +1204,8 @@ pub fn wizard_html() -> String {
     jobPresets = cands;
     jobSelected = new Set(cands);          // 默认全选
     jobDefault = s.default_job || "";      // 回显当前默认岗位（可为空）
+    jobRosterEnabled = !!s.roster_enabled; // 回显当前花名册开关
+    if($("rosterToggle")) $("rosterToggle").checked = jobRosterEnabled;
     jobInitialized = true;
     paintJobChips();
     $("jobSection").style.display="block";
@@ -1149,33 +1217,37 @@ pub fn wizard_html() -> String {
       const on=jobSelected.has(j);
       const chip=document.createElement("div");
       chip.className="job-chip"+(on?" checked":"");
-      chip.innerHTML='<span class="tick">'+(on?"✓":"○")+'</span>'+esc(j);
+      chip.innerHTML='<span class="tick">'+(on?"✓":"○")+'</span>'+esc(jobLabel(j));
       chip.onclick=()=>{
         if(jobSelected.has(j)) jobSelected.delete(j); else jobSelected.add(j);
         paintJobChips();
       };
       list.appendChild(chip);
     });
-    // 默认岗位单选
+    // 默认岗位单选（每行一个：中文名 + 中文描述 + 岗位 id）
     const radios=$("defaultJobRadios"); radios.innerHTML="";
-    const mkRadio=(val,label,checked)=>{
+    const mkRadio=(val,label,desc,checked)=>{
       const lab=document.createElement("label");
       lab.className="job-radio";
-      lab.innerHTML='<input class="radio" type="radio" name="defaultJob" value="'+esc(val)+'"'+(checked?" checked":"")+'>'+esc(label);
+      const descHtml = desc ? '<span class="job-desc">'+esc(desc)+'</span>' : '';
+      lab.innerHTML='<input class="radio" type="radio" name="defaultJob" value="'+esc(val)+'"'+(checked?" checked":"")+'>'
+        +'<span class="job-label">'+esc(label)+'</span>'
+        +descHtml
+        +(val!==''?'<span class="job-id">'+esc(val)+'</span>':'');
       const inp=lab.querySelector("input");
       inp.onchange=()=>{ jobDefault=val; };
-      lab.style.marginRight="12px";
       radios.appendChild(lab);
     };
-    mkRadio("","不指定", jobDefault==="");
-    jobPresets.forEach(j=>{ mkRadio(j, j, jobDefault===j); });
+    mkRadio("","不指定","", jobDefault==="");
+    jobPresets.forEach(j=>{ mkRadio(j, jobLabel(j), jobDesc(j), jobDefault===j); });
   }
 
-  // 保存岗位设置：勾选的预装清单 + 默认岗位 → POST /jobs → 关窗
+  // 保存岗位设置：勾选的预装清单 + 默认岗位 + 花名册开关 → POST /jobs → 关窗
   $("saveJobsBtn").onclick=async()=>{
     const st=$("jobStatus"); st.className="status info"; st.textContent="正在保存岗位设置…";
     $("saveJobsBtn").disabled=true;
-    const payload={ jobs:Array.from(jobSelected), defaultJob:jobDefault };
+    if($("rosterToggle")) jobRosterEnabled = $("rosterToggle").checked;
+    const payload={ jobs:Array.from(jobSelected), defaultJob:jobDefault, rosterEnabled:jobRosterEnabled };
     try{
       const r=await fetch("http://matrix-setup.localhost/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       const j=await r.json();

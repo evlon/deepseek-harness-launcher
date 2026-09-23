@@ -353,13 +353,26 @@ pub(crate) fn split_spec(input: &str) -> (String, String) {
 }
 
 /// 提取指定版本的直接依赖（name -> semver range）。
+///
+/// 合并 `dependencies` 与 `peerDependencies`：npm7+ 在安装包时会**自动安装 peer 依赖**，
+/// 若镜像上传只解析 `dependencies`，则 peer 依赖不会进内网 registry → 沙箱/离线安装
+/// 报 ERESOLVE。`dsh-acp-interactive` 这类依赖大量 `@deepseek-ai/dsh-*` peer 的包正是
+/// 因此在内网装不上。合并时 dependencies 优先（同名以 dependencies 的范围为准）。
 fn extract_deps(meta: &serde_json::Value, version: &str) -> Vec<(String, String)> {
-    meta.get("versions")
-        .and_then(|v| v.get(version))
-        .and_then(|v| v.get("dependencies"))
-        .and_then(|d| d.as_object())
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("*").to_string())).collect())
-        .unwrap_or_default()
+    let version_obj = meta.get("versions").and_then(|v| v.get(version));
+    let mut merged: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    // peer 先入，dependencies 后入覆盖（同名依赖以直接 dependencies 声明为准）
+    for field in ["peerDependencies", "dependencies"] {
+        if let Some(obj) = version_obj
+            .and_then(|v| v.get(field))
+            .and_then(|d| d.as_object())
+        {
+            for (k, v) in obj {
+                merged.insert(k.clone(), v.as_str().unwrap_or("*").to_string());
+            }
+        }
+    }
+    merged.into_iter().collect()
 }
 
 // ---------- 上传执行 ----------
@@ -654,7 +667,7 @@ fn is_prerelease(version: &str) -> bool {
 /// latest tag（`Cannot implicitly apply the "latest" tag because previously published
 /// version X is higher than the new version Y`）。命中后用 `--tag legacy` 重试发布。
 fn is_version_rollback_err(err: &str) -> bool {
-    err.contains("Cannot implicitly apply")
+    err.contains("[version-rollback]") || err.contains("Cannot implicitly apply")
 }
 
 /// npm 单次命令超时（秒）：pack / publish 网络慢或卡死时防止永久挂起。
@@ -725,14 +738,22 @@ fn run_npm(cwd: &PathBuf, args: &[&str], envs: &[(String, String)]) -> Result<St
                     log::info!("npm {} 目标已存在该版本，视为已同步（幂等）", args[0]);
                     return Ok("already-published".to_string());
                 }
-                // 错误文本截断（npm 会把整个包清单打到 stderr，几千字节），
-                // 避免超大错误串进入 ops 状态 / 进度窗口 / 桥接响应
+                // 版本回退冲突判定必须在**截断前**基于完整 stderr 做：
+                // npm 会把整个包清单打到 stderr（几千字节），"Cannot implicitly apply"
+                // 位于末尾，若先截断再判，该关键词会被切掉 → 回退重试永不触发。
+                let is_rollback = is_version_rollback_err(&stderr);
+                // 错误文本截断（避免超大错误串进入 ops 状态 / 进度窗口 / 桥接响应），
+                // 但保留 rollback 标记前缀，供 upload_one_pkg 判定是否 --tag legacy 重试。
                 let trimmed = stderr.trim();
                 let msg = if trimmed.len() > 800 {
                     format!("{}…（已截断）", crate::config::truncate_utf8(trimmed, 800))
                 } else {
                     trimmed.to_string()
                 };
+                if is_rollback {
+                    // 显式标记：is_version_rollback_err 依赖此前缀命中（不依赖截断后尾部）
+                    return Err(format!("[version-rollback] npm {} 失败: {}", args[0], msg));
+                }
                 return Err(format!("npm {} 失败: {}", args[0], msg));
             }
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -936,6 +957,57 @@ mod tests {
     }
 
     #[test]
+    fn extract_deps_merges_peer_dependencies() {
+        // peerDependencies 与 dependencies 合并（npm7+ 会自动安装 peer）
+        let meta = serde_json::json!({
+            "versions": {
+                "1.0.0": {
+                    "dependencies": { "zod": "^4.0.0" },
+                    "peerDependencies": { "cordis": "4.0.2", "dsh-acp": "^0.1.1-rc.2" }
+                }
+            }
+        });
+        let deps = extract_deps(&meta, "1.0.0");
+        assert_eq!(deps.len(), 3);
+        assert!(deps.contains(&("cordis".to_string(), "4.0.2".to_string())));
+        assert!(deps.contains(&("dsh-acp".to_string(), "^0.1.1-rc.2".to_string())));
+        assert!(deps.contains(&("zod".to_string(), "^4.0.0".to_string())));
+    }
+
+    #[test]
+    fn extract_deps_dependencies_override_peer() {
+        // 同名同时出现在 dependencies 与 peerDependencies：以 dependencies 为准
+        let meta = serde_json::json!({
+            "versions": {
+                "1.0.0": {
+                    "dependencies": { "foo": "2.0.0" },
+                    "peerDependencies": { "foo": "1.0.0", "bar": "1.2.3" }
+                }
+            }
+        });
+        let deps = extract_deps(&meta, "1.0.0");
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&("foo".to_string(), "2.0.0".to_string())));
+        assert!(!deps.contains(&("foo".to_string(), "1.0.0".to_string())));
+        assert!(deps.contains(&("bar".to_string(), "1.2.3".to_string())));
+    }
+
+    #[test]
+    fn extract_deps_only_peer_no_dependencies() {
+        // 仅有 peerDependencies、无 dependencies（如 dsh-acp-interactive 的 peer 链）
+        let meta = serde_json::json!({
+            "versions": {
+                "0.1.0": {
+                    "peerDependencies": { "dsh-agent": "^0.1.1-rc.2" }
+                }
+            }
+        });
+        let deps = extract_deps(&meta, "0.1.0");
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains(&("dsh-agent".to_string(), "^0.1.1-rc.2".to_string())));
+    }
+
+    #[test]
     fn progress_serializable() {
         let p = UploadProgress {
             state: "running".to_string(),
@@ -973,6 +1045,11 @@ mod tests {
         assert!(!is_version_rollback_err("npm error EPUBLISHCONFLICT"));
         assert!(!is_version_rollback_err("npm error code EUSAGE"));
         assert!(!is_version_rollback_err(""));
+        // 截断后仍命中：真实场景 run_npm 会把 npm notice 清单截断到 800 字节，
+        // 尾部 "Cannot implicitly apply" 被切掉，须靠 [version-rollback] 前缀命中
+        assert!(is_version_rollback_err(
+            "[version-rollback] npm publish 失败: npm notice ... npm notice package: @agentclientprotocol/sdk@0.25.1 …（已截断）"
+        ));
     }
 
     #[test]
