@@ -1641,26 +1641,38 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             });
         }
         "cert-reinstall" => {
-            // 重装内网根证书：独立重试入口（此前「同步」菜单并不触发证书安装，
+            // 重装安全证书：独立重试入口（此前「同步」菜单并不触发证书安装，
             // 证书导入失败后用户无路可走；此菜单项补上真实闭环）。
+            // 一次重装两个：内网 HTTPS 根 CA（红锁）+ 代码签名根 CA（未知发布者）。
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
-                crate::ops::start_op(&h, "cert-reinstall", "重装内网证书", &["导入根证书"]);
+                crate::ops::start_op(&h, "cert-reinstall", "重装内网证书", &["导入安全证书"]);
                 crate::ops::mark_step_running(&h, 0);
-                crate::ops::update_step(&h, "正在导入内网根证书…");
+                crate::ops::update_step(&h, "正在导入安全证书…");
                 let cfg = load_cached();
+                let mut errors: Vec<String> = Vec::new();
                 match crate::install::install_root_ca(&h, &cfg) {
-                    Ok(()) => {
-                        crate::ops::finish_op(&h, "内网根证书已导入系统信任库");
-                        notify(&h, "内网证书已就绪", "已导入系统信任库，浏览器访问 *.ai.ict.cmcc 不再红锁");
-                        refresh_sync_menu(&h);
-                    }
+                    Ok(()) => crate::ops::append_log(&h, "✓ 内网根证书已导入系统信任库"),
                     Err(e) => {
-                        crate::ops::fail_op(&h, &e);
-                        notify(&h, "内网证书导入失败", &format!("{e}\n\n若提示需要管理员权限，请以管理员身份重新运行 launcher 后再试"));
-                        refresh_sync_menu(&h);
+                        crate::ops::append_log(&h, &format!("✗ 内网根证书导入未完成：{e}"));
+                        errors.push(e);
                     }
                 }
+                match crate::install::install_code_signing_ca(&h, &cfg) {
+                    Ok(()) => crate::ops::append_log(&h, "✓ 代码签名根证书已导入系统信任库"),
+                    Err(e) => {
+                        crate::ops::append_log(&h, &format!("✗ 代码签名根证书导入未完成：{e}"));
+                        errors.push(e);
+                    }
+                }
+                if errors.is_empty() {
+                    crate::ops::finish_op(&h, "安全证书均已导入系统信任库");
+                    notify(&h, "安全证书已就绪", "已导入系统信任库：浏览器访问 *.ai.ict.cmcc 不再红锁；launcher 程序签名可验证、不再显示“未知发布者”");
+                } else {
+                    crate::ops::fail_op(&h, "部分安全证书导入失败");
+                    notify(&h, "安全证书导入失败", &format!("{}\n\n若提示需要管理员权限，请以管理员身份重新运行 launcher 后再试", errors.join("；")));
+                }
+                refresh_sync_menu(&h);
             });
         }
         id if id.starts_with("link-") => {

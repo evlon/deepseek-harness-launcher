@@ -20,6 +20,11 @@
 
 set -euo pipefail
 
+# ⚠️ 关键：MSYS/git-bash 会把 signtool 的 /pa /fd /tr 等单斜杠参数误当成路径转换
+#   （实测 /pa → C:/Program Files/Git/pa，/fd 被吞 → 报 "No file digest algorithm
+#   specified"）。必须设 MSYS_NO_PATHCONV=1 禁用参数路径转换，否则签名静默失败。
+export MSYS_NO_PATHCONV=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 

@@ -32,7 +32,7 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // 证书导入放在第一步：它是独立于依赖下载的最快闭环，且此前排在最末位
     // 会被前面任何一步失败「短路」——证书永远装不上，浏览器一直红锁。
     let steps = vec![
-        "导入内网根证书",
+        "导入安全证书",
         "下载 / 安装 Node.js",
         "安装 pnpm",
         "下载 Harness 核心",
@@ -44,22 +44,37 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         log::warn!("进度窗口打开失败（降级为托盘状态 + 通知）：{e}");
     }
 
-    // ① 内网根证书：最先做。失败不阻断后续依赖安装（依赖本体仍要装好），
-    //    但必须显式告知用户并留下重试入口（托盘「重装内网证书」）。
+    // ① 安全证书（内网 HTTPS 根 CA + 代码签名根 CA）：最先做。失败不阻断后续依赖安装
+    //    （依赖本体仍要装好），但必须显式告知用户并留下重试入口（托盘「重装内网证书」）。
+    //    两个证书互相独立：任一个失败都不影响另一个的导入尝试。
     crate::ops::mark_step_running(app, 0);
-    crate::ops::update_step(app, "正在导入内网根证书…");
-    crate::ops::append_log(app, "开始导入内网根证书（im.ai.ict.cmcc 等 HTTPS 依赖）…");
-    if let Err(e) = install_root_ca(app, &cfg) {
-        log::warn!("内网根证书导入未完成：{e}");
+    crate::ops::update_step(app, "正在导入安全证书…");
+    crate::ops::append_log(app, "开始导入内网根证书 + 代码签名根证书…");
+
+    let mut cert_ok = true;
+    match install_root_ca(app, &cfg) {
+        Ok(()) => crate::ops::append_log(app, "✓ 内网根证书已导入系统信任库"),
+        Err(e) => {
+            cert_ok = false;
+            log::warn!("内网根证书导入未完成：{e}");
+            crate::ops::append_log(app, &format!("✗ 内网根证书导入未完成：{e}"));
+        }
+    }
+    match install_code_signing_ca(app, &cfg) {
+        Ok(()) => crate::ops::append_log(app, "✓ 代码签名根证书已导入系统信任库"),
+        Err(e) => {
+            cert_ok = false;
+            log::warn!("代码签名根证书导入未完成：{e}");
+            crate::ops::append_log(app, &format!("✗ 代码签名根证书导入未完成：{e}"));
+        }
+    }
+    if !cert_ok {
         crate::ops::mark_step_failed(app, 0);
-        crate::ops::append_log(app, &format!("✗ 内网根证书导入未完成：{e}"));
         crate::notify::notify(
             app,
-            "内网证书导入未完成",
-            &format!("{e}\n\n依赖安装会继续；完成后可点托盘「重装内网证书」补装"),
+            "安全证书导入未完成",
+            "部分安全证书未导入系统信任库（详情见进度窗口）。依赖安装会继续；完成后可点托盘「重装内网证书」补装",
         );
-    } else {
-        crate::ops::append_log(app, "✓ 内网根证书已导入系统信任库");
     }
 
     // 预写 npmrc，使加速源在安装后就绪（供后续插件拉包）
@@ -555,6 +570,23 @@ fn copy_link(from: &PathBuf, to: &PathBuf) -> Result<(), String> {
 /// 若证书只放在 zip 里 exe 旁边，自动更新后丢失 → 同事机器红锁复发。
 const ICT_INTERNAL_CA_PEM: &str = include_str!("../resources/ict-internal-ca.crt");
 
+/// 内嵌的代码签名根 CA（编译期 include_str!，仅公钥）。
+///
+/// 用途：让 Windows 能够验证 launcher exe 的 Authenticode 签名链——
+/// launcher 本体用 `DeepSeek Harness Launcher` 证书签名，该证书由
+/// 「ICT Internal AI Code Signing Root CA」签发。Windows 的 Authenticode 校验
+/// 需要把这条链的**根 CA** 放进「受信任的根证书颁发机构」才能验通，
+/// 否则 `Get-AuthenticodeSignature` 返回 `UnknownError`（"无法建立到信任根颁发机构的证书链"）。
+///
+/// 安全边界：此文件**只含公钥**（自签根 CA 的公开证书，本就是公开放出的）。
+/// 对应私钥 `signing-ca.key` 与含私钥的 `codesign.pfx` 留在构建机仓库外
+/// （.launcher-signing/），**绝不入库**。公钥证书入库仅用于「验签」，无法用于「签出」，
+/// 不产生冒充风险。
+const CODE_SIGNING_CA_PEM: &str = include_str!("../resources/ict-code-signing-ca.crt");
+
+/// 代码签名根 CA 在系统信任库里的显示名（certutil -store Root 里按此精确匹配）。
+const CODE_SIGNING_CA_CN: &str = "ICT Internal AI Code Signing Root CA";
+
 /// 把内嵌的内网根 CA 导入 Windows 系统信任库（Chrome/Edge 走这里）。
 ///
 /// 流程（先查后装，避免重复弹 UAC）：
@@ -567,76 +599,135 @@ const ICT_INTERNAL_CA_PEM: &str = include_str!("../resources/ict-internal-ca.crt
 /// 返回 `Result<(), String>`：Ok = 已成功导入（或验证确认已存在）；Err = 导入失败，
 /// 错误信息已尽量精确定位（用户取消 UAC / certutil 缺失 / 证书内容异常）。
 /// 供 install_all 与托盘「重装内网证书」菜单共用，保证两处行为一致。
+/// 把**一个**根 CA 导入系统「受信任的根证书颁发机构」的通用实现。
+///
+/// 参数化：证书内容 / 落盘文件名 / 信任库匹配 CN / 说明框标题与正文 / 取消提示，
+/// 供 HTTPS 内网根 CA（`install_root_ca`）与代码签名根 CA（`install_code_signing_ca`）共用，
+/// 保证两处「先查后装 → 去静默化确认 → UAC 提权 → 回读验证」行为完全一致。
+#[cfg(windows)]
+fn import_root_ca_to_store<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+    cert_pem: &str,
+    file_name: &str,
+    ca_cn: &str,
+    dialog_title: &str,
+    dialog_body: &str,
+    cancelled_hint: &str,
+) -> Result<(), String> {
+    // 1. 落到磁盘（certutil 需要一个文件路径）
+    let cert_path = dsh_home(app, cfg).join(file_name);
+    if let Some(parent) = cert_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 内容有变化才重写（幂等，避免无谓磁盘 IO）
+    let need_write = match std::fs::read_to_string(&cert_path) {
+        Ok(existing) => existing != cert_pem,
+        Err(_) => true,
+    };
+    if need_write {
+        std::fs::write(&cert_path, cert_pem).map_err(|e| format!("写入根证书失败：{e}"))?;
+    }
+
+    // 2. 只读预检：证书已在信任库 → 直接成功，不弹 UAC。
+    //    certutil -store Root 是只读操作，不需要管理员权限。
+    match certutil_has_root_ca(ca_cn) {
+        Ok(true) => {
+            log::info!("根 CA「{ca_cn}」已存在于系统信任库，跳过导入");
+            return Ok(());
+        }
+        Ok(false) => {
+            log::info!("根 CA「{ca_cn}」不在信任库，进入 UAC 提权导入");
+        }
+        Err(e) => {
+            // 预检失败（如 certutil 缺失）不能直接当作「没装」——
+            // 下面提权导入会再次暴露真实错误。这里仅记录，继续走导入流程。
+            log::warn!("预检系统信任库失败（继续尝试导入）：{e}");
+        }
+    }
+
+    // 2.5 去静默化：在弹 UAC 前先弹一个「说明 + 确认」的原生对话框，
+    //     讲清楚接下来会发生什么（提权导入该根证书）、为什么需要、
+    //     以及选择「否」的后果。避免用户只看到一闪的 UAC、不明所以，
+    //     也降低「静默提权」被安全软件误判为可疑程序的可能。
+    if !confirm_root_ca_import(dialog_title, dialog_body) {
+        return Err(cancelled_hint.to_string());
+    }
+
+    // 3. UAC 提权导入：用 ShellExecuteExW 的 runas verb 拉起提权进程执行
+    //    certutil -addstore -f Root <cert>。弹系统原生 UAC 对话框。
+    elevate_certutil_addstore(&cert_path)?;
+
+    // 4. 验证闭环：读回系统信任库，确认证书确实在「受信任的根证书颁发机构」里。
+    //    不验证的话，certutil 报成功但实际没进信任库（例如被组策略拦截）时会误报。
+    match certutil_has_root_ca(ca_cn) {
+        Ok(true) => {
+            log::info!("验证通过：根 CA「{ca_cn}」已在系统信任库中");
+            Ok(())
+        }
+        Ok(false) => Err(format!(
+            "验证失败：导入命令已执行，但未在系统信任库中找到「{ca_cn}」"
+        )),
+        Err(e) => Err(format!("验证系统信任库失败：{e}")),
+    }
+}
+
 pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
     #[cfg(windows)]
     {
-        // 1. 落到磁盘（certutil 需要一个文件路径）
-        let cert_path = dsh_home(app, cfg).join("ict-internal-ca.crt");
-        if let Some(parent) = cert_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // 内容有变化才重写（幂等，避免无谓磁盘 IO）
-        let need_write = match std::fs::read_to_string(&cert_path) {
-            Ok(existing) => existing != ICT_INTERNAL_CA_PEM,
-            Err(_) => true,
-        };
-        if need_write {
-            std::fs::write(&cert_path, ICT_INTERNAL_CA_PEM)
-                .map_err(|e| format!("写入根证书失败：{e}"))?;
-        }
-
-        // 2. 只读预检：证书已在信任库 → 直接成功，不弹 UAC。
-        //    certutil -store Root 是只读操作，不需要管理员权限。
-        match certutil_has_root_ca() {
-            Ok(true) => {
-                log::info!("内网根 CA 已存在于系统信任库，跳过导入");
-                return Ok(());
-            }
-            Ok(false) => {
-                log::info!("内网根 CA 不在信任库，进入 UAC 提权导入");
-            }
-            Err(e) => {
-                // 预检失败（如 certutil 缺失）不能直接当作「没装」——
-                // 下面提权导入会再次暴露真实错误。这里仅记录，继续走导入流程。
-                log::warn!("预检系统信任库失败（继续尝试导入）：{e}");
-            }
-        }
-
-        // 2.5 去静默化：在弹 UAC 前先弹一个「说明 + 确认」的原生对话框，
-        //     讲清楚接下来会发生什么（提权导入内网根证书）、为什么需要、
-        //     以及选择「否」的后果。避免用户只看到一闪的 UAC、不明所以，
-        //     也降低「静默提权」被安全软件误判为可疑程序的可能。
-        if !confirm_root_ca_import() {
-            return Err(
-                "已取消：你选择不导入内网根证书。可随时在托盘「重装内网证书」重试"
-                    .to_string(),
-            );
-        }
-
-        // 3. UAC 提权导入：用 ShellExecuteExW 的 runas verb 拉起提权进程执行
-        //    certutil -addstore -f Root <cert>。弹系统原生 UAC 对话框。
-        //    Chrome/Edge 在 Windows 上读系统信任库，导入后即绿锁。
-        //    Firefox 用独立 NSS 库，暂不处理（同事主要用 Chrome/Edge）。
-        elevate_certutil_addstore(&cert_path)?;
-
-        // 4. 验证闭环：读回系统信任库，确认证书确实在「受信任的根证书颁发机构」里。
-        //    不验证的话，certutil 报成功但实际没进信任库（例如被组策略拦截）时会误报绿锁。
-        match certutil_has_root_ca() {
-            Ok(true) => {
-                log::info!("验证通过：内网根 CA 已在系统信任库中");
-                Ok(())
-            }
-            Ok(false) => Err(
-                "验证失败：导入命令已执行，但未在系统信任库中找到「ICT Internal AI Root CA」"
-                    .to_string(),
-            ),
-            Err(e) => Err(format!("验证系统信任库失败：{e}")),
-        }
+        import_root_ca_to_store(
+            app,
+            cfg,
+            ICT_INTERNAL_CA_PEM,
+            "ict-internal-ca.crt",
+            "ICT Internal AI Root CA",
+            "安装内网安全证书",
+            "为了让浏览器正常访问公司内网站点（*.ai.ict.cmcc 等，否则会显示“不安全/红锁”），\
+             需要把内网根证书「ICT Internal AI Root CA」加入系统信任库。\n\n\
+             下一步 Windows 会弹出“用户账户控制(UAC)”授权框，点击“是”即完成安装（仅这一次，之后不再提示）。\n\n\
+             · 点击「确定」= 继续，随后在 UAC 弹窗中选择「是」\n\
+             · 点击「取消」= 跳过，不导入（可稍后在托盘“重装内网证书”重试）",
+            "已取消：你选择不导入内网根证书。可随时在托盘「重装内网证书」重试",
+        )
     }
     #[cfg(not(windows))]
     {
         let _ = (app, cfg);
-        log::info!("非 Windows 平台，跳过根 CA 导入");
+        log::info!("非 Windows 平台，跳过内网根 CA 导入");
+        Ok(())
+    }
+}
+
+/// 导入代码签名根 CA（让 Windows 能验证 launcher exe 的 Authenticode 签名链）。
+///
+/// 与 `install_root_ca`（导入 HTTPS 内网根 CA）是**两条独立的腿**：
+/// 前者解决浏览器红锁，本函数解决 exe「未知发布者 / 无法验证签名」。二者共用
+/// 同一套「先查后装 + 确认 + UAC 提权 + 回读验证」底层逻辑（`import_root_ca_to_store`）。
+pub fn install_code_signing_ca<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        import_root_ca_to_store(
+            app,
+            cfg,
+            CODE_SIGNING_CA_PEM,
+            "ict-code-signing-ca.crt",
+            CODE_SIGNING_CA_CN,
+            "安装代码签名安全证书",
+            "为了让 Windows 能验证 launcher 程序的安全签名、不再提示“未知发布者”，\
+             需要把代码签名根证书「ICT Internal AI Code Signing Root CA」加入系统信任库。\n\n\
+             下一步 Windows 会弹出“用户账户控制(UAC)”授权框，点击“是”即完成安装（仅这一次，之后不再提示）。\n\n\
+             · 点击「确定」= 继续，随后在 UAC 弹窗中选择「是」\n\
+             · 点击「取消」= 跳过，不导入（可稍后在托盘“重装内网证书”重试）",
+            "已取消：你选择不导入代码签名根证书。可随时在托盘「重装内网证书」重试",
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, cfg);
+        log::info!("非 Windows 平台，跳过代码签名根 CA 导入");
         Ok(())
     }
 }
@@ -648,22 +739,10 @@ pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> 
 /// 讲清「为什么需要」和「点否的后果」，避免只看到一闪的 UAC、不明所以，
 /// 也降低「静默提权」这一动作被安全软件（Windows Defender 等）误判为可疑行为的可能。
 #[cfg(windows)]
-fn confirm_root_ca_import() -> bool {
+fn confirm_root_ca_import(title: &str, body: &str) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OKCANCEL, IDOK};
-    let title: Vec<u16> = "安装内网安全证书"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let body: Vec<u16> = format!(
-        "为了让浏览器正常访问公司内网站点（*.ai.ict.cmcc 等，否则会显示“不安全/红锁”），\
-         需要把内网根证书「ICT Internal AI Root CA」加入系统信任库。\n\n\
-         下一步 Windows 会弹出“用户账户控制(UAC)”授权框，点击“是”即完成安装（仅这一次，之后不再提示）。\n\n\
-         · 点击「确定」= 继续，随后在 UAC 弹窗中选择「是」\n\
-         · 点击「取消」= 跳过，不导入（可稍后在托盘“重装内网证书”重试）"
-    )
-    .encode_utf16()
-    .chain(std::iter::once(0))
-    .collect();
+    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let body: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
     let ret = unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
@@ -677,16 +756,16 @@ fn confirm_root_ca_import() -> bool {
 
 /// 非 Windows 平台：无确认框，直接视为继续（桌面端仅面向 Windows）。
 #[cfg(not(windows))]
-fn confirm_root_ca_import() -> bool {
+fn confirm_root_ca_import(_title: &str, _body: &str) -> bool {
     true
 }
 
-/// 只读检查系统信任库是否已含本内网根 CA（按 CN 精确匹配，避免误判同名证书）。
+/// 只读检查系统信任库是否已含指定 CN 的根 CA（按 CN 精确匹配，避免误判同名证书）。
 ///
 /// `certutil -store Root` 是只读操作，不需要管理员权限，因此可放心前置预检。
 /// 返回 Ok(true) = 已存在；Ok(false) = 不存在；Err = 查询失败（如 certutil 缺失）。
 #[cfg(windows)]
-fn certutil_has_root_ca() -> Result<bool, String> {
+fn certutil_has_root_ca(ca_cn: &str) -> Result<bool, String> {
     let out = Command::new("certutil")
         .arg("-store")
         .arg("Root")
@@ -697,7 +776,7 @@ fn certutil_has_root_ca() -> Result<bool, String> {
         return Err(format!("certutil -store Root 返回非零：{}", stderr.trim()));
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    Ok(text.contains("ICT Internal AI Root CA"))
+    Ok(text.contains(ca_cn))
 }
 
 /// 通过 UAC 提权执行 `certutil -addstore -f Root <cert>`。
