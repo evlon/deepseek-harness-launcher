@@ -602,6 +602,17 @@ pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> 
             }
         }
 
+        // 2.5 去静默化：在弹 UAC 前先弹一个「说明 + 确认」的原生对话框，
+        //     讲清楚接下来会发生什么（提权导入内网根证书）、为什么需要、
+        //     以及选择「否」的后果。避免用户只看到一闪的 UAC、不明所以，
+        //     也降低「静默提权」被安全软件误判为可疑程序的可能。
+        if !confirm_root_ca_import() {
+            return Err(
+                "已取消：你选择不导入内网根证书。可随时在托盘「重装内网证书」重试"
+                    .to_string(),
+            );
+        }
+
         // 3. UAC 提权导入：用 ShellExecuteExW 的 runas verb 拉起提权进程执行
         //    certutil -addstore -f Root <cert>。弹系统原生 UAC 对话框。
         //    Chrome/Edge 在 Windows 上读系统信任库，导入后即绿锁。
@@ -628,6 +639,46 @@ pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> 
         log::info!("非 Windows 平台，跳过根 CA 导入");
         Ok(())
     }
+}
+
+/// 导入根 CA 前的说明确认框：返回 true = 继续导入，false = 用户取消。
+///
+/// 目的（去静默化）：让用户在被 UAC 提权前**先知道**接下来会发生什么——
+/// 程序要把内网根证书加入系统「受信任的根证书颁发机构」，需要管理员权限。
+/// 讲清「为什么需要」和「点否的后果」，避免只看到一闪的 UAC、不明所以，
+/// 也降低「静默提权」这一动作被安全软件（Windows Defender 等）误判为可疑行为的可能。
+#[cfg(windows)]
+fn confirm_root_ca_import() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OKCANCEL, IDOK};
+    let title: Vec<u16> = "安装内网安全证书"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let body: Vec<u16> = format!(
+        "为了让浏览器正常访问公司内网站点（*.ai.ict.cmcc 等，否则会显示“不安全/红锁”），\
+         需要把内网根证书「ICT Internal AI Root CA」加入系统信任库。\n\n\
+         下一步 Windows 会弹出“用户账户控制(UAC)”授权框，点击“是”即完成安装（仅这一次，之后不再提示）。\n\n\
+         · 点击「确定」= 继续，随后在 UAC 弹窗中选择「是」\n\
+         · 点击「取消」= 跳过，不导入（可稍后在托盘“重装内网证书”重试）"
+    )
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+    let ret = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OKCANCEL | MB_ICONINFORMATION,
+        )
+    };
+    ret == IDOK
+}
+
+/// 非 Windows 平台：无确认框，直接视为继续（桌面端仅面向 Windows）。
+#[cfg(not(windows))]
+fn confirm_root_ca_import() -> bool {
+    true
 }
 
 /// 只读检查系统信任库是否已含本内网根 CA（按 CN 精确匹配，避免误判同名证书）。

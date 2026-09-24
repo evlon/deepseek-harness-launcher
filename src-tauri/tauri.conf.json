@@ -23,7 +23,10 @@
       "icons/icon.ico"
     ],
     "shortDescription": "DeepSeek Harness 托盘启动器",
-    "longDescription": "常驻任务栏的托盘程序，用于安装 / 启动 DeepSeek Harness 及全部依赖，并提供 npm 源 / GitHub 加速切换与可配置网址菜单。"
+    "longDescription": "常驻任务栏的托盘程序，用于安装 / 启动 DeepSeek Harness 及全部依赖，并提供 npm 源 / GitHub 加速切换与可配置网址菜单。",
+    "windows": {
+      "signCommand": "scripts/sign-launcher.sh %1"
+    }
   },
   "plugins": {}
 }
