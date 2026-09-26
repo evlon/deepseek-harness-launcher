@@ -100,7 +100,36 @@ pub async fn download_ui_bundle<R: Runtime>(app: &AppHandle<R>, server_url: &str
         return Err("UI 包无可写文件".to_string());
     }
     log::info!("UI 包已缓存 v{}（{} 个文件）", bundle.version, wrote);
+    prune_old_versions(app, &bundle.version);
     Ok(bundle.version)
+}
+
+/// 清理旧版本缓存目录，避免 UI 包版本号无限累积（每次发版遗留一个 v<版本>/）。
+/// 只删除「非当前版本」的目录；当前版本刚写完，保留。失败仅记日志，不影响主流程。
+fn prune_old_versions<R: Runtime>(app: &AppHandle<R>, keep_version: &str) {
+    prune_old_versions_in_dir(&cache_dir(app), keep_version)
+}
+
+/// prune_old_versions 的纯函数版（测试友好）。
+fn prune_old_versions_in_dir(root: &PathBuf, keep_version: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 目录名形如 v<版本>，剥掉 v 前缀后与当前版本比较；不同则删除
+        let Some(stripped) = name.strip_prefix('v') else {
+            continue;
+        };
+        if stripped != keep_version {
+            log::info!("UI 包清理旧版本目录: {name}");
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// 双轨加载：优先读缓存文件，无则回落内置。返回 (html, 来源)。
@@ -239,6 +268,30 @@ mod tests {
         let (html, src) = load_html_from_dir(dir.clone(), "console.html", builtin);
         assert_eq!(src, "builtin");
         assert_eq!(html, builtin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_old_versions_keeps_only_current() {
+        let dir = std::env::temp_dir().join(format!("ui-bundle-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 造三个版本目录 + 一个非版本目录
+        std::fs::create_dir_all(dir.join("v1")).unwrap();
+        std::fs::create_dir_all(dir.join("v2")).unwrap();
+        std::fs::create_dir_all(dir.join("v3")).unwrap();
+        std::fs::create_dir_all(dir.join("backup-notes")).unwrap();
+        std::fs::write(dir.join("v1").join("console.html"), "<html>1</html>").unwrap();
+        std::fs::write(dir.join("v2").join("console.html"), "<html>2</html>").unwrap();
+        std::fs::write(dir.join("v3").join("console.html"), "<html>3</html>").unwrap();
+
+        // 保留 v3，清理 v1/v2；非 v 前缀目录（backup-notes）不碰
+        prune_old_versions_in_dir(&dir, "3");
+
+        assert!(!dir.join("v1").exists(), "旧版本 v1 应被清理");
+        assert!(!dir.join("v2").exists(), "旧版本 v2 应被清理");
+        assert!(dir.join("v3").exists(), "当前版本 v3 应保留");
+        assert!(dir.join("backup-notes").exists(), "非版本目录不应被误删");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -777,7 +777,8 @@ fn check_ui_bundle<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig, config:
 }
 
 /// 拉取服务端配置。失败返回 Err（调用方应视作离线，用缓存）。
-pub async fn fetch_config(server_url: &str, token: &str) -> Result<ServerConfig, String> {    let url = format!("{}/api/config", server_url.trim_end_matches('/'));
+pub async fn fetch_config(server_url: &str, token: &str) -> Result<ServerConfig, String> {
+    let url = format!("{}/api/config", server_url.trim_end_matches('/'));
     let mut req = http_client().get(&url);
     if !token.is_empty() {
         req = req.header("X-Admin-Token", token);
