@@ -9,7 +9,7 @@
 //! 因此引入统一判定 `needs_onboarding`：只要「dsh 未装」**或**「数字分身未激活」，
 //! 都属于需要引导的首次态，双击后直接进入「激活数字分身」主流程。
 
-use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::config::*;
 
@@ -39,27 +39,6 @@ pub fn needs_onboarding<R: Runtime>(app: &AppHandle<R>) -> bool {
         crate::matrix_setup::status(app, &cfg),
         crate::matrix_setup::MatrixStatus::Configured
     )
-}
-
-/// 打开（或聚焦）首次运行欢迎窗口。
-pub fn open_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window(WINDOW_LABEL) {
-        let _ = win.show();
-        let _ = win.set_focus();
-        return Ok(());
-    }
-    let url = WebviewUrl::External(
-        "http://first-run.localhost/index.html"
-            .parse()
-            .map_err(|e: url::ParseError| e.to_string())?,
-    );
-    WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
-        .title("数字分身 · 首次使用")
-        .inner_size(520.0, 480.0)
-        .resizable(true)
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// 关闭欢迎窗口（安装开始后调用）。
@@ -93,7 +72,7 @@ pub fn handle_scheme_request<R: Runtime>(
     };
 
     if method == tauri::http::Method::GET && (path == "/" || path == "/index.html") {
-        let html = welcome_html();
+        let html = welcome_html(app);
         return Response::builder()
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(
@@ -123,17 +102,34 @@ pub fn handle_scheme_request<R: Runtime>(
         let h = app.clone();
         let dsh_installed = dsh_binary_path(app).exists();
         if !dsh_installed {
-            // 后台跑安装（复用 install_all：含进度窗口 + 分步通知）。
-            // 装完关闭本首屏，衔接数字分身激活向导（而非旧的「配置向导」）。
+            // 后台跑安装（复用 install_all，进度内嵌于向导窗口；install_all 已做
+            // 「向导存在则不弹独立进度窗」）。先开向导再装——用户立刻看到单窗口，
+            // 安装进度直接滚动，装完自动衔接激活，全程一个窗口。
             tauri::async_runtime::spawn(async move {
-                let _ = crate::install::install_all(&h).await;
+                // 先关首屏窗（避免 first-run + matrix-setup 双窗并存），单窗口收口到向导
                 close_window(&h);
-                log::info!("首次安装完成，自动打开数字分身激活向导");
+                // 先打开向导（用户立即看到界面 + 内嵌进度），再装再激活，全程单窗口
                 let _ = crate::matrix_setup::open_window(&h);
+                // 等安装完成
+                let _ = crate::install::install_all(&h).await;
+                // 安装已完成：立即触发向导内的自动激活（POST /resume-auto-activation），
+                // 保证「装完即用」不需再点按钮选「开始激活」
+                let _h2 = h.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    // 给向导一点热身时间打开
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    // 通过本地 HTTP 协议调向导端点（不关心返回，纯触发）
+                    let _ = reqwest::blocking::Client::new()
+                        .post("http://matrix-setup.localhost/resume-auto-activation")
+                        .send()
+                        .ok();
+                    let _ = _h2;
+                });
+                log::info!("首次安装完成，已在向导窗口内自动衔接激活流程");
             });
             return json_resp(
                 StatusCode::OK,
-                serde_json::json!({"ok": true, "message": "正在安装依赖，随后自动进入激活"}),
+                serde_json::json!({"ok": true, "message": "正在安装依赖，完成后将自动激活数字分身"}),
             );
         }
         // dsh 已装 → 先确保 matrix profile 骨架 + 推荐插件就绪，再打开激活向导。
@@ -142,6 +138,8 @@ pub fn handle_scheme_request<R: Runtime>(
         // "profile does not exist" → HARNESS_NOT_READY。
         tauri::async_runtime::spawn(async move {
             let cfg = load_cached();
+            // 先关首屏窗（避免 first-run + matrix-setup 双窗并存），单窗口收口到向导
+            close_window(&h);
             // 1) 同步建 matrix profile 骨架（manifest + bundles + 品牌 patch + env defaults）
             if let Err(e) = crate::install::ensure_matrix_profile(&h, &cfg) {
                 log::warn!("激活前确保 matrix profile 骨架失败：{e}");
@@ -150,7 +148,19 @@ pub fn handle_scheme_request<R: Runtime>(
             if let Err(e) = crate::install::install_server_recommended(&h, &cfg).await {
                 log::warn!("激活前装 matrix 推荐插件未完成（可在激活后托盘补装）：{e}");
             }
+            // 2️⃣ 直接打开「数字分身配置向导」单窗口处理全部流程（安装进度、激活、岗位选择），不再中途关闭重开
+            // ⚠️ 不再 open_console 预热独立进度窗——进度统一内嵌在向导窗口内（见 wizard_html 的
+            //    进度区 + /op-state 轮询），避免「配置数字分身 + 操作进度」双窗交替闪烁。
             let _ = crate::matrix_setup::open_window(&h);
+            // 已装未激活：同样直接触发自动激活，免去用户再点按钮
+            let _h2 = h.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = reqwest::blocking::Client::new()
+                    .post("http://matrix-setup.localhost/resume-auto-activation")
+                    .send()
+                    .ok();
+            });
         });
         return json_resp(
             StatusCode::OK,
@@ -168,76 +178,7 @@ pub fn handle_scheme_request<R: Runtime>(
 ///
 /// 文案目标：让用户**一眼看懂下一步**，不再需要「找托盘、问同事」。
 /// 主按钮 = 「开始激活」，后端按状态自动分流（未装 dsh 先装、已装直接激活）。
-fn welcome_html() -> String {
-    r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>激活数字分身</title>
-<style>
-  :root{--bg:#1a2233;--card:#232c40;--text:#e6eaf2;--muted:#8b95a9;--green:#4ade80;--blue:#60a5fa;--line:#2d3650}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:24px;font-size:13.5px;line-height:1.7}
-  h1{font-size:20px;margin-bottom:6px}
-  .sub{font-size:12.5px;color:var(--muted);margin-bottom:18px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:12px}
-  .card h2{font-size:13px;color:var(--blue);margin-bottom:8px}
-  .steps{list-style:none;counter-reset:s}
-  .steps li{counter-increment:s;position:relative;padding-left:26px;margin:7px 0;font-size:13px}
-  .steps li::before{content:counter(s);position:absolute;left:0;top:1px;width:18px;height:18px;border-radius:50%;
-    background:var(--blue);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
-  .tip{background:#1f2937;border-left:3px solid var(--blue);border-radius:6px;padding:10px 12px;font-size:12.5px;color:var(--muted);margin-bottom:16px}
-  .tip b{color:var(--text)}
-  .btn{width:100%;padding:13px;border-radius:9px;border:0;cursor:pointer;font-size:15px;font-weight:700;margin-bottom:9px}
-  .btn-primary{background:var(--green);color:#fff}
-  .btn-primary:disabled{opacity:.55;cursor:not-allowed}
-  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--line);font-weight:500;font-size:13px}
-  .btn-ghost:hover{color:var(--text)}
-  .status{font-size:12.5px;min-height:18px;text-align:center;color:var(--muted)}
-  .status.ok{color:var(--green)} .status.err{color:#f87171}
-</style>
-</head>
-<body>
-  <h1>🤖 激活你的数字分身</h1>
-  <div class="sub">欢迎使用！点下面的按钮，用公司账号一键认领你的数字分身。</div>
-
-  <div class="card">
-    <h2>接下来会自动完成</h2>
-    <ol class="steps">
-      <li>下载并安装运行环境（首次约几分钟）</li>
-      <li>用公司账号登录，自动认领你的 @ai-xxx 数字分身</li>
-      <li>选择你的岗位，分身即可在聊天工具里 @ 使用</li>
-    </ol>
-  </div>
-
-  <div class="tip">
-    <b>小提示：</b>完成后数字分身常驻在右下角托盘区（点 <b>^</b> 可看到图标），
-    以后从托盘图标打开它。
-  </div>
-
-  <button class="btn btn-primary" id="activate">🚀 开始激活</button>
-  <button class="btn btn-ghost" id="close">稍后再说（可从托盘图标随时打开）</button>
-  <div class="status" id="status"></div>
-
-<script>
-(function(){
-  const $=id=>document.getElementById(id);
-  $("activate").onclick=async()=>{
-    const st=$("status"); st.className="status"; st.textContent="正在准备…";
-    $("activate").disabled=true;
-    try{
-      const r=await fetch("http://first-run.localhost/activate",{method:"POST"});
-      const j=await r.json();
-      if(j.ok){
-        st.className="status ok";
-        st.textContent="✓ 已开始——接下来会自动安装环境并进入激活，请稍候。";
-      } else { st.className="status err"; st.textContent="✗ "+(j.error||"启动失败"); $("activate").disabled=false; }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activate").disabled=false; }
-  };
-  $("close").onclick=()=>{ fetch("http://first-run.localhost/close",{method:"POST"}).catch(()=>{}); };
-})();
-</script>
-</body>
-</html>"#
-        .to_string()
+fn welcome_html<R: Runtime>(app: &AppHandle<R>) -> String {
+    // 双轨：服务端下发版优先（同步拉取，本地缓存），离线回落编译期内嵌
+    crate::embedded::first_run_html(app)
 }

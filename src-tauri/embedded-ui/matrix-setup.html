@@ -1,0 +1,688 @@
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>配置数字分身</title>
+<style>
+  :root{--bg:#1a2233;--card:#232c40;--text:#e6eaf2;--muted:#8b95a9;--green:#4ade80;--amber:#fbbf24;--red:#f87171;--blue:#60a5fa;--line:#2d3650}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:18px;font-size:13px;line-height:1.6}
+  h1{font-size:16px;margin-bottom:4px}
+  .sub{font-size:12px;color:var(--muted);margin-bottom:14px}
+  .section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+  .section h2{font-size:13px;margin-bottom:10px;color:var(--blue)}
+  label{display:block;font-size:12px;color:var(--muted);margin:8px 0 4px}
+  input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:#161d2e;color:var(--text);font-size:13px}
+  input:focus{outline:none;border-color:var(--blue)}
+  .hint{font-size:11px;color:var(--muted);margin-top:3px}
+  .row{display:flex;gap:8px;align-items:center}
+  .btn{padding:9px 16px;border-radius:8px;border:0;cursor:pointer;font-size:13px;font-weight:600}
+  .btn-primary{background:var(--blue);color:#fff}
+  .btn-primary:disabled{opacity:.5;cursor:not-allowed}
+  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--line)}
+  .btn-ghost:hover{color:var(--text)}
+  .status{margin-top:10px;font-size:12px;min-height:18px}
+  .status.ok{color:var(--green)} .status.err{color:var(--red)} .status.info{color:var(--muted)}
+  .token-toggle{margin:6px 0}
+  .token-toggle a{color:var(--blue);cursor:pointer;font-size:12px;text-decoration:none}
+  .secret-mode{display:none}
+  .step-done{color:var(--green)}
+  .cfg-table{width:100%;border-collapse:collapse;font-size:12px}
+  .cfg-table td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  .cfg-key{color:var(--muted);width:90px;white-space:nowrap}
+  .cfg-val{color:var(--text);word-break:break-all}
+  .cfg-val.empty{color:var(--muted)}
+  /* ① 选岗位：勾选预装 + 单选默认岗位 */
+  .job-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .job-chip{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border:1px solid var(--line);border-radius:16px;background:#161d2e;color:var(--text);font-size:12px;cursor:pointer;user-select:none}
+  .job-chip.checked{border-color:var(--green);color:var(--green);background:#1c2a24}
+  .job-chip .tick{width:14px;text-align:center}
+  .job-chip input{display:none}
+  /* 必选岗位（秘书/前台）：锁定不可取消，置灰 + 必选徽标 */
+  .job-chip.fixed{cursor:not-allowed;border-color:var(--amber);background:#2a2418}
+  .job-chip.fixed .job-fixed{font-size:10px;color:var(--amber);border:1px solid var(--amber);border-radius:8px;padding:0 4px;margin-left:2px}
+  .job-radio{display:flex;align-items:center;gap:8px;padding:7px 10px;margin:0 0 6px;border:1px solid var(--line);border-radius:8px;font-size:13px;color:var(--text);cursor:pointer;background:#141a28}
+  .job-radio:hover{border-color:var(--blue)}
+  .job-radio input{margin:0;flex:none;width:auto;padding:0}
+  .job-radio .job-label{font-weight:500;flex:none;white-space:nowrap}
+  .job-radio .job-label .job-id{font-size:10px;color:var(--muted);margin-left:4px;font-weight:400}
+  .job-radio .job-desc{font-size:11px;color:var(--muted);flex:1;min-width:0}
+  .job-hint{font-size:11px;color:var(--muted);margin:6px 0 8px}
+  .roster-toggle{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--text);cursor:pointer;background:#141a28;margin-bottom:4px}
+  .roster-toggle:hover{border-color:var(--blue)}
+  .roster-toggle input{margin:0;width:auto;flex:none;padding:0}
+  .roster-toggle .roster-label{font-weight:500;white-space:nowrap}
+  .roster-toggle .roster-desc{font-size:11px;color:var(--muted)}
+</style>
+</head>
+<body>
+  <h1>🤖 配置数字分身</h1>
+  <div class="sub">分两步完成：<b>① 安装运行环境</b> → <b>② 领数字人并启动</b>。安装可以慢慢来，领号很快。</div>
+
+  <!-- 已激活成功态：configured 分支（账号已激活，不再引导安装/领号） -->
+  <div class="section" id="readySection" style="border-color:var(--green);display:none">
+    <h2 style="color:var(--green)">✅ 数字分身已就绪</h2>
+    <div class="hint" style="margin-bottom:10px">你的数字分身已激活并配置完成，随时可以开工。</div>
+    <table class="cfg-table" style="margin-bottom:10px">
+      <tr><td class="cfg-key">分身账号</td><td class="cfg-val" id="readyUid">—</td></tr>
+      <tr><td class="cfg-key">服务器</td><td class="cfg-val" id="readyHs">—</td></tr>
+    </table>
+    <button class="btn btn-primary" id="launchReadyBtn" style="width:100%;background:var(--green)">🚀 启动数字分身</button>
+    <div class="status" id="readyStatus"></div>
+    <div id="readyProgress" style="display:none;margin-top:12px">
+      <div class="progress-wrap" style="background:#141a28;border:1px solid var(--line);border-radius:8px;padding:10px 12px">
+        <div class="progress-label" style="font-size:12px;margin-bottom:6px;display:flex;justify-content:space-between">
+          <span id="readyOpStep" style="color:var(--text)">准备中…</span><span id="readyOpPercent" style="color:var(--muted)"></span>
+        </div>
+        <div class="bar" style="height:7px;background:#2d3650;border-radius:4px;overflow:hidden">
+          <div class="bar-fill" id="readyOpBar" style="height:100%;background:linear-gradient(90deg,var(--blue),var(--green));border-radius:4px;width:0%;transition:width .3s"></div>
+        </div>
+        <div id="readyOpSteps" style="margin-top:8px;font-size:12px;max-height:132px;overflow-y:auto;line-height:1.7"></div>
+        <div id="readyOpLog" style="margin-top:6px;font-size:11px;color:var(--muted);max-height:96px;overflow-y:auto;line-height:1.6;font-family:ui-monospace,Consolas,monospace"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 阶段一：安装运行环境 -->
+  <div class="section" id="installSection" style="border-color:var(--blue)">
+    <h2 style="color:var(--blue)">① 安装运行环境</h2>
+    <div class="hint" style="margin-bottom:10px">首次使用需要下载并安装运行环境（Node + 数字分身核心 + 插件）。时间取决于网速，一般几分钟。</div>
+    <button class="btn btn-primary" id="installBtn" style="width:100%;background:var(--blue)">⬇️ 开始安装运行环境</button>
+    <button class="btn btn-primary" id="retryInstallBtn" style="width:100%;background:var(--amber);display:none;margin-top:8px">🔄 重试安装</button>
+    <div class="status" id="installStatus"></div>
+    <!-- 安装进度（阶段一专用；与阶段二共用 op-state 协议） -->
+    <div id="installProgress" style="display:none;margin-top:12px">
+      <div class="progress-wrap" style="background:#141a28;border:1px solid var(--line);border-radius:8px;padding:10px 12px">
+        <div class="progress-label" style="font-size:12px;margin-bottom:6px;display:flex;justify-content:space-between">
+          <span id="installOpStep" style="color:var(--text)">准备中…</span><span id="installOpPercent" style="color:var(--muted)"></span>
+        </div>
+        <div class="bar" style="height:7px;background:#2d3650;border-radius:4px;overflow:hidden">
+          <div class="bar-fill" id="installOpBar" style="height:100%;background:linear-gradient(90deg,var(--blue),var(--green));border-radius:4px;width:0%;transition:width .3s"></div>
+        </div>
+        <div id="installOpSteps" style="margin-top:8px;font-size:12px;max-height:132px;overflow-y:auto;line-height:1.7"></div>
+        <div id="installOpLog" style="margin-top:6px;font-size:11px;color:var(--muted);max-height:96px;overflow-y:auto;line-height:1.6;font-family:ui-monospace,Consolas,monospace"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 阶段二：领号启动（默认隐藏，环境就绪后显示） -->
+  <div class="section" id="activateSection" style="border-color:var(--green);display:none">
+    <h2 style="color:var(--green)">② 领数字人并启动</h2>
+    <div class="hint" style="margin-bottom:10px">用公司 SSO（Keycloak）登录，自动认领你的 @ai-你的邮箱前缀 数字分身。无需密码、无需 token。</div>
+    <button class="btn btn-primary" id="activateBtn" style="width:100%;background:var(--green)">🚀 立即领号并启动数字分身</button>
+    <div class="status" id="activateStatus"></div>
+    <!-- 内嵌进度区（单窗口一贯流程）：激活/安装进度直接显示在向导窗口内，
+         不再弹独立「操作进度」窗。由 activateBtn 触发后显示，轮询 /op-state 刷新。 -->
+    <div id="opProgress" style="display:none;margin-top:12px">
+      <div class="progress-wrap" style="background:#141a28;border:1px solid var(--line);border-radius:8px;padding:10px 12px">
+        <div class="progress-label" style="font-size:12px;margin-bottom:6px;display:flex;justify-content:space-between">
+          <span id="opStep" style="color:var(--text)">准备中…</span><span id="opPercent" style="color:var(--muted)"></span>
+        </div>
+        <div class="bar" style="height:7px;background:#2d3650;border-radius:4px;overflow:hidden">
+          <div class="bar-fill" id="opBar" style="height:100%;background:linear-gradient(90deg,var(--blue),var(--green));border-radius:4px;width:0%;transition:width .3s"></div>
+        </div>
+        <div id="opSteps" style="margin-top:8px;font-size:12px;max-height:132px;overflow-y:auto;line-height:1.7"></div>
+        <div id="opLog" style="margin-top:6px;font-size:11px;color:var(--muted);max-height:96px;overflow-y:auto;line-height:1.6;font-family:ui-monospace,Consolas,monospace"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2 style="color:var(--blue)">📡 当前连接配置（服务端下发，只读）</h2>
+    <div class="hint" style="margin-bottom:10px">以下连接参数由服务端统一下发（激活时自动写入），本地不可手改，用于排查连接问题。</div>
+    <table class="cfg-table">
+      <tr><td class="cfg-key">服务器地址</td><td class="cfg-val" id="viewHs">—</td></tr>
+      <tr><td class="cfg-key">分身账号</td><td class="cfg-val" id="viewUid">—</td></tr>
+      <tr><td class="cfg-key">主人账号</td><td class="cfg-val" id="viewOwner">—</td></tr>
+      <tr><td class="cfg-key">访问令牌</td><td class="cfg-val" id="viewToken">—</td></tr>
+    </table>
+  </div>
+
+  <div class="section" id="manualSection" style="display:none">
+    <h2 style="color:var(--amber)">🛠 手动配置（开发者）</h2>
+    <div class="hint" style="margin-bottom:10px">已启用开发者手动配置开关（matrixManualConfig）。此处可手填连接参数，覆盖服务端下发值，用于测试环境联调。</div>
+    <label>服务器地址（homeserverUrl）</label>
+    <input id="mHs" placeholder="https://matrix.example.com">
+    <label>分身账号（userId）</label>
+    <input id="mUid" placeholder="@ai-xxx:example.com">
+    <label>主人账号（owner，可选）</label>
+    <input id="mOwner" placeholder="@owner:example.com">
+    <label>访问令牌（accessToken）</label>
+    <input id="mToken" type="password" placeholder="syt_...">
+    <div class="token-toggle"><a id="toggleToken" onclick="return false">显示令牌</a></div>
+    <button class="btn btn-primary" id="submitBtn" style="width:100%">保存手动配置</button>
+    <div class="status" id="manualStatus"></div>
+  </div>
+
+  <div class="section" id="pendingSection" style="display:none">
+    <h2 style="color:var(--amber)">📋 订阅 / 安装清单</h2>
+    <div class="hint" style="margin-bottom:8px">你的账号已订阅以下能力，但本地尚未安装或版本落后。点「安装 / 修复」会自动补齐。</div>
+    <div id="pendingList" style="font-size:12px"></div>
+  </div>
+
+  <div class="section" id="jobSection" style="display:none">
+    <h2 style="color:var(--blue)">💼 选择岗位（重点）</h2>
+    <div class="hint">勾选要**预装**的岗位（会下载对应岗位技能，默认全选，可去掉不需要的）；再选一个**默认岗位**（分身激活后默认以它开工）。</div>
+    <div class="job-hint">预装岗位：</div>
+    <div class="job-list" id="jobList"></div>
+    <div class="job-hint" style="margin-top:12px">默认岗位（上岗后默认启用哪一个）：</div>
+    <div id="defaultJobRadios" style="font-size:12px"></div>
+    <div class="job-hint" style="margin-top:12px">附加能力：</div>
+    <label class="roster-toggle">
+      <input type="checkbox" id="rosterToggle">
+      <span class="roster-label">开启花名册</span>
+      <span class="roster-desc">对外登记「我在做什么」（当前工作 / 已完成），供同事查询你的数字分身动态</span>
+    </label>
+    <button class="btn btn-primary" id="saveJobsBtn" style="width:100%;margin-top:14px">💾 保存岗位设置并完成</button>
+    <div class="status" id="jobStatus"></div>
+  </div>
+
+  <div class="status" id="status"></div>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  // 岗位 id → 中文名映射（与服务端 dsh-launcher-center 的 BUILTIN_JOBS 保持一致）。
+  // 清单外的岗位（员工自建）没有中文名，就回退显示原始 id。
+  const JOB_LABELS = {
+    "pm":"产品经理","dev":"研发工程师","qa":"测试工程师","leader":"团队负责人",
+    "newbie":"新员工","general":"通用","secretary":"秘书","reception":"前台接待"
+  };
+  // 岗位中文描述（说明该岗位负责什么，帮小白选岗）。
+  const JOB_DESC = {
+    "pm":"产品需求、PRD、需求澄清与优先级",
+    "dev":"接口联调、告警定位、排期评估、技术方案",
+    "qa":"测试用例、缺陷跟踪、验收",
+    "leader":"任务分配、进度跟进、决策驱动",
+    "newbie":"新员工上手引导与答疑",
+    "general":"通用办公助手",
+    "secretary":"请示分级、决策回传、上呈主人、转达话术",
+    "reception":"访客接待、咨询分流"
+  };
+  const jobLabel=id=>JOB_LABELS[id] || id;
+  const jobDesc=id=>JOB_DESC[id] || "";
+  // ⭐ 必选岗位（固定项，不可取消）。
+  // 秘书/前台是数字分身正常工作的基础能力（请示分级/上呈主人 + 访客接待/咨询分流），
+  // 取消后分身不完整、无法正常工作，故锁定为始终勾选（UI 置灰 + 提交时强制保证）。
+  const MANDATORY_JOBS = new Set(["secretary","reception"]);
+
+  // ⭐ 阶段二「自动衔接领号」：环境就绪（phase=ready）时自动开浏览器 SSO，无需再点。
+  // 幂等：只触发一次（标志位），避免多次 /state 轮询重复打开浏览器。
+  let autoActivated = false;
+  function autoActivateOnce(){
+    if(autoActivated) return;
+    autoActivated = true;
+    const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
+    startOpPolling();
+    fetch("http://matrix-setup.localhost/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})
+      .then(r=>r.json()).then(j=>{
+        if(j.ok){
+          st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。</span>';
+          // 轮询 /state 等激活完成（configured）→ 渲染岗位区；失败感知 last_activation_error
+          let tries=0;
+          const poll=setInterval(async()=>{
+            tries++;
+            if(tries>90){ clearInterval(poll); $("activateBtn").disabled=false; st.className="status err"; st.textContent="✗ 激活超时未完成，请点下方按钮重试。"; return; }
+            try{
+              const s=await (await fetch("http://matrix-setup.localhost/state")).json();
+              if(s.last_activation_error){
+                clearInterval(poll);
+                st.className="status err";
+                st.textContent="✗ "+(s.last_activation_error||"激活失败，请重试");
+                $("activateBtn").disabled=false;
+                return;
+              }
+              if(s.status==="configured"){
+                clearInterval(poll);
+                st.className="status ok";
+                st.textContent="✓ 已激活！";
+                $("activateSection").style.display="none";
+                if(s.job_presets && s.job_presets.length){ renderJobSection(s); }
+              }
+            }catch(e){}
+          },1500);
+        } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
+      })
+      .catch(()=>{ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; });
+  }
+
+  // ⭐ 阶段一「开始 / 重试安装」：触发 install_all（幂等），轮询 install 进度。
+  // 安装 op 完成后，重新拉 /state（phase 应变 ready），自动进入阶段二领号。
+  function startInstall(){
+    const st=$("installStatus"); st.className="status info"; st.textContent="正在安装运行环境（约几分钟）…";
+    $("installBtn").disabled=true; $("retryInstallBtn").disabled=true;
+    startInstallOpPolling();
+    fetch("http://matrix-setup.localhost/retry-install",{method:"POST"})
+      .then(r=>r.json()).then(j=>{
+        if(!j.ok){ st.className="status err"; st.textContent="✗ "+(j.error||"安装启动失败"); $("installBtn").disabled=false; $("retryInstallBtn").disabled=false; }
+      })
+      .catch(()=>{ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("installBtn").disabled=false; $("retryInstallBtn").disabled=false; });
+  }
+  $("installBtn").onclick=startInstall;
+  $("retryInstallBtn").onclick=startInstall;
+
+  // 只读展示：加载当前连接配置（服务端下发 + 激活写入），用于排查，不允许本地手改
+  fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{    $("viewHs").textContent = s.homeserver_url || "（未下发）";
+    $("viewUid").textContent = s.user_id || "（未激活）";
+    $("viewOwner").textContent = s.owner || "（未设置）";
+    $("viewToken").textContent = s.access_token_set ? "已写入（明文不在此展示）" : "（未写入）";
+    // ⭐ 两阶段分流：phase=not-installed（阶段一）→ 显示安装区；
+    //                 phase=ready（阶段二就绪）→ 显示领号区 + 自动激活；
+    //                 phase=configured → 显示岗位区。
+    const phase = s.phase || "not-installed";
+    if(s.status==="configured"){
+      // ✅ 已激活：展示「数字分身已就绪」成功态（不再显示误导的安装提示）
+      $("status").innerHTML='<span class="ok">✅ 数字分身已激活并配置完成。</span>';
+      $("readyUid").textContent = s.user_id || "（未显示）";
+      $("readyHs").textContent = s.homeserver_url || "（未下发）";
+      const launchBtn=$("launchReadyBtn");
+      if(s.launcher_running){
+        launchBtn.textContent="🟢 数字分身运行中";
+        launchBtn.disabled=true;
+        $("readyStatus").className="status ok";
+        $("readyStatus").textContent="✓ 正在运行。";
+      } else {
+        launchBtn.textContent="🚀 启动数字分身";
+        launchBtn.disabled=false;
+        $("readyStatus").textContent="";
+      }
+      $("readySection").style.display="block";
+    }
+    else if(s.status==="ready-activate"){ $("status").innerHTML='<span class="info">运行环境已就绪，正在自动领号…</span>'; }
+    else if(s.status==="not-installed"){ $("status").innerHTML='<span class="info">请先完成第一步「安装运行环境」。</span>'; }
+    else if(s.status==="unconfigured"){ $("status").innerHTML='<span class="info">尚未完成激活。请点上方「领号」。</span>'; }
+    if(phase==="not-installed"){
+      $("installSection").style.display="block";
+      $("activateSection").style.display="none";
+    } else if(phase==="ready"){
+      $("installSection").style.display="none";
+      $("activateSection").style.display="block";
+      // ⭐ 装完自动衔接领号（你选择的体验）：环境就绪后无需再点，自动开浏览器 SSO
+      autoActivateOnce();
+    } else {
+      // configured 或其它：两阶段都完成
+      $("installSection").style.display="none";
+      $("activateSection").style.display="none";
+    }
+    // 开发者手动配置开关：matrixManualConfig=true 时显示手填区块并预填当前值
+    if(s.manual_config_enabled){
+      $("manualSection").style.display="block";
+      $("mHs").value = s.homeserver_url || "";
+      $("mUid").value = s.user_id || "";
+      $("mOwner").value = s.owner || "";
+      // access token 不回传明文，仅占位提示
+      $("mToken").placeholder = s.access_token_set ? "已设置（留空则保持不变）" : "syt_...";
+    }
+    // 订阅/安装清单差异
+    if(s.pending_plugins && s.pending_plugins.length){
+      const list=$("pendingList"); list.innerHTML="";
+      s.pending_plugins.forEach(p=>{
+        const tag = p.action==="update"
+          ? '<span style="color:var(--amber)">待更新</span>'
+          : '<span style="color:var(--blue)">待安装</span>';
+        const ver = p.installed ? ` <span style="color:var(--muted)">（已装 ${esc(p.installed)} → ${esc(p.latest||"最新")}）</span>` : "";
+        const div=document.createElement("div");
+        div.style.cssText="padding:4px 0;border-bottom:1px solid var(--line)";
+        div.innerHTML=`${tag} <strong>${esc(p.name)}</strong>${ver}`;
+        list.appendChild(div);
+      });
+      $("pendingSection").style.display="block";
+    }
+    // 岗位选择：仅在「已激活」（status=configured）且有服务端下发的候选岗位时展示。
+    // 未激活时（unconfigured/not-installed/ready-activate）不展示——先完成激活再选岗位。
+    if(s.status==="configured"){ renderJobSection(s); }
+    // 单窗口一贯流程：页面加载时若有进行中的操作（安装/激活），自动开启内嵌
+    // 进度轮询——覆盖「first_run 装完自动激活」「返回向导继续」等无人点击的路径。
+    fetch("http://matrix-setup.localhost/op-state").then(r=>r.json()).then(op=>{
+      if(op && (op.state==="running"||op.state==="pending")){
+        // launch 类操作（已激活态启动分身）渲染到 ready 区块，其余（安装/激活）到 op 区块
+        if(op.id==="launch"){ startReadyOpPolling(); } else { startOpPolling(); }
+      }
+    }).catch(()=>{});
+  }).catch(()=>{});
+
+  // 渲染岗位选择区块。candidates = 服务端 jobPresets；defaultJob = 当前已落盘默认岗位。
+  // 首次激活后：默认全选 + 默认岗位为空（等用户选）；已保存过：回显当前值。
+  let jobPresets = [];      // 服务端候选（默认全选基础）
+  let jobSelected = new Set();
+  let jobDefault = "";
+  let jobRosterEnabled = false;   // 花名册开关（独立能力，不挂岗位）
+  let jobInitialized = false;
+  function renderJobSection(s){
+    const cands = s.job_presets || [];
+    if(!cands.length){ $("jobSection").style.display="none"; return; }
+    if(jobInitialized){ return; }  // 只初始化一次，避免轮询/重复渲染覆盖用户已选
+    jobPresets = cands;
+    jobSelected = new Set(cands);          // 默认全选
+    MANDATORY_JOBS.forEach(j=>jobSelected.add(j)); // 必选岗位始终在选（即使候选清单缺它们）
+    jobDefault = s.default_job || "";      // 回显当前默认岗位（可为空）
+    jobRosterEnabled = !!s.roster_enabled; // 回显当前花名册开关
+    if($("rosterToggle")) $("rosterToggle").checked = jobRosterEnabled;
+    jobInitialized = true;
+    paintJobChips();
+    $("jobSection").style.display="block";
+  }
+  function paintJobChips(){
+    // 预装岗位勾选 chips
+    const list=$("jobList"); list.innerHTML="";
+    jobPresets.forEach(j=>{
+      const on=jobSelected.has(j);
+      const fixed=MANDATORY_JOBS.has(j);
+      const chip=document.createElement("div");
+      chip.className="job-chip"+(on?" checked":"")+(fixed?" fixed":"");
+      chip.innerHTML='<span class="tick">'+(on?"✓":"○")+'</span>'+esc(jobLabel(j))
+        +(fixed?'<span class="job-fixed" title="分身正常工作必需，不可取消">必选</span>':'');
+      chip.onclick=()=>{
+        // 必选岗位锁定：点击不取消（保持勾选态）；非必选岗位正常 toggle
+        if(fixed) return;
+        if(jobSelected.has(j)) jobSelected.delete(j); else jobSelected.add(j);
+        paintJobChips();
+      };
+      list.appendChild(chip);
+    });
+    // 默认岗位单选（每行一个：中文名 + 中文描述 + 岗位 id）
+    const radios=$("defaultJobRadios"); radios.innerHTML="";
+    const mkRadio=(val,label,desc,checked)=>{
+      const lab=document.createElement("label");
+      lab.className="job-radio";
+      const descHtml = desc ? '<span class="job-desc">'+esc(desc)+'</span>' : '';
+      const idBadge = (val!=='') ? '<span class="job-id">'+esc(val)+'</span>' : '';
+      lab.innerHTML='<input class="radio" type="radio" name="defaultJob" value="'+esc(val)+'"'+(checked?" checked":"")+'>'
+        +'<span class="job-label">'+esc(label)+idBadge+'</span>'
+        +descHtml;
+      const inp=lab.querySelector("input");
+      inp.onchange=()=>{ jobDefault=val; };
+      radios.appendChild(lab);
+    };
+    mkRadio("","不指定","", jobDefault==="");
+    jobPresets.forEach(j=>{ mkRadio(j, jobLabel(j), jobDesc(j), jobDefault===j); });
+  }
+
+  // 保存岗位设置：勾选的预装清单 + 默认岗位 + 花名册开关 → POST /jobs → 关窗
+  $("saveJobsBtn").onclick=async()=>{
+    const st=$("jobStatus"); st.className="status info"; st.textContent="正在保存岗位设置…";
+    $("saveJobsBtn").disabled=true;
+    if($("rosterToggle")) jobRosterEnabled = $("rosterToggle").checked;
+    // 必选岗位强制合入：无论前端如何勾选（含绕过锁定逻辑），保存时秘书/前台始终在清单里
+    MANDATORY_JOBS.forEach(j=>jobSelected.add(j));
+    const payload={ jobs:Array.from(jobSelected), defaultJob:jobDefault, rosterEnabled:jobRosterEnabled };
+    try{
+      const r=await fetch("http://matrix-setup.localhost/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const j=await r.json();
+      if(j.ok){
+        st.innerHTML='<span class="ok">✓ 岗位设置已保存，向导即将关闭。</span>';
+        // 单窗口流程收口：保存成功后 1500ms 前端自动关窗
+        setTimeout(()=>{ try{ window.close(); }catch(e){} }, 1500);
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"保存失败"); $("saveJobsBtn").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("saveJobsBtn").disabled=false; }
+  };
+
+  // 内嵌进度区渲染（单窗口一贯流程）：读取 ops 当前操作并绘制。
+  // 调用方在激活开始后调用一次；轮询周期由调用方 setInterval 控制。
+  let opPollTimer = null;
+  function showOpProgress(){ $("opProgress").style.display="block"; }
+  function renderOp(op){
+    if(!op){ $("opStep").textContent="准备中…"; $("opPercent").textContent=""; $("opBar").style.width="0%"; $("opSteps").innerHTML=""; $("opLog").innerHTML=""; return; }
+    $("opStep").textContent=op.current_step||"…";
+    let pct=0;
+    if(op.state==="done"||op.state==="failed") pct=100;
+    else if(op.steps&&op.steps.length){ pct=Math.round(op.steps.filter(s=>s.state==="done"||s.state==="failed").length/op.steps.length*100); }
+    $("opBar").style.width=pct+"%";
+    $("opPercent").textContent=pct? (pct+"%") : "";
+    if(op.steps&&op.steps.length){
+      $("opSteps").innerHTML=op.steps.map(s=>{
+        const cls=s.state==="done"?"<span style='color:var(--green)'>✓</span>"
+          :(s.state==="running"?"<span style='color:var(--blue)'>⏳</span>"
+          :(s.state==="failed"?"<span style='color:var(--red)'>✗</span>":"<span style='color:var(--muted)'>○</span>"));
+        const col=s.state==="done"?"var(--green)":(s.state==="running"?"var(--text)":(s.state==="failed"?"var(--red)":"var(--muted)"));
+        return '<div style="color:'+col+'">'+cls+' '+esc(s.label)+'</div>';
+      }).join("");
+    }
+    if(op.log&&op.log.length){
+      $("opLog").innerHTML=op.log.map(l=>{ const bad=(l.startsWith("[失败]")||l.startsWith("✗")); return '<div style="color:'+(bad?"var(--red)":"var(--muted)")+'">'+esc(l)+'</div>'; }).join("");
+      $("opLog").scrollTop=$("opLog").scrollHeight;
+    }
+    // 失败：恢复按钮（感知 last error 的兜底，正常由 /state 的 last_activation_error 处理）
+    if(op.state==="failed"){
+      $("activateStatus").className="status err";
+      $("activateStatus").textContent="✗ "+(op.result||"操作失败，请重试");
+      $("activateBtn").disabled=false;
+    } else if(op.state==="done"){
+      $("activateStatus").className="status ok";
+      $("activateStatus").textContent="✓ "+(op.result||"完成");
+      // 激活类操作完成且无岗位候选 → 单窗口收口：稍候自动关窗（有候选则留给选岗位区块）。
+      // 安装类操作（install）完成不该关窗——那是激活前的准备阶段，向导还要继续。
+      if(op.id==="matrix-activate"||op.id==="auto-resume-activate"){
+        fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
+          const hasJobs = s.job_presets && s.job_presets.length;
+          if(!hasJobs){
+            st.innerHTML='<span class="ok">✓ 完成！窗口即将自动关闭，数字分身已在托盘运行。</span>';
+            setTimeout(()=>{ try{ window.close(); }catch(e){} }, 2000);
+          }
+        }).catch(()=>{});
+      }
+    }
+  }
+  function startOpPolling(){
+    showOpProgress();
+    if(opPollTimer) clearInterval(opPollTimer);
+    renderOp(null);
+    opPollTimer=setInterval(()=>{
+      fetch("http://matrix-setup.localhost/op-state").then(r=>r.json()).then(op=>{
+        renderOp(op);
+        // 激活终态（done）且已有岗位候选 → 停止轮询，让 /state 轮询接管选岗位
+        if(op && op.state==="done"){ clearInterval(opPollTimer); }
+      }).catch(()=>{});
+    },1500);
+  }
+
+  // 「数字分身已就绪」区块的启动进度轮询（复用 renderOp 的样式，渲染到 ready 那组元素）。
+  // launch op done/failed → 停止轮询；**不关窗**（已激活机器启动后保留窗口展示运行中态）。
+  let readyOpPollTimer = null;
+  function startReadyOpPolling(){
+    $("readyProgress").style.display="block";
+    if(readyOpPollTimer) clearInterval(readyOpPollTimer);
+    const render = (op)=>{
+      if(!op){ $("readyOpStep").textContent="准备中…"; $("readyOpPercent").textContent=""; $("readyOpBar").style.width="0%"; $("readyOpSteps").innerHTML=""; $("readyOpLog").innerHTML=""; return; }
+      $("readyOpStep").textContent=op.current_step||"…";
+      let pct=0;
+      if(op.state==="done"||op.state==="failed") pct=100;
+      else if(op.steps&&op.steps.length){ pct=Math.round(op.steps.filter(s=>s.state==="done"||s.state==="failed").length/op.steps.length*100); }
+      $("readyOpBar").style.width=pct+"%";
+      $("readyOpPercent").textContent=pct? (pct+"%") : "";
+      if(op.steps&&op.steps.length){
+        $("readyOpSteps").innerHTML=op.steps.map(s=>{
+          const cls=s.state==="done"?"<span style='color:var(--green)'>✓</span>"
+            :(s.state==="running"?"<span style='color:var(--blue)'>⏳</span>"
+            :(s.state==="failed"?"<span style='color:var(--red)'>✗</span>":"<span style='color:var(--muted)'>○</span>"));
+          const col=s.state==="done"?"var(--green)":(s.state==="running"?"var(--text)":(s.state==="failed"?"var(--red)":"var(--muted)"));
+          return '<div style="color:'+col+'">'+cls+' '+esc(s.label)+'</div>';
+        }).join("");
+      }
+      if(op.log&&op.log.length){
+        $("readyOpLog").innerHTML=op.log.map(l=>{ const bad=(l.startsWith("[失败]")||l.startsWith("✗")); return '<div style="color:'+(bad?"var(--red)":"var(--muted)")+'">'+esc(l)+'</div>'; }).join("");
+        $("readyOpLog").scrollTop=$("readyOpLog").scrollHeight;
+      }
+      const st=$("readyStatus");
+      if(op.state==="failed"){
+        st.className="status err";
+        st.textContent="✗ "+(op.result||"启动失败，请重试");
+        $("launchReadyBtn").disabled=false;
+        $("launchReadyBtn").textContent="🚀 启动数字分身";
+      } else if(op.state==="done"){
+        st.className="status ok";
+        st.textContent="✓ 数字分身已启动。";
+        // done 后刷新按钮态：/state 的 launcher_running 应为 true → 显示「运行中」
+        fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
+          if(s.launcher_running){
+            $("launchReadyBtn").textContent="🟢 数字分身运行中";
+            $("launchReadyBtn").disabled=true;
+            st.textContent="✓ 数字分身运行中，可在 Matrix 客户端 @ 它试试。";
+          }
+        }).catch(()=>{});
+      }
+    };
+    render(null);
+    readyOpPollTimer=setInterval(()=>{
+      fetch("http://matrix-setup.localhost/op-state").then(r=>r.json()).then(op=>{
+        render(op);
+        if(op && (op.state==="done"||op.state==="failed")){ clearInterval(readyOpPollTimer); }
+      }).catch(()=>{});
+    },1500);
+  }
+
+  // ⭐ 阶段一「安装进度」轮询：渲染到 install 那组元素。
+  // 安装 op（id="install"）done → 自动切到阶段二领号（重新拉 /state，phase 应变 ready，
+  // 由状态渲染逻辑触发 autoActivateOnce）；失败 → 显示「重试安装」按钮。
+  let installPollTimer = null;
+  function startInstallOpPolling(){
+    $("installProgress").style.display="block";
+    if(installPollTimer) clearInterval(installPollTimer);
+    const render = (op)=>{
+      if(!op){ $("installOpStep").textContent="准备中…"; $("installOpPercent").textContent=""; $("installOpBar").style.width="0%"; $("installOpSteps").innerHTML=""; $("installOpLog").innerHTML=""; return; }
+      $("installOpStep").textContent=op.current_step||"…";
+      let pct=0;
+      if(op.state==="done"||op.state==="failed") pct=100;
+      else if(op.steps&&op.steps.length){ pct=Math.round(op.steps.filter(s=>s.state==="done"||s.state==="failed").length/op.steps.length*100); }
+      $("installOpBar").style.width=pct+"%";
+      $("installOpPercent").textContent=pct? (pct+"%") : "";
+      if(op.steps&&op.steps.length){
+        $("installOpSteps").innerHTML=op.steps.map(s=>{
+          const cls=s.state==="done"?"<span style='color:var(--green)'>✓</span>"
+            :(s.state==="running"?"<span style='color:var(--blue)'>⏳</span>"
+            :(s.state==="failed"?"<span style='color:var(--red)'>✗</span>":"<span style='color:var(--muted)'>○</span>"));
+          const col=s.state==="done"?"var(--green)":(s.state==="running"?"var(--text)":(s.state==="failed"?"var(--red)":"var(--muted)"));
+          return '<div style="color:'+col+'">'+cls+' '+esc(s.label)+'</div>';
+        }).join("");
+      }
+      if(op.log&&op.log.length){
+        $("installOpLog").innerHTML=op.log.map(l=>{ const bad=(l.startsWith("[失败]")||l.startsWith("✗")); return '<div style="color:'+(bad?"var(--red)":"var(--muted)")+'">'+esc(l)+'</div>'; }).join("");
+        $("installOpLog").scrollTop=$("installOpLog").scrollHeight;
+      }
+      const st=$("installStatus");
+      if(op.state==="failed"){
+        st.className="status err";
+        st.textContent="✗ "+(op.result||"安装失败，请重试");
+        $("installBtn").disabled=false;
+        // 内嵌「重试安装」按钮（同窗口，不回托盘）
+        $("retryInstallBtn").style.display="block";
+        $("retryInstallBtn").disabled=false;
+      } else if(op.state==="done"){
+        st.className="status ok";
+        st.textContent="✓ 运行环境已就绪！";
+        $("installBtn").disabled=false;
+        $("retryInstallBtn").style.display="none";
+        // 安装完成 → 重新拉 /state，phase 应变 ready → 状态渲染逻辑自动切换领号并激活
+        fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
+          if(s.phase==="ready"){
+            $("installSection").style.display="none";
+            $("activateSection").style.display="block";
+            $("status").innerHTML='<span class="info">运行环境已就绪，正在自动领号…</span>';
+            autoActivateOnce();
+          }
+        }).catch(()=>{});
+      }
+    };
+    render(null);
+    installPollTimer=setInterval(()=>{
+      fetch("http://matrix-setup.localhost/op-state").then(r=>r.json()).then(op=>{
+        render(op);
+        if(op && (op.state==="done"||op.state==="failed")){ clearInterval(installPollTimer); }
+      }).catch(()=>{});
+    },1500);
+  }
+
+  // 已激活态「🚀 启动数字分身」：不弹浏览器（不重领号），纯启动 matrix profile。
+  // 进度走 /launch 的 ops（与 activate 同协议），完成后重新拉 /state 刷新按钮态。
+  $("launchReadyBtn").onclick=async()=>{
+    const st=$("readyStatus"); st.className="status info"; st.textContent="正在启动数字分身…";
+    $("launchReadyBtn").disabled=true;
+    startReadyOpPolling();
+    try{
+      const r=await fetch("http://matrix-setup.localhost/launch",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      const j=await r.json();
+      if(j.ok){
+        st.innerHTML='<span class="ok">✓ 已开始启动，稍候显示「运行中」。</span>';
+        // 轮询 /state，等 launcher_running=true 后把按钮切成「运行中」态
+        let tries=0;
+        const poll=setInterval(async()=>{
+          tries++;
+          if(tries>60){ clearInterval(poll); $("launchReadyBtn").disabled=false; }
+          try{
+            const s=await (await fetch("http://matrix-setup.localhost/state")).json();
+            if(s.launcher_running){
+              clearInterval(poll);
+              $("launchReadyBtn").textContent="🟢 数字分身运行中";
+              $("launchReadyBtn").disabled=true;
+              st.className="status ok";
+              st.textContent="✓ 数字分身运行中，可在 Matrix 客户端 @ 它试试。";
+            }
+          }catch(e){}
+        },1500);
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"启动失败"); $("launchReadyBtn").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("launchReadyBtn").disabled=false; }
+  };
+
+  // 自动激活：调本机服务，打开浏览器授权。激活成功后，若有岗位候选则轮询 /state
+  // 等 status=configured 后展示「选岗位」步骤；无岗位候选则由后端关窗。
+  $("activateBtn").onclick=async()=>{
+    const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
+    $("activateBtn").disabled=true;
+    startOpPolling();  // 单窗口一贯流程：进度内嵌于向导窗口
+    try{
+      const r=await fetch("http://matrix-setup.localhost/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      const j=await r.json();
+      if(j.ok){
+        st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。完成后本窗口会引导你选择岗位。</span>';
+        // 轮询 /state，等激活完成（configured）后渲染岗位区块；
+        // 检测 last_activation_error 感知失败（恢复按钮 + 提示，避免「失败后按钮锁死」）
+        let tries=0;
+        const poll=setInterval(async()=>{
+          tries++;
+          if(tries>90){ clearInterval(poll); $("activateBtn").disabled=false; st.className="status err"; st.textContent="✗ 激活超时未完成，请重试。"; return; }  // 最多 135s
+          try{
+            const s=await (await fetch("http://matrix-setup.localhost/state")).json();
+            if(s.last_activation_error){
+              clearInterval(poll);
+              st.className="status err";
+              st.textContent="✗ "+(s.last_activation_error||"激活失败，请重试");
+              $("activateBtn").disabled=false;
+              return;
+            }
+            if(s.status==="configured"){
+              clearInterval(poll);
+              st.className="status ok";
+              st.textContent="✓ 已激活！";
+              if(s.job_presets && s.job_presets.length){
+                renderJobSection(s);
+              }
+            }
+          }catch(e){}
+        },1500);
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; }
+  };
+
+  // 开发者手动配置：显示令牌切换 + 提交
+  $("toggleToken").onclick=()=>{ const el=$("mToken"); el.type = el.type==="password" ? "text" : "password"; };
+  $("submitBtn").onclick=async()=>{
+    const st=$("manualStatus"); st.className="status info"; st.textContent="正在写入配置…";
+    $("submitBtn").disabled=true;
+    const payload={
+      homeserverUrl:$("mHs").value.trim(),
+      userId:$("mUid").value.trim(),
+      owner:$("mOwner").value.trim(),
+      accessToken:$("mToken").value.trim()
+    };
+    try{
+      const r=await fetch("http://matrix-setup.localhost/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const j=await r.json();
+      if(j.ok){
+        st.innerHTML='<span class="ok">✓ 已提交！本窗口会自动关闭，进度在操作窗口显示。</span>';
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"提交失败"); $("submitBtn").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("submitBtn").disabled=false; }
+  };
+})();
+</script>
+</body>
+</html>

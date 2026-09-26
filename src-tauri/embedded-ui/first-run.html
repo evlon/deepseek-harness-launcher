@@ -1,0 +1,69 @@
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>激活数字分身</title>
+<style>
+  :root{--bg:#1a2233;--card:#232c40;--text:#e6eaf2;--muted:#8b95a9;--green:#4ade80;--blue:#60a5fa;--line:#2d3650}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:24px;font-size:13.5px;line-height:1.7}
+  h1{font-size:20px;margin-bottom:6px}
+  .sub{font-size:12.5px;color:var(--muted);margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:12px}
+  .card h2{font-size:13px;color:var(--blue);margin-bottom:8px}
+  .steps{list-style:none;counter-reset:s}
+  .steps li{counter-increment:s;position:relative;padding-left:26px;margin:7px 0;font-size:13px}
+  .steps li::before{content:counter(s);position:absolute;left:0;top:1px;width:18px;height:18px;border-radius:50%;
+    background:var(--blue);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .tip{background:#1f2937;border-left:3px solid var(--blue);border-radius:6px;padding:10px 12px;font-size:12.5px;color:var(--muted);margin-bottom:16px}
+  .tip b{color:var(--text)}
+  .btn{width:100%;padding:13px;border-radius:9px;border:0;cursor:pointer;font-size:15px;font-weight:700;margin-bottom:9px}
+  .btn-primary{background:var(--green);color:#fff}
+  .btn-primary:disabled{opacity:.55;cursor:not-allowed}
+  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--line);font-weight:500;font-size:13px}
+  .btn-ghost:hover{color:var(--text)}
+  .status{font-size:12.5px;min-height:18px;text-align:center;color:var(--muted)}
+  .status.ok{color:var(--green)} .status.err{color:#f87171}
+</style>
+</head>
+<body>
+  <h1>🤖 激活你的数字分身</h1>
+  <div class="sub">欢迎使用！点下面的按钮，用公司账号一键认领你的数字分身。</div>
+
+  <div class="card">
+    <h2>接下来会自动完成</h2>
+    <ol class="steps">
+      <li>下载并安装运行环境（首次约几分钟）</li>
+      <li>用公司账号登录，自动认领你的 @ai-xxx 数字分身</li>
+      <li>选择你的岗位，分身即可在聊天工具里 @ 使用</li>
+    </ol>
+  </div>
+
+  <div class="tip">
+    <b>小提示：</b>完成后数字分身常驻在右下角托盘区（点 <b>^</b> 可看到图标），
+    以后从托盘图标打开它。
+  </div>
+
+  <button class="btn btn-primary" id="activate">🚀 开始激活</button>
+  <button class="btn btn-ghost" id="close">稍后再说（可从托盘图标随时打开）</button>
+  <div class="status" id="status"></div>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  $("activate").onclick=async()=>{
+    const st=$("status"); st.className="status"; st.textContent="正在准备…";
+    $("activate").disabled=true;
+    try{
+      const r=await fetch("http://first-run.localhost/activate",{method:"POST"});
+      const j=await r.json();
+      if(j.ok){
+        st.className="status ok";
+        st.textContent="✓ 已开始——接下来会自动安装环境并进入激活，请稍候。";
+      } else { st.className="status err"; st.textContent="✗ "+(j.error||"启动失败"); $("activate").disabled=false; }
+    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activate").disabled=false; }
+  };
+  $("close").onclick=()=>{ fetch("http://first-run.localhost/close",{method:"POST"}).catch(()=>{}); };
+})();
+</script>
+</body>
+</html>

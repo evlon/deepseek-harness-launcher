@@ -222,8 +222,8 @@ fn handle_request_inner<R: Runtime>(
     }
 
     // token 校验（health 免 token——纯探测，无副作用；其余路由需 token）
-    let is_health = method == "GET" && path == "/api/health";
-    if !is_health {
+    // 只读状态端点亦免 token（无副作用、不含明文凭据，仅本机 + Origin 白名单可达）。
+    if requires_token(&method, &path) {
         let auth_ok = token.is_empty() || req_has_token(&query, token);
         if !auth_ok {
             log::warn!("管理能力：token 校验失败（path={path} method={method}）");
@@ -241,6 +241,27 @@ fn handle_request_inner<R: Runtime>(
             "port": port(),
             "bridge": true,
         }),
+        // 只读：本机数字分身状态（浏览器版「我的数字分身」页面用）。
+        // 免 token（同 health：无副作用、不含明文凭据、仅本机 + Origin 白名单可达）。
+        // 返回字段出于最小暴露：状态相位/账号标识/是否运行/岗位，不返回 accessToken。
+        ("GET", "/api/twin/status") => {
+            let cfg = load_cached();
+            let st = crate::matrix_setup::collect_state(app, &cfg);
+            serde_json::json!({
+                "ok": true,
+                "status": st.status,
+                "phase": st.phase,
+                "user_id": st.user_id,
+                "owner": st.owner,
+                "homeserver_url": st.homeserver_url,
+                "access_token_set": st.access_token_set,
+                "launcher_running": st.launcher_running,
+                "default_job": st.default_job,
+                "job_presets": st.job_presets,
+                "roster_enabled": st.roster_enabled,
+                "launcher_version": env!("CARGO_PKG_VERSION"),
+            })
+        }
         ("GET", "/api/registry/meta") => {
             let name = query.get("name").cloned().unwrap_or_default();
             match block_on_query_meta(&name) {
@@ -345,6 +366,13 @@ fn parse_query(qs: &str) -> std::collections::HashMap<String, String> {
 
 fn req_has_token(query: &std::collections::HashMap<String, String>, token: &str) -> bool {
     query.get("token").map(|t| t == token).unwrap_or(false)
+}
+
+/// 该请求是否需要 token？免 token 端点 = 纯只读、无副作用、不含明文凭据：
+/// - `GET /api/health`：桥健康探测
+/// - `GET /api/twin/status`：本机数字分身只读状态（浏览器「我的数字分身」页用）
+fn requires_token(method: &str, path: &str) -> bool {
+    !(method == "GET" && (path == "/api/health" || path == "/api/twin/status"))
 }
 
 /// 发送 JSON 响应（带 CORS 头）。
@@ -752,5 +780,21 @@ mod tests {
             ("@scope/pkg".to_string(), "0.1.2".to_string())
         );
         assert_eq!(parsed[2], ("dsh-b".to_string(), "latest".to_string()));
+    }
+
+    /// 免 token 端点判定：health / twin/status 免；其余端点需 token。
+    #[test]
+    fn requires_token_rule() {
+        use super::requires_token;
+        // 免 token（GET 只读）
+        assert!(!requires_token("GET", "/api/health"));
+        assert!(!requires_token("GET", "/api/twin/status"));
+        // 需 token
+        assert!(requires_token("POST", "/api/health"), "非 GET 必须 token");
+        assert!(requires_token("GET", "/api/registry/meta"));
+        assert!(requires_token("GET", "/api/twin/status/extra"), "路径必须精确");
+        assert!(requires_token("POST", "/api/twin/status"), "twin 状态仅读，POST 需 token");
+        assert!(requires_token("GET", "/api/script/exec"));
+        assert!(requires_token("", ""));
     }
 }

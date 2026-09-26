@@ -11,6 +11,7 @@ mod dsh_npm;
 mod dsh_versions;
 mod domain_migrate;
 mod env_defaults;
+mod embedded;
 mod first_run;
 mod install;
 mod logging;
@@ -25,6 +26,7 @@ mod self_update;
 mod speedtest;
 mod sync;
 mod tray;
+mod ui_bundle;
 mod workflow;
 
 /// 本次进程是否已自动弹过「首次使用」激活主流程窗口（防骚扰：只弹一次）。
@@ -84,11 +86,12 @@ fn main() {
         ])
         // 操作进度窗口的内嵌 HTML 协议（console://localhost/index.html）
         // data: URL 在 Tauri 2 External 里被安全策略拦截，改用自定义协议。
-        .register_uri_scheme_protocol("console", |_ctx, request| {
+        .register_uri_scheme_protocol("console", |ctx, request| {
             use tauri::http::Response;
             // /state → 当前操作状态 JSON（窗口加载后拉取）
             let path = request.uri().path().to_string();
             log::info!("console:// 协议请求：{}", path);
+            let app = ctx.app_handle();
             if path == "/ping" {
                 log::info!("console:// JS 心跳：脚本已执行");
                 return Response::builder()
@@ -115,8 +118,8 @@ fn main() {
                     .body(body.into_bytes())
                     .unwrap_or_default();
             }
-            // 其他 → 内嵌 HTML
-            let html = console::console_html();
+            // 其他 → 内嵌 HTML（双轨：服务端下发缓存优先，内置兜底）
+            let html = crate::embedded::console_html(app);
             Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
                 // 关键：允许内联脚本 + 本协议 fetch（Tauri 默认注入的 CSP 会拦内联 JS）
@@ -171,18 +174,20 @@ fn main() {
                     let cfg = config::load_cached();
                     if crate::first_run::needs_onboarding(&h) {
                         if FIRST_RUN_SHOWN.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
-                            log::info!("检测到首次引导态（dsh 未装或数字分身未激活），弹出激活主流程");
+                            log::info!("检测到首次引导态（dsh 未装或数字分身未激活），弹出数字分身配置向导（单窗口一贯流程）");
                             crate::notify::notify(
                                 &h,
                                 "激活你的数字分身",
-                                "点击弹窗中的「开始激活」，用公司账号一键认领你的数字分身。",
+                                "点击弹窗中的「开始激活」，用公司账号一键认领并完成配置。",
                             );
-                            match crate::first_run::open_window(&h) {
-                                Ok(()) => {}
-                                Err(e) => log::warn!("弹激活主流程窗口失败：{e}"),
+                            // 单窗口一贯流程：进度内嵌在矩阵向导窗口内，不再单独
+                            // 预热「操作进度」独立窗（旧版此处 open_console 导致
+                            // 双击弹出两个窗口「配置数字分身 + 操作进度」交替闪烁）。
+                            if let Err(e) = crate::matrix_setup::open_window(&h) {
+                                log::warn!("弹配置向导窗口失败：{e}");
                             }
                         }
-                        return; // 引导态不做后续配置检测（激活完成后自动衔接选岗位）
+                        return; // 引导态不做后续配置检测（流程在向导内一步到底）
                     }
 
                     // 已激活：找回会话（上次「一键重置」保留了会话历史，本次启动且当前
@@ -217,6 +222,7 @@ fn main() {
                     && matches!(
                         crate::matrix_setup::status(&handle, &cfg),
                         crate::matrix_setup::MatrixStatus::Unconfigured { .. }
+                            | crate::matrix_setup::MatrixStatus::ReadyToActivate
                     ))
             {
                 let h = handle.clone();

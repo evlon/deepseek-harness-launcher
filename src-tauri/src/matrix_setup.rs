@@ -87,6 +87,8 @@ pub enum MatrixStatus {
     Unconfigured { missing: Vec<String> },
     /// 已配置（三要素齐全）。
     Configured,
+    /// 已装好运行环境，但还未激活数字分身（等待领号）。
+    ReadyToActivate,
 }
 
 /// settings.yaml 路径：`<DSH_HOME>/settings.yaml`。
@@ -110,30 +112,50 @@ pub fn load_account<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> (Ma
     (preset, false)
 }
 
-/// 当前向导状态。
+/// 当前向导状态（两阶段模型）。
+///
+/// 阶段一「安装运行环境」：dsh 核心（node/pnpm/dsh 二进制）+ matrix profile 骨架
+/// （web-app + dsh-matrix-agent 桥）都装好。
+/// 阶段二「领号启动」：账号配置（homeserverUrl/userId/accessToken）写入完成。
+///
+/// - [`MatrixStatus::NotInstalled`]：阶段一未完成（环境缺东西，需先安装）；
+/// - [`MatrixStatus::Unconfigured`]：阶段一完成、阶段二未做（已就绪，等待领号）；
+/// - [`MatrixStatus::Configured`]：两阶段全部完成，分身可用。
 pub fn status<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> MatrixStatus {
+    // ① 阶段一：运行环境未装（dsh 二进制不在）→ 需先安装
+    if !dsh_binary_path(app).exists() {
+        return MatrixStatus::NotInstalled;
+    }
+    // ② 阶段一：运行环境在，但 matrix profile 骨架/桥未就绪 → 也需安装补全
     if !matrix_agent_installed(app, cfg) {
         return MatrixStatus::NotInstalled;
     }
+    // ③ 阶段二：环境就绪，检查账号
     let (acc, _) = load_account(app, cfg);
     if acc.complete() {
         MatrixStatus::Configured
-    } else {
+    } else if manual_config_enabled(cfg) {
+        // 手动配置模式：给全缺字段细节（开发者联调用）
         MatrixStatus::Unconfigured {
             missing: acc.missing().iter().map(|s| s.to_string()).collect(),
         }
+    } else {
+        // 自动化模式：环境已就绪，等待领号（阶段二）
+        MatrixStatus::ReadyToActivate
     }
 }
 
 /// dsh-matrix-agent 是否已装进 matrix profile（node_modules 存在 bundle patch）。
+///
+/// 判定口径（2026-09-24 起，两阶段模型的「安装成功」确定性判据）：
+/// 同时认两个包布局（pnpm 结构兼容）：
+/// - `profiles/matrix/node_modules/dsh-matrix-agent/cordis.patch.yml`（顶层包）
+/// - `profiles/matrix/node_modules/@deepseek-ai/dsh-matrix-agent/cordis.patch.yml`（scoped）
+/// 任一命中即视为「已安装」。文件存在是**客观安装事实**，比「日志字符串」可靠得多。
 pub fn matrix_agent_installed<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> bool {
-    dsh_home(app, cfg)
-        .join("profiles")
-        .join(MATRIX_PROFILE)
-        .join("node_modules")
-        .join(MATRIX_AGENT_BUNDLE)
-        .join("cordis.patch.yml")
-        .exists()
+    let nm = dsh_home(app, cfg).join("profiles").join(MATRIX_PROFILE).join("node_modules");
+    nm.join(MATRIX_AGENT_BUNDLE).join("cordis.patch.yml").exists()
+        || nm.join("@deepseek-ai").join(MATRIX_AGENT_BUNDLE).join("cordis.patch.yml").exists()
 }
 
 /// 从 dsh-matrix-agent 的 bundle 层 patch（cordis.patch.yml）读取预置账号字段。
@@ -536,9 +558,18 @@ pub fn atomic_write_public(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 // ---------- 等待 Matrix 连接 ----------
 
-/// 等待 Matrix 桥连接就绪：轮询 dsh-matrix-agent 的 diagnostics.log（stateDir），
-/// 出现 "config complete" / "bridge started" 且无 "incomplete config" 即成功。
-/// 超时返回错误（可重试）。
+/// 等待 Matrix 桥连接就绪（两阶段模型的「运行成功」确定性判据）。
+///
+/// 判据（按优先级）：
+/// 1. **文件事实**：`<DSH_HOME>/.dsh-matrix/diagnostics.log` 出现成功信号
+///    `Matrix bridge started`（bridge.js 启动成功后才写这行——这是「桥真正连上
+///    Matrix」的客观信号，比「端口活着」强）。
+/// 2. **快速失败**：dsh-matrix-agent 进程已死（端口/进程探测失败）→ 立即报错，
+///    不傻等满 45s。
+/// 3. 附带提示：diagnostics.log 文件不存在 = 桥根本没加载（matrix profile 里
+///    dsh-matrix-agent 未装 / patch 缺失）→ 给明确诊断，而不是「等超时」。
+///
+/// 超时返回错误（可重试）。返回的 Err 文案就是直接给用户看的原因。
 fn wait_matrix_ready<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
@@ -549,11 +580,14 @@ fn wait_matrix_ready<R: Runtime>(
     let deadline = std::time::Instant::now() + timeout;
     // 先给启动 3s（进程 spawn + 插件加载）
     std::thread::sleep(std::time::Duration::from_secs(3));
+    let mut file_ever_seen = false;
     while std::time::Instant::now() < deadline {
+        // ① 文件事实判据：出现成功信号即完成
         if let Ok(text) = std::fs::read_to_string(&diag_path) {
+            file_ever_seen = true;
             // 全文判断（不做字节切片，避免切中文 panic）
             let full = text.as_str();
-            // 出现成功信号：bridge started / settings register OK + 配置完整
+            // 出现成功信号：bridge started / Matrix bridge started
             let started = full.contains("bridge started") || full.contains("Matrix bridge started");
             let incomplete = full.contains("incomplete config") || full.contains("not started");
             let configured = full.contains("config complete") || full.contains("starting Matrix bridge");
@@ -562,9 +596,22 @@ fn wait_matrix_ready<R: Runtime>(
                 return Ok(());
             }
         }
+        // ② 快速失败：dsh-matrix-agent 进程已死（端口/进程探测失败）→ 立即报错
+        if !crate::workflow::is_running() {
+            return Err("数字分身进程未在运行，无法建立 Matrix 连接。请稍后在托盘「启动」重试。".to_string());
+        }
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
-    Err("等待 Matrix 连接超时——请查看日志确认数字分身配置是否正确".to_string())
+    // ③ 超时：区分「文件从未出现」（桥未加载）与「文件有但没到成功信号」（连接慢）
+    if !file_ever_seen {
+        Err(format!(
+            "等待 Matrix 连接超时：未找到诊断日志（{}）。\
+             可能原因：dsh-matrix-agent 桥未加载。请在托盘「安装 / 修复」补装插件后重试。",
+            diag_path.display()
+        ))
+    } else {
+        Err("等待 Matrix 连接超时——请查看日志确认数字分身配置是否正确".to_string())
+    }
 }
 
 // ---------- 向导窗口 ----------
@@ -620,7 +667,7 @@ pub fn handle_scheme_request<R: TauriRuntime>(
     let cfg = load_cached();
 
     if method == tauri::http::Method::GET && (path == "/" || path == "/index.html") {
-        let html = wizard_html();
+        let html = wizard_html(app);
         return Response::builder()
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(
@@ -637,9 +684,16 @@ pub fn handle_scheme_request<R: TauriRuntime>(
     if method == tauri::http::Method::POST && path == "/activate" {
         // 自动激活：授权码 + PKCE + 本地回调（P3）。后台线程跑完整流程
         // （起回调 → 打开浏览器 → 等回调 → 换 token → 调 /activate → 写配置 → 重启）。
-        // 与 /submit 一致：任务移交后台，进度走 ops + console 窗口，向导窗口关闭。
+        // 单窗口一贯流程：任务移交后台，进度写入 ops 全局状态，由向导窗口内嵌
+        // 进度区轮询 /op-state 展示——不再弹独立「操作进度」窗、也不关闭向导。
         let h = app.clone();
         tauri::async_runtime::spawn_blocking(move || {
+            // ① dsh 未装 → 先装依赖（进度内嵌于向导，无需独立进度窗；install_all
+            //    已做「向导存在则不弹 console」）。装完才能激活。
+            if !dsh_binary_path(&h).exists() {
+                crate::ops::append_log(&h, "[开始] 检测到运行环境未安装，先安装依赖…");
+                let _ = tauri::async_runtime::block_on(crate::install::install_all(&h));
+            }
             crate::ops::start_op(&h, "matrix-activate", "自动激活数字分身", &["浏览器授权", "认领身份", "写入配置", "重启数字分身", "等待连接"]);
             crate::ops::mark_step_running(&h, 0);
             crate::ops::update_step(&h, "等待浏览器授权…");
@@ -702,22 +756,166 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                 }
             }
         });
-        // 弹进度窗口；向导窗口是否关闭取决于「是否还有岗位待选」：
-        // - 服务端下发了岗位候选（jobPresets 非空）→ 保留向导窗口，切到「选岗位」步骤；
-        // - 无岗位候选 → 照旧关闭向导（进度走操作窗口）。
-        let has_jobs = !job_presets_from_sync(app, &cfg).is_empty();
+        // ===== 优化 A：进度与岗位选择全部收进「同一个向导窗口」 =====
+        // 不再开第二个「操作进度」窗交替闪烁：
+        // - 有岗位候选 → 向导窗口直接切换到「选岗位」步骤（jobSection 由前端渲染）；
+        // - 无岗位候选 → 进度在向导窗口内嵌区显示（前端轮询 /op-state），完成后由后端收尾。
+        // 仅当向导窗口意外未打开时，重新打开/聚焦向导（进度依旧内嵌，**不弹独立进度窗**）。
         let h = app.clone();
-        tauri::async_runtime::spawn(async move {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            let _ = crate::console::open_console(&h);
-            if !has_jobs {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                if let Some(win) = h.get_webview_window("matrix-setup") {
-                    let _ = win.close();
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = crate::matrix_setup::open_window(&h); // 聚焦/重建向导（进度内嵌）
+        });
+        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始自动激活"}));
+    }
+    if method == tauri::http::Method::POST && path == "/resume-auto-activation" {
+        // first_run 安装完成自动流转入口：不弹通知，直接衔接「激活」流程
+        // 复用与 /activate 相同的后台线程逻辑，仅不对前端再弹「已开始」
+        let h = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            // 进度归到 ops（进度 HUD 与向导共用同一套 ops 接口）
+            crate::ops::start_op(&h, "auto-resume-activate", "安装后自动激活并启动（无人值守）", &["浏览器授权（无人值守）", "认领身份", "写入配置", "重启数字分身", "等待连接"]);
+            crate::ops::mark_step_running(&h, 0);
+            crate::ops::update_step(&h, "等待浏览器授权…");
+            crate::ops::append_log(&h, "已打开浏览器，请在浏览器中完成公司 SSO 登录…");
+            match crate::activation::run_activation(&h) {
+                r if r.ok => {
+                    crate::ops::mark_step_running(&h, 2);
+                    crate::ops::update_step(&h, "已认领分身，写入配置…");
+                    crate::ops::append_log(&h, &format!("✓ 已认领分身账号 {}", r.user_id));
+                    let cfg_now = load_cached();
+                    if let Err(e) = crate::install::ensure_matrix_profile(&h, &cfg_now) {
+                        crate::ops::append_log(&h, &format!("⚠️ 确保数字分身运行环境失败：{e}"));
+                    }
+                    let running = crate::workflow::is_running();
+                    let cur_profile = crate::workflow::current_profile();
+                    crate::ops::mark_step_running(&h, 3);
+                    crate::ops::update_step(&h, "重启数字分身…");
+                    if running && cur_profile.as_deref() == Some(MATRIX_PROFILE) {
+                        crate::workflow::stop();
+                        crate::ops::append_log(&h, "已停止旧数字分身进程（连接参数需重启生效）");
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                    match crate::workflow::launch_with_profile(&h, MATRIX_PROFILE) {
+                        Ok(port) => {
+                            *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            crate::ops::append_log(&h, &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)));
+                            crate::ops::mark_step_running(&h, 4);
+                            crate::ops::update_step(&h, "等待 Matrix 连接…");
+                            match wait_matrix_ready(&h, &cfg_now, std::time::Duration::from_secs(45)) {
+                                Ok(()) => {
+                                    crate::ops::finish_op(&h, &format!("数字分身已激活并自动就绪：{}", r.user_id));
+                                    crate::notify::notify(&h, "数字分身已激活", &format!("{} 已就绪，可在 Matrix 客户端 @ 它试试", r.user_id));
+                                    crate::tray::refresh_sync_menu(&h);
+                                }
+                                Err(e) => {
+                                    crate::ops::finish_op(&h, &format!("数字分身已激活（{}），但连接等待超时：{}", r.user_id, e));
+                                    crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置。连接验证超时（不影响使用），可稍后在托盘查看。", r.user_id));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::ops::fail_op(&h, &format!("分身已激活但启动失败：{e}"));
+                            crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置，但启动失败：{}。可在托盘「启动」重试。", r.user_id, e));
+                            *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("分身已激活但启动失败：{e}"));
+                        }
+                    }
+                }
+                r => {
+                    crate::ops::fail_op(&h, &r.message);
+                    crate::notify::notify(&h, "自动激活失败", &r.message);
+                    *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(r.message.clone());
                 }
             }
         });
-        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始自动激活"}));
+        // 向导层面由前端控制自动关闭/提示，这里不额外动窗
+        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始自动激活（安装后无人值守）"}));
+    }
+    if method == tauri::http::Method::POST && path == "/launch" {
+        // 「数字分身已就绪」区块的启动入口：configured 态（账号已激活）直接启动
+        // matrix 分身。**不触发 SSO**（区别于 /activate——那是「领号」流程，会
+        // 弹浏览器重领；已激活机器不该再领号）。启动逻辑与托盘「启动 Harness」
+        // 一致：确保 profile 骨架 → 幂等启动（已运行同 profile 直接返回）→ 等连接。
+        let h = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::ops::start_op(&h, "launch", "启动数字分身", &["确保运行环境", "启动分身", "等待连接"]);
+            crate::ops::mark_step_running(&h, 0);
+            crate::ops::update_step(&h, "确保运行环境…");
+            let cfg_now = load_cached();
+            if let Err(e) = crate::install::ensure_matrix_profile(&h, &cfg_now) {
+                crate::ops::append_log(&h, &format!("⚠️ 确保数字分身运行环境失败：{e}"));
+            }
+            crate::ops::mark_step_running(&h, 1);
+            crate::ops::update_step(&h, "启动数字分身…");
+            match crate::workflow::launch_with_profile(&h, MATRIX_PROFILE) {
+                Ok(port) => {
+                    crate::ops::append_log(&h, &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)));
+                    crate::ops::mark_step_running(&h, 2);
+                    crate::ops::update_step(&h, "等待 Matrix 连接…");
+                    match wait_matrix_ready(&h, &cfg_now, std::time::Duration::from_secs(45)) {
+                        Ok(()) => {
+                            crate::ops::finish_op(&h, "数字分身已启动并可用（Matrix 已连接）");
+                            crate::tray::refresh_sync_menu(&h);
+                            crate::notify::notify(&h, "数字分身已启动", "数字分身已在托盘运行，可在 Matrix 客户端 @ 它试试。");
+                        }
+                        Err(e) => {
+                            crate::ops::finish_op(&h, &format!("数字分身已启动，但连接等待超时：{e}"));
+                            crate::notify::notify(&h, "数字分身已启动", &format!("进程已启动。连接验证超时（不影响使用）：{e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::ops::fail_op(&h, &format!("启动数字分身失败：{e}"));
+                    crate::notify::notify(&h, "启动失败", &format!("{e}\n\n可在托盘「安装 / 修复」后重试。"));
+                }
+            }
+        });
+        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始启动数字分身"}));
+    }
+    if method == tauri::http::Method::GET && path == "/op-state" {
+        // 向导窗口内嵌进度区轮询端点：返回 ops 全局状态的当前操作 JSON
+        // （含步骤列表/当前步骤/日志/结果）。custom protocol 无 Tauri IPC，
+        // 前端用轮询取数（与 console.rs 的 /state 一致）。
+        let body = serde_json::to_string(&crate::ops::current())
+            .unwrap_or_else(|_| "null".to_string());
+        log::info!("matrix-setup:// /op-state 返回（截断）：{}", crate::config::truncate_utf8(&body, 120));
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(body.into_bytes())
+            .unwrap_or_default();
+    }
+    if method == tauri::http::Method::POST && path == "/retry-install" {
+        // 阶段一「安装运行环境」失败后的重试入口：复用 install_all（幂等，已装则跳过）。
+        // 进度照旧内嵌于向导窗口（前端轮询 /op-state），不弹独立进度窗。
+        let h = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::ops::append_log(&h, "[开始] 重试安装运行环境…");
+            match tauri::async_runtime::block_on(crate::install::install_all(&h)) {
+                Ok(()) => {
+                    // ⭐ 阶段一完成后的「安装桥」收口：install_all 不保证 matrix profile
+                    // 的 dsh-matrix-agent 已装（它取决于服务端清单是否出现该键；且在
+                    // 「dsh 已装未激活」分流路径下 install_all 会被跳过，只有骨架）。
+                    // 这里显式按 matrix 清单补装一次（幂等，已装则跳过）——缺了它
+                    // diagnostics.log 永远不会出现，wait_matrix_ready 必超时（2026-09-24 实测）。
+                    let h2 = h.clone();
+                    let r = tauri::async_runtime::block_on(async move {
+                        crate::install::install_server_recommended(&h2, &load_cached()).await
+                    });
+                    match r {
+                        Ok(()) => log::info!("安装运行环境 + matrix 推荐插件完成"),
+                        Err(e) => log::warn!("补装 matrix 推荐插件未完成（可托盘重试）：{e}"),
+                    }
+                    crate::ops::append_log(&h, "运行环境已就绪，请继续");
+                    crate::notify::notify(&h, "安装完成", "运行环境已就绪，请继续激活数字分身。");
+                }
+                Err(e) => {
+                    crate::ops::fail_op(&h, &format!("安装仍未完成：{e}"));
+                    log::error!("重试安装失败（向导内触发）：{e}");
+                }
+            }
+        });
+        return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始重试安装"}));
     }
     if method == tauri::http::Method::POST && path == "/jobs" {
         // 「选岗位」提交：用户勾选预装岗位 + 选默认岗位后落盘。
@@ -742,6 +940,10 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                     .collect()
             })
             .unwrap_or_default();
+        // ⭐ 必选岗位兜底（不信任前端）：秘书/前台是分身正常工作的基础能力（请示分级/
+        // 上呈主人 + 访客接待/咨询分流），取消后分身不完整。无论前端提交什么清单，
+        // 后端都强制合入这两个岗位，杜绝「前端被绕过 / 旧版客户端」漏掉。
+        let jobs = enforce_mandatory_jobs(jobs);
         let default_job: String = body
             .get("defaultJob")
             .and_then(|v| v.as_str())
@@ -775,7 +977,7 @@ pub fn handle_scheme_request<R: TauriRuntime>(
             log::warn!("[jobs] 落盘花名册开关失败：{e}");
         }
         log::info!(
-            "[jobs] 已保存岗位设置：预装 {} 个，默认岗位 {}，花名册 {}",
+            "[jobs] 已保存岗位设置：预装 {} 个（含必选秘书/前台），默认岗位 {}，花名册 {}",
             jobs.len(),
             if default_job.is_empty() { "（未指定）" } else { &default_job },
             if roster_enabled { "开启" } else { "关闭" }
@@ -879,14 +1081,11 @@ pub fn handle_scheme_request<R: TauriRuntime>(
             }
         });
         // 弹进度窗口 + 关闭向导（与 /activate 一致）
+        // ⚠️ 单窗口一贯流程：进度内嵌于向导窗口（前端轮询 /op-state），不再弹独立
+        // 「操作进度」窗；手动配置提交后向导留在前台展示进度，不再关闭重开。
         let h = app.clone();
         tauri::async_runtime::spawn(async move {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            let _ = crate::console::open_console(&h);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            if let Some(win) = h.get_webview_window("matrix-setup") {
-                let _ = win.close();
-            }
+            let _ = crate::matrix_setup::open_window(&h); // 聚焦向导（进度内嵌）
         });
         return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已提交手动配置"}));
     }
@@ -897,6 +1096,9 @@ pub fn handle_scheme_request<R: TauriRuntime>(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WizardState {
     pub status: String,
+    /// 两阶段相位：`not-installed`（阶段一未完成，需安装）| `ready`（阶段一完成，等待领号）
+    /// | `configured`（两阶段完成）。前端据此渲染「安装」或「领号」UI。
+    pub phase: String,
     pub missing: Vec<String>,
     pub homeserver_url: String,
     pub user_id: String,
@@ -914,6 +1116,8 @@ pub struct WizardState {
     pub roster_enabled: bool,
     /// 最近一次自动激活的失败文案（无失败/未激活过 = 空串）。前端据此恢复按钮并提示。
     pub last_activation_error: String,
+    /// 数字分身（matrix profile）当前是否已在运行（前端据此渲染「启动 / 运行中」）。
+    pub launcher_running: bool,
 }
 
 /// 计算订阅/安装清单差异：服务端推荐清单 vs 本地已装清单。
@@ -939,6 +1143,23 @@ fn job_presets_from_sync<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &Launche
         .as_ref()
         .map(|c| c.job_presets.clone())
         .unwrap_or_default()
+}
+
+/// ⭐ 必选岗位（分身正常工作必需，不可取消）。
+///
+/// 秘书（请示分级/决策回传/上呈主人/转达话术）与前台（访客接待/咨询分流）是数字分身
+/// 的基础人设能力：取消后分身不完整、无法正常工作。本函数在「保存岗位设置」时对用户
+/// 提交的预装清单做兜底合入——无论前端是否已锁定（UI 置灰）、是否被绕过（旧客户端 /
+/// 直接 curl），后端都保证这两个岗位在最终清单里。与 matrix_setup 内嵌 JS 的同名常量
+/// （MANDATORY_JOBS）保持同步。
+pub fn enforce_mandatory_jobs(mut jobs: Vec<String>) -> Vec<String> {
+    const MANDATORY_JOBS: [&str; 2] = ["secretary", "reception"];
+    for mj in MANDATORY_JOBS {
+        if !jobs.iter().any(|j| j == mj) {
+            jobs.push(mj.to_string());
+        }
+    }
+    jobs
 }
 
 /// 读取当前 settings.yaml 里的 `himarket.defaultJob`（默认岗位），空 = 未指定。
@@ -984,13 +1205,16 @@ fn read_roster_enabled<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherC
 pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherConfig) -> WizardState {
     let st = status(app, cfg);
     let (acc, _) = load_account(app, cfg);
-    let (status_str, missing) = match &st {
-        MatrixStatus::Configured => ("configured".to_string(), Vec::new()),
-        MatrixStatus::NotInstalled => ("not-installed".to_string(), Vec::new()),
-        MatrixStatus::Unconfigured { missing } => ("unconfigured".to_string(), missing.clone()),
+    let (status_str, phase, missing) = match &st {
+        MatrixStatus::Configured => ("configured".to_string(), "configured".to_string(), Vec::new()),
+        MatrixStatus::NotInstalled => ("not-installed".to_string(), "not-installed".to_string(), Vec::new()),
+        MatrixStatus::Unconfigured { missing } => ("unconfigured".to_string(), "ready".to_string(), missing.clone()),
+        // 阶段一完成、账号未配 → 阶段二「领号」UI
+        MatrixStatus::ReadyToActivate => ("ready-activate".to_string(), "ready".to_string(), Vec::new()),
     };
     WizardState {
         status: status_str,
+        phase,
         missing,
         homeserver_url: acc.homeserver_url,
         user_id: acc.user_id,
@@ -1006,626 +1230,15 @@ pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherCon
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_default(),
+        // 「数字分身已就绪」区块判断：matrix profile 是否正在运行
+        launcher_running: crate::workflow::is_running()
+            && crate::workflow::current_profile().as_deref() == Some(MATRIX_PROFILE),
     }
 }
 
 /// 向导 HTML（内嵌，无需前端构建；仿 console.rs）。
-pub fn wizard_html() -> String {
-    let html = r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>配置数字分身</title>
-<style>
-  :root{--bg:#1a2233;--card:#232c40;--text:#e6eaf2;--muted:#8b95a9;--green:#4ade80;--amber:#fbbf24;--red:#f87171;--blue:#60a5fa;--line:#2d3650}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:18px;font-size:13px;line-height:1.6}
-  h1{font-size:16px;margin-bottom:4px}
-  .sub{font-size:12px;color:var(--muted);margin-bottom:14px}
-  .section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
-  .section h2{font-size:13px;margin-bottom:10px;color:var(--blue)}
-  label{display:block;font-size:12px;color:var(--muted);margin:8px 0 4px}
-  input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:#161d2e;color:var(--text);font-size:13px}
-  input:focus{outline:none;border-color:var(--blue)}
-  .hint{font-size:11px;color:var(--muted);margin-top:3px}
-  .row{display:flex;gap:8px;align-items:center}
-  .btn{padding:9px 16px;border-radius:8px;border:0;cursor:pointer;font-size:13px;font-weight:600}
-  .btn-primary{background:var(--blue);color:#fff}
-  .btn-primary:disabled{opacity:.5;cursor:not-allowed}
-  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--line)}
-  .btn-ghost:hover{color:var(--text)}
-  .status{margin-top:10px;font-size:12px;min-height:18px}
-  .status.ok{color:var(--green)} .status.err{color:var(--red)} .status.info{color:var(--muted)}
-  .token-toggle{margin:6px 0}
-  .token-toggle a{color:var(--blue);cursor:pointer;font-size:12px;text-decoration:none}
-  .secret-mode{display:none}
-  .step-done{color:var(--green)}
-  .cfg-table{width:100%;border-collapse:collapse;font-size:12px}
-  .cfg-table td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-  .cfg-key{color:var(--muted);width:90px;white-space:nowrap}
-  .cfg-val{color:var(--text);word-break:break-all}
-  .cfg-val.empty{color:var(--muted)}
-  /* ① 选岗位：勾选预装 + 单选默认岗位 */
-  .job-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-  .job-chip{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border:1px solid var(--line);border-radius:16px;background:#161d2e;color:var(--text);font-size:12px;cursor:pointer;user-select:none}
-  .job-chip.checked{border-color:var(--green);color:var(--green);background:#1c2a24}
-  .job-chip .tick{width:14px;text-align:center}
-  .job-chip input{display:none}
-  .job-radio{display:flex;align-items:center;gap:8px;padding:7px 10px;margin:0 0 6px;border:1px solid var(--line);border-radius:8px;font-size:13px;color:var(--text);cursor:pointer;background:#141a28}
-  .job-radio:hover{border-color:var(--blue)}
-  .job-radio input{margin:0}
-  .job-radio .job-label{font-weight:500}
-  .job-radio .job-desc{font-size:11px;color:var(--muted);flex:1}
-  .job-radio .job-id{margin-left:auto;font-size:11px;color:var(--muted)}
-  .job-hint{font-size:11px;color:var(--muted);margin:6px 0 8px}
-  .roster-toggle{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--text);cursor:pointer;background:#141a28;margin-bottom:4px}
-  .roster-toggle:hover{border-color:var(--blue)}
-  .roster-toggle input{margin:0}
-  .roster-toggle .roster-label{font-weight:500;white-space:nowrap}
-  .roster-toggle .roster-desc{font-size:11px;color:var(--muted)}
-</style>
-</head>
-<body>
-  <h1>🤖 配置数字分身</h1>
-  <div class="sub">推荐：点下面「自动激活」，用公司账号一键认领你的数字分身（无需手填任何信息）。</div>
-
-  <div class="section" id="activateSection" style="border-color:var(--green)">
-    <h2 style="color:var(--green)">⭐ 自动激活（推荐）</h2>
-    <div class="hint" style="margin-bottom:10px">用公司 SSO（Keycloak）登录，自动认领你的 @ai-你的邮箱前缀 数字分身。无需密码、无需 token。</div>
-    <button class="btn btn-primary" id="activateBtn" style="width:100%;background:var(--green)">🚀 自动激活数字分身</button>
-    <div class="status" id="activateStatus"></div>
-  </div>
-
-  <div class="section">
-    <h2 style="color:var(--blue)">📡 当前连接配置（服务端下发，只读）</h2>
-    <div class="hint" style="margin-bottom:10px">以下连接参数由服务端统一下发（激活时自动写入），本地不可手改，用于排查连接问题。</div>
-    <table class="cfg-table">
-      <tr><td class="cfg-key">服务器地址</td><td class="cfg-val" id="viewHs">—</td></tr>
-      <tr><td class="cfg-key">分身账号</td><td class="cfg-val" id="viewUid">—</td></tr>
-      <tr><td class="cfg-key">主人账号</td><td class="cfg-val" id="viewOwner">—</td></tr>
-      <tr><td class="cfg-key">访问令牌</td><td class="cfg-val" id="viewToken">—</td></tr>
-    </table>
-  </div>
-
-  <div class="section" id="manualSection" style="display:none">
-    <h2 style="color:var(--amber)">🛠 手动配置（开发者）</h2>
-    <div class="hint" style="margin-bottom:10px">已启用开发者手动配置开关（matrixManualConfig）。此处可手填连接参数，覆盖服务端下发值，用于测试环境联调。</div>
-    <label>服务器地址（homeserverUrl）</label>
-    <input id="mHs" placeholder="https://matrix.example.com">
-    <label>分身账号（userId）</label>
-    <input id="mUid" placeholder="@ai-xxx:example.com">
-    <label>主人账号（owner，可选）</label>
-    <input id="mOwner" placeholder="@owner:example.com">
-    <label>访问令牌（accessToken）</label>
-    <input id="mToken" type="password" placeholder="syt_...">
-    <div class="token-toggle"><a id="toggleToken" onclick="return false">显示令牌</a></div>
-    <button class="btn btn-primary" id="submitBtn" style="width:100%">保存手动配置</button>
-    <div class="status" id="manualStatus"></div>
-  </div>
-
-  <div class="section" id="pendingSection" style="display:none">
-    <h2 style="color:var(--amber)">📋 订阅 / 安装清单</h2>
-    <div class="hint" style="margin-bottom:8px">你的账号已订阅以下能力，但本地尚未安装或版本落后。点「安装 / 修复」会自动补齐。</div>
-    <div id="pendingList" style="font-size:12px"></div>
-  </div>
-
-  <div class="section" id="jobSection" style="display:none">
-    <h2 style="color:var(--blue)">💼 选择岗位（重点）</h2>
-    <div class="hint">勾选要**预装**的岗位（会下载对应岗位技能，默认全选，可去掉不需要的）；再选一个**默认岗位**（分身激活后默认以它开工）。</div>
-    <div class="job-hint">预装岗位：</div>
-    <div class="job-list" id="jobList"></div>
-    <div class="job-hint" style="margin-top:12px">默认岗位（上岗后默认启用哪一个）：</div>
-    <div id="defaultJobRadios" style="font-size:12px"></div>
-    <div class="job-hint" style="margin-top:12px">附加能力：</div>
-    <label class="roster-toggle">
-      <input type="checkbox" id="rosterToggle">
-      <span class="roster-label">开启花名册</span>
-      <span class="roster-desc">对外登记「我在做什么」（当前工作 / 已完成），供同事查询你的数字分身动态</span>
-    </label>
-    <button class="btn btn-primary" id="saveJobsBtn" style="width:100%;margin-top:14px">💾 保存岗位设置并完成</button>
-    <div class="status" id="jobStatus"></div>
-  </div>
-
-  <div class="status" id="status"></div>
-
-<script>
-(function(){
-  const $=id=>document.getElementById(id);
-  const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  // 岗位 id → 中文名映射（与服务端 dsh-launcher-center 的 BUILTIN_JOBS 保持一致）。
-  // 清单外的岗位（员工自建）没有中文名，就回退显示原始 id。
-  const JOB_LABELS = {
-    "pm":"产品经理","dev":"研发工程师","qa":"测试工程师","leader":"团队负责人",
-    "newbie":"新员工","general":"通用","secretary":"秘书","reception":"前台接待"
-  };
-  // 岗位中文描述（说明该岗位负责什么，帮小白选岗）。
-  const JOB_DESC = {
-    "pm":"产品需求、PRD、需求澄清与优先级",
-    "dev":"接口联调、告警定位、排期评估、技术方案",
-    "qa":"测试用例、缺陷跟踪、验收",
-    "leader":"任务分配、进度跟进、决策驱动",
-    "newbie":"新员工上手引导与答疑",
-    "general":"通用办公助手",
-    "secretary":"请示分级、决策回传、上呈主人、转达话术",
-    "reception":"访客接待、咨询分流"
-  };
-  const jobLabel=id=>JOB_LABELS[id] || id;
-  const jobDesc=id=>JOB_DESC[id] || "";
-
-  // 只读展示：加载当前连接配置（服务端下发 + 激活写入），用于排查，不允许本地手改
-  fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
-    $("viewHs").textContent = s.homeserver_url || "（未下发）";
-    $("viewUid").textContent = s.user_id || "（未激活）";
-    $("viewOwner").textContent = s.owner || "（未设置）";
-    $("viewToken").textContent = s.access_token_set ? "已写入（明文不在此展示）" : "（未写入）";
-    if(s.status==="configured"){ $("status").innerHTML='<span class="ok">✓ 已配置并连接。</span>'; }
-    else if(s.status==="not-installed"){ $("status").innerHTML='<span class="err">数字分身插件未安装——请先关闭本窗口，在托盘点「安装 / 修复」。</span>'; }
-    else if(s.status==="unconfigured"){ $("status").innerHTML='<span class="info">尚未完成激活。请点上方「自动激活」。</span>'; }
-    // 开发者手动配置开关：matrixManualConfig=true 时显示手填区块并预填当前值
-    if(s.manual_config_enabled){
-      $("manualSection").style.display="block";
-      $("mHs").value = s.homeserver_url || "";
-      $("mUid").value = s.user_id || "";
-      $("mOwner").value = s.owner || "";
-      // access token 不回传明文，仅占位提示
-      $("mToken").placeholder = s.access_token_set ? "已设置（留空则保持不变）" : "syt_...";
-    }
-    // 订阅/安装清单差异
-    if(s.pending_plugins && s.pending_plugins.length){
-      const list=$("pendingList"); list.innerHTML="";
-      s.pending_plugins.forEach(p=>{
-        const tag = p.action==="update"
-          ? '<span style="color:var(--amber)">待更新</span>'
-          : '<span style="color:var(--blue)">待安装</span>';
-        const ver = p.installed ? ` <span style="color:var(--muted)">（已装 ${esc(p.installed)} → ${esc(p.latest||"最新")}）</span>` : "";
-        const div=document.createElement("div");
-        div.style.cssText="padding:4px 0;border-bottom:1px solid var(--line)";
-        div.innerHTML=`${tag} <strong>${esc(p.name)}</strong>${ver}`;
-        list.appendChild(div);
-      });
-      $("pendingSection").style.display="block";
-    }
-    // 岗位选择：仅在「已激活」（status=configured）且有服务端下发的候选岗位时展示。
-    // 未激活时（unconfigured/not-installed）不展示——先完成激活再选岗位。
-    if(s.status==="configured"){ renderJobSection(s); }
-  }).catch(()=>{});
-
-  // 渲染岗位选择区块。candidates = 服务端 jobPresets；defaultJob = 当前已落盘默认岗位。
-  // 首次激活后：默认全选 + 默认岗位为空（等用户选）；已保存过：回显当前值。
-  let jobPresets = [];      // 服务端候选（默认全选基础）
-  let jobSelected = new Set();
-  let jobDefault = "";
-  let jobRosterEnabled = false;   // 花名册开关（独立能力，不挂岗位）
-  let jobInitialized = false;
-  function renderJobSection(s){
-    const cands = s.job_presets || [];
-    if(!cands.length){ $("jobSection").style.display="none"; return; }
-    if(jobInitialized){ return; }  // 只初始化一次，避免轮询/重复渲染覆盖用户已选
-    jobPresets = cands;
-    jobSelected = new Set(cands);          // 默认全选
-    jobDefault = s.default_job || "";      // 回显当前默认岗位（可为空）
-    jobRosterEnabled = !!s.roster_enabled; // 回显当前花名册开关
-    if($("rosterToggle")) $("rosterToggle").checked = jobRosterEnabled;
-    jobInitialized = true;
-    paintJobChips();
-    $("jobSection").style.display="block";
-  }
-  function paintJobChips(){
-    // 预装岗位勾选 chips
-    const list=$("jobList"); list.innerHTML="";
-    jobPresets.forEach(j=>{
-      const on=jobSelected.has(j);
-      const chip=document.createElement("div");
-      chip.className="job-chip"+(on?" checked":"");
-      chip.innerHTML='<span class="tick">'+(on?"✓":"○")+'</span>'+esc(jobLabel(j));
-      chip.onclick=()=>{
-        if(jobSelected.has(j)) jobSelected.delete(j); else jobSelected.add(j);
-        paintJobChips();
-      };
-      list.appendChild(chip);
-    });
-    // 默认岗位单选（每行一个：中文名 + 中文描述 + 岗位 id）
-    const radios=$("defaultJobRadios"); radios.innerHTML="";
-    const mkRadio=(val,label,desc,checked)=>{
-      const lab=document.createElement("label");
-      lab.className="job-radio";
-      const descHtml = desc ? '<span class="job-desc">'+esc(desc)+'</span>' : '';
-      lab.innerHTML='<input class="radio" type="radio" name="defaultJob" value="'+esc(val)+'"'+(checked?" checked":"")+'>'
-        +'<span class="job-label">'+esc(label)+'</span>'
-        +descHtml
-        +(val!==''?'<span class="job-id">'+esc(val)+'</span>':'');
-      const inp=lab.querySelector("input");
-      inp.onchange=()=>{ jobDefault=val; };
-      radios.appendChild(lab);
-    };
-    mkRadio("","不指定","", jobDefault==="");
-    jobPresets.forEach(j=>{ mkRadio(j, jobLabel(j), jobDesc(j), jobDefault===j); });
-  }
-
-  // 保存岗位设置：勾选的预装清单 + 默认岗位 + 花名册开关 → POST /jobs → 关窗
-  $("saveJobsBtn").onclick=async()=>{
-    const st=$("jobStatus"); st.className="status info"; st.textContent="正在保存岗位设置…";
-    $("saveJobsBtn").disabled=true;
-    if($("rosterToggle")) jobRosterEnabled = $("rosterToggle").checked;
-    const payload={ jobs:Array.from(jobSelected), defaultJob:jobDefault, rosterEnabled:jobRosterEnabled };
-    try{
-      const r=await fetch("http://matrix-setup.localhost/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-      const j=await r.json();
-      if(j.ok){
-        st.innerHTML='<span class="ok">✓ 岗位设置已保存，向导即将关闭。</span>';
-      } else { st.className="status err"; st.textContent="✗ "+(j.error||"保存失败"); $("saveJobsBtn").disabled=false; }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("saveJobsBtn").disabled=false; }
-  };
-
-  // 自动激活：调本机服务，打开浏览器授权。激活成功后，若有岗位候选则轮询 /state
-  // 等 status=configured 后展示「选岗位」步骤；无岗位候选则由后端关窗。
-  $("activateBtn").onclick=async()=>{
-    const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
-    $("activateBtn").disabled=true;
-    try{
-      const r=await fetch("http://matrix-setup.localhost/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
-      const j=await r.json();
-      if(j.ok){
-        st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。完成后本窗口会引导你选择岗位。</span>';
-        // 轮询 /state，等激活完成（configured）后渲染岗位区块；
-        // 检测 last_activation_error 感知失败（恢复按钮 + 提示，避免「失败后按钮锁死」）
-        let tries=0;
-        const poll=setInterval(async()=>{
-          tries++;
-          if(tries>90){ clearInterval(poll); $("activateBtn").disabled=false; st.className="status err"; st.textContent="✗ 激活超时未完成，请重试。"; return; }  // 最多 135s
-          try{
-            const s=await (await fetch("http://matrix-setup.localhost/state")).json();
-            if(s.last_activation_error){
-              clearInterval(poll);
-              st.className="status err";
-              st.textContent="✗ "+(s.last_activation_error||"激活失败，请重试");
-              $("activateBtn").disabled=false;
-              return;
-            }
-            if(s.status==="configured"){
-              clearInterval(poll);
-              st.className="status ok";
-              st.textContent="✓ 已激活！";
-              if(s.job_presets && s.job_presets.length){
-                renderJobSection(s);
-              }
-            }
-          }catch(e){}
-        },1500);
-      } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; }
-  };
-
-  // 开发者手动配置：显示令牌切换 + 提交
-  $("toggleToken").onclick=()=>{ const el=$("mToken"); el.type = el.type==="password" ? "text" : "password"; };
-  $("submitBtn").onclick=async()=>{
-    const st=$("manualStatus"); st.className="status info"; st.textContent="正在写入配置…";
-    $("submitBtn").disabled=true;
-    const payload={
-      homeserverUrl:$("mHs").value.trim(),
-      userId:$("mUid").value.trim(),
-      owner:$("mOwner").value.trim(),
-      accessToken:$("mToken").value.trim()
-    };
-    try{
-      const r=await fetch("http://matrix-setup.localhost/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-      const j=await r.json();
-      if(j.ok){
-        st.innerHTML='<span class="ok">✓ 已提交！本窗口会自动关闭，进度在操作窗口显示。</span>';
-      } else { st.className="status err"; st.textContent="✗ "+(j.error||"提交失败"); $("submitBtn").disabled=false; }
-    }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("submitBtn").disabled=false; }
-  };
-})();
-</script>
-</body>
-</html>"#.to_string();
-    html
-}
-
-// ---------- 测试 ----------
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_settings_with_mirror() -> String {
-        // 模拟 dsh 已写入大量运行时镜像的 settings.yaml
-        "dsh-matrix:\n  homeserverUrl: 'https://old.example'\n  timelineSnapshot:\n    entries: []\n    updatedAt: 123\n  tasksSnapshot:\n    rooms: {}\n".to_string()
-    }
-
-    #[test]
-    fn write_preserves_mirror_keys_and_updates_account() {
-        let dir = std::env::temp_dir().join(format!("dsh-setup-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        std::fs::write(&path, sample_settings_with_mirror()).unwrap();
-        let acc = MatrixAccount {
-            homeserver_url: "https://im.example".into(),
-            user_id: "@ai-x:example".into(),
-            access_token: "tok-123".into(),
-            owner: "@owner:example".into(),
-        };
-        write_account_to_file(&path, &acc).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        // 账号键已更新
-        assert!(text.contains("homeserverUrl: https://im.example"));
-        assert!(text.contains("userId: '@ai-x:example'"));
-        assert!(text.contains("accessToken: tok-123"));
-        // 镜像键保留
-        assert!(text.contains("timelineSnapshot"));
-        assert!(text.contains("tasksSnapshot"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn write_creates_file_when_absent() {
-        let dir = std::env::temp_dir().join(format!("dsh-setup-create-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        let acc = MatrixAccount {
-            homeserver_url: "https://im.example".into(),
-            user_id: "@ai-x:example".into(),
-            access_token: "t".into(),
-            owner: String::new(),
-        };
-        write_account_to_file(&path, &acc).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("dsh-matrix:"));
-        assert!(text.contains("homeserverUrl"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn clear_empties_account_keeps_mirror() {
-        let dir = std::env::temp_dir().join(format!("dsh-setup-clear-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        std::fs::write(&path, sample_settings_with_mirror()).unwrap();
-        clear_account_in_file(&path).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("timelineSnapshot"));
-        // 账号键被置空（homeserverUrl: ''）
-        assert!(text.contains("homeserverUrl: ''") || text.contains("homeserverUrl: \"\""));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_ns_reads_account_fields() {
-        let yaml = "dsh-matrix:\n  homeserverUrl: 'https://a'\n  userId: '@u:a'\n  accessToken: 't1'\n  owner: '@o:a'\n  timelineSnapshot: {}\n";
-        let acc = parse_ns(yaml, MATRIX_NS).unwrap();
-        assert_eq!(acc.homeserver_url, "https://a");
-        assert_eq!(acc.user_id, "@u:a");
-        assert_eq!(acc.access_token, "t1");
-        assert_eq!(acc.owner, "@o:a");
-    }
-
-    // ---------- HiMarket SSO 登录态读写 ----------
-
-    #[test]
-    fn himarket_write_preserves_other_keys() {
-        let dir = std::env::temp_dir().join(format!("dsh-hm-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        // 模拟已有 himarket 配置（含非登录键，必须保留）
-        std::fs::write(
-            &path,
-            "himarket:\n  baseUrl: 'http://market.example'\n  gatewayUrl: 'http://job.example'\n  portalId: 'p-1'\n  skillInstallDir: '/x'\n",
-        )
-        .unwrap();
-        let login = HimarketLogin {
-            base_url: "http://market.ai.ict.cmcc".into(),
-            username: "niukunliang".into(),
-            display_name: "牛昆亮".into(),
-            token: "tok-abc".into(),
-        };
-        write_himarket_login_to_file(&path, &login).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("token: tok-abc"));
-        assert!(text.contains("username: niukunliang"));
-        assert!(text.contains("displayName: 牛昆亮"));
-        assert!(text.contains("baseUrl: http://market.ai.ict.cmcc"));
-        // 非登录键必须原样保留
-        assert!(text.contains("gatewayUrl: http://job.example"));
-        assert!(text.contains("portalId: p-1"));
-        assert!(text.contains("skillInstallDir: /x"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn himarket_write_skips_empty_values() {
-        // SSO 登录缺 username 时，不应把用户已填的兜底账号清掉
-        let dir = std::env::temp_dir().join(format!("dsh-hm-empty-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        std::fs::write(&path, "himarket:\n  username: 'user'\n  password: 'pw'\n").unwrap();
-        let login = HimarketLogin {
-            base_url: String::new(),
-            username: String::new(),
-            display_name: String::new(),
-            token: "tok-new".into(),
-        };
-        write_himarket_login_to_file(&path, &login).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("token: tok-new"));
-        assert!(text.contains("username: user"), "空 username 不应覆盖已填值");
-        assert!(text.contains("password: pw"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn himarket_token_state_detects_login() {
-        let dir = std::env::temp_dir().join(format!("dsh-hm-state-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-
-        // 无文件 → 未登录
-        assert_eq!(himarket_token_state_in_file(&path), HimarketTokenState::NotLoggedIn);
-
-        // token 为空 → 未登录
-        std::fs::write(&path, "himarket:\n  token: ''\n  username: 'u'\n").unwrap();
-        assert_eq!(himarket_token_state_in_file(&path), HimarketTokenState::NotLoggedIn);
-
-        // token 非空 → 已登录（带用户名）
-        std::fs::write(&path, "himarket:\n  token: 't'\n  username: 'niukunliang'\n").unwrap();
-        assert_eq!(
-            himarket_token_state_in_file(&path),
-            HimarketTokenState::LoggedIn {
-                username: "niukunliang".into(),
-                display_name: String::new(),
-            }
-        );
-
-        // 带中文姓名（SSO 登录后）→ 一并读出
-        std::fs::write(&path, "himarket:\n  token: 't'\n  username: 'niukunliang'\n  displayName: 牛昆亮\n").unwrap();
-        assert_eq!(
-            himarket_token_state_in_file(&path),
-            HimarketTokenState::LoggedIn {
-                username: "niukunliang".into(),
-                display_name: "牛昆亮".into(),
-            }
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ---------- 员工身份（管理页「谁在用这台机器」）----------
-
-    #[test]
-    fn identity_reads_sso_username_and_display_name() {
-        let dir = std::env::temp_dir().join(format!("dsh-id-sso-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        std::fs::write(
-            &path,
-            "himarket:\n  username: niukunliang\n  displayName: 牛昆亮\n  token: t\n\
-             dsh-matrix:\n  userId: '@ai-niukunliang:im.ai.ict.cmcc'\n  owner: '@niukunliang:im.ai.ict.cmcc'\n",
-        )
-        .unwrap();
-        let id = read_identity_from_file(&path);
-        assert_eq!(id.username, "niukunliang");
-        assert_eq!(id.display_name, "牛昆亮");
-        assert_eq!(id.owner, "@niukunliang:im.ai.ict.cmcc");
-        assert_eq!(id.twin_user_id, "@ai-niukunliang:im.ai.ict.cmcc");
-        assert!(id.any());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn identity_falls_back_to_owner_when_not_sso_logged_in() {
-        // 未 SSO 登录（himarket 无 username），但分身已配置 → 从 owner 反推账号名
-        let dir = std::env::temp_dir().join(format!("dsh-id-owner-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        std::fs::write(
-            &path,
-            "dsh-matrix:\n  userId: '@ai-niukunliang:im.ai.ict.cmcc'\n  owner: '@niukunliang:im.ai.ict.cmcc'\n",
-        )
-        .unwrap();
-        let id = read_identity_from_file(&path);
-        assert_eq!(id.username, "niukunliang", "owner 反推账号名");
-        assert!(id.display_name.is_empty(), "无 SSO 时没有中文姓名");
-        assert!(id.any());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn identity_empty_when_nothing_configured() {
-        let dir = std::env::temp_dir().join(format!("dsh-id-none-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-
-        // 文件不存在 → 空身份，且 any()=false（管理页显示「未登录」）
-        let id = read_identity_from_file(&path);
-        assert!(!id.any(), "无文件时不应报告身份");
-
-        // 文件存在但无关键 → 同样空身份
-        std::fs::write(&path, "llm:\n  retries: 3\n").unwrap();
-        let id = read_identity_from_file(&path);
-        assert!(!id.any());
-        assert_eq!(id, ClientIdentity::default());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn identity_ignores_twin_account_prefix_in_owner_fallback() {
-        // 反推只在 owner 上做：分身 userId 是机器账号（@ai-xxx），不能当人名用
-        assert_eq!(localpart_of("@niukunliang:im.ai.ict.cmcc"), "niukunliang");
-        assert_eq!(localpart_of("@ai-niukunliang:im.ai.ict.cmcc"), "ai-niukunliang");
-        // 非 Matrix userId 形状 → 空串（不猜）
-        assert_eq!(localpart_of(""), "");
-        assert_eq!(localpart_of("niukunliang"), "");
-        assert_eq!(localpart_of("@nocolon"), "");
-        assert_eq!(localpart_of("@:im.ai.ict.cmcc"), "");
-    }
-
-    #[test]
-    fn identity_json_uses_camel_case() {
-        // 上报给中心服务端的字段名是 camelCase（与 sync.rs 的 json! 一致）
-        let id = ClientIdentity {
-            username: "niukunliang".into(),
-            display_name: "牛昆亮".into(),
-            owner: "@niukunliang:im.ai.ict.cmcc".into(),
-            twin_user_id: "@ai-niukunliang:im.ai.ict.cmcc".into(),
-        };
-        let json = serde_json::to_string(&id).unwrap();
-        assert!(json.contains("\"displayName\":\"牛昆亮\""), "got {json}");
-        assert!(json.contains("\"twinUserId\""), "got {json}");
-        assert!(json.contains("\"username\":\"niukunliang\""), "got {json}");
-    }
-
-    #[test]
-    fn himarket_clear_keeps_baseurl() {
-        let dir = std::env::temp_dir().join(format!("dsh-hm-clear-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.yaml");
-        std::fs::write(
-            &path,
-            "himarket:\n  baseUrl: 'http://m'\n  token: 't'\n  username: 'u'\n  portalId: 'p'\n",
-        )
-        .unwrap();
-        clear_himarket_login_in_file(&path).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("token: ''") || text.contains("token: \"\""));
-        assert!(text.contains("baseUrl: http://m"), "baseUrl 应保留");
-        assert!(text.contains("portalId: p"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn account_complete_and_missing() {
-        let full = MatrixAccount {
-            homeserver_url: "https://a".into(),
-            user_id: "@u:a".into(),
-            access_token: "t".into(),
-            owner: String::new(),
-        };
-        assert!(full.complete());
-        assert!(full.missing().is_empty());
-
-        let no_token = MatrixAccount {
-            homeserver_url: "https://a".into(),
-            user_id: "@u:a".into(),
-            access_token: String::new(),
-            owner: String::new(),
-        };
-        assert!(!no_token.complete());
-        assert_eq!(no_token.missing(), vec!["accessToken"]);
-
-        // 占位 token 视为未配置
-        let pending = MatrixAccount {
-            homeserver_url: "https://a".into(),
-            user_id: "@u:a".into(),
-            access_token: PENDING_CONFIG.into(),
-            owner: String::new(),
-        };
-        assert!(!pending.complete());
-    }
-
-    #[test]
-    fn parse_preset_patch_extracts_config() {
-        let patch = "# bundle layer\n- insert:\n    - id: matrix\n      name: dsh-matrix-agent\n      config:\n        homeserverUrl: 'https://im.example'\n        userId: '@ai-x:example'\n        accessToken: ''\n        owner: '@owner:example'\n";
-        let acc = parse_preset_patch(patch);
-        assert_eq!(acc.homeserver_url, "https://im.example");
-        assert_eq!(acc.user_id, "@ai-x:example");
-        assert_eq!(acc.owner, "@owner:example");
-        assert_eq!(acc.access_token, "");
-    }
+/// HTML 已抽为独立静态资源（src-tauri/embedded-ui/matrix-setup.html），
+/// 双轨加载：服务端下发版优先（同步拉取缓存在 app_data/ui-bundle/），离线回落内置。
+pub fn wizard_html<R: Runtime>(app: &AppHandle<R>) -> String {
+    crate::embedded::matrix_setup_html(app)
 }

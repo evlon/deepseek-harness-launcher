@@ -18,6 +18,9 @@ use tauri::{AppHandle, Runtime};
 use crate::config::*;
 use crate::notify;
 use crate::tray;
+// Windows 上隐藏子进程控制台窗口（防「安装/卸载插件时弹黑框」）
+#[cfg(windows)]
+use crate::install::hide_console;
 
 /// 服务端下发的托盘菜单策略。
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -63,6 +66,9 @@ pub struct ServerConfig {
     /// himarket 插件按名自动下载落盘到 .agent-presets/。
     #[serde(default, rename = "jobPresets")]
     pub job_presets: Vec<String>,
+    /// UI 包版本（服务端下发的本地窗口 HTML 版本号；空 = 未启用下发）。
+    #[serde(default, rename = "uiBundle")]
+    pub ui_bundle: Option<serde_json::Value>,
 }
 
 /// 客户端已装插件详情（跨所有 profile，上报给服务端）。
@@ -679,6 +685,9 @@ pub async fn uninstall_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Res
     for (k, v) in &env {
         cmd.env(k, v);
     }
+    // Windows 隐藏控制台窗口防止弹黑框
+    #[cfg(windows)]
+    hide_console(&mut cmd);
     let output = tauri::async_runtime::spawn_blocking(move || cmd.output()).await
         .map_err(|e| format!("UNINSTALL_SPAWN_FAILED: {e}"))?;
     let output = output.map_err(|e| format!("UNINSTALL_LAUNCH_FAILED: {e}"))?;
@@ -730,7 +739,7 @@ fn save_state<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig, state: &Sync
 
 // ---------- 网络 ----------
 
-fn http_client() -> reqwest::Client {
+pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("dsh-harness-launcher-sync")
         .connect_timeout(Duration::from_secs(5))
@@ -739,9 +748,36 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// 检查并后台拉取 UI 包（服务端下发的本地窗口 HTML）。
+/// 客户端主动发起（同步成功后才触发），不阻塞主同步。
+fn check_ui_bundle<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig, config: &ServerConfig) {
+    let Some(ub) = config.ui_bundle.as_ref() else { return };
+    let server_version = ub.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if server_version.is_empty() {
+        return; // 服务端未启用 UI 包，不用管
+    }
+    let cached = crate::ui_bundle::cached_version(app);
+    if !crate::ui_bundle::needs_update(&server_version, cached.as_deref()) {
+        log::debug!("UI 包已是最新 v{server_version}");
+        return;
+    }
+    let server_url = resolve_server_url(cfg);
+    if server_url.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    log::info!("检测到新版 UI 包 v{server_version}（本地 {}），后台拉取", cached.as_deref().unwrap_or("无"));
+    // 后台任务：拉取并缓存（失败仅日志，下次同步再试）
+    tauri::async_runtime::spawn(async move {
+        match crate::ui_bundle::download_ui_bundle(&app, &server_url, &server_version).await {
+            Ok(v) => log::info!("UI 包更新完成 v{v}"),
+            Err(e) => log::warn!("UI 包拉取失败（下次同步重试）：{e}"),
+        }
+    });
+}
+
 /// 拉取服务端配置。失败返回 Err（调用方应视作离线，用缓存）。
-pub async fn fetch_config(server_url: &str, token: &str) -> Result<ServerConfig, String> {
-    let url = format!("{}/api/config", server_url.trim_end_matches('/'));
+pub async fn fetch_config(server_url: &str, token: &str) -> Result<ServerConfig, String> {    let url = format!("{}/api/config", server_url.trim_end_matches('/'));
     let mut req = http_client().get(&url);
     if !token.is_empty() {
         req = req.header("X-Admin-Token", token);
@@ -932,6 +968,8 @@ pub async fn sync_once<R: Runtime>(
             state.last_removed = removed.clone();
             state.last_sync_at = Some(now_iso());
             save_state(app, cfg, &state);
+            // UI 包：服务端下发版本 vs 本地缓存版本 → 落后则后台拉取（不阻塞主同步）
+            check_ui_bundle(app, cfg, &config);
             // 菜单策略可能变化 → 刷新托盘
             tray::refresh_sync_menu(app);
             log::info!(
@@ -1240,6 +1278,9 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
     for (k, v) in &env {
         cmd.env(k, v);
     }
+    // Windows 隐藏控制台窗口防止弹黑框
+    #[cfg(windows)]
+    hide_console(&mut cmd);
     let output = tauri::async_runtime::spawn_blocking(move || cmd.output()).await
         .map_err(|e| format!("INSTALL_SPAWN_FAILED: {e}"))?;
     let output = output.map_err(|e| format!("INSTALL_LAUNCH_FAILED: {e}"))?;
@@ -1284,6 +1325,9 @@ pub async fn install_plugin<R: Runtime>(app: &AppHandle<R>, name: &str) -> Resul
             for (k, v) in &env {
                 cmd.env(k, v);
             }
+            // Windows 隐藏控制台窗口防止弹黑框
+            #[cfg(windows)]
+            hide_console(&mut cmd);
             let output = tauri::async_runtime::spawn_blocking(move || cmd.output()).await
                 .map_err(|e| format!("INSTALL_SPAWN_FAILED: {e}"))?;
             let output = output.map_err(|e| format!("INSTALL_LAUNCH_FAILED: {e}"))?;
