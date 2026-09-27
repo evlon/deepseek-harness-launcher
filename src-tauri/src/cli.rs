@@ -221,6 +221,7 @@ pub fn run_cli<R: Runtime>(app: &AppHandle<R>, args: &CliArgs) -> i32 {
                 crate::matrix_setup::MatrixStatus::Configured => ("configured".to_string(), Vec::new()),
                 crate::matrix_setup::MatrixStatus::NotInstalled => ("not-installed".to_string(), Vec::new()),
                 crate::matrix_setup::MatrixStatus::Unconfigured { missing } => ("unconfigured".to_string(), missing.clone()),
+                crate::matrix_setup::MatrixStatus::ReadyToActivate => ("ready-activate".to_string(), Vec::new()),
             };
             let json = serde_json::json!({ "status": state, "missing": missing });
             println!("[matrix-setup-status] {}", serde_json::to_string_pretty(&json).unwrap_or_default());

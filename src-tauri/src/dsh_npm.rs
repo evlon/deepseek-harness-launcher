@@ -15,6 +15,9 @@ use std::time::Duration;
 use tauri::{AppHandle, Runtime};
 
 use crate::config::*;
+// Windows 上隐藏子进程控制台窗口（防「安装 dsh 核心时弹黑框」）
+#[cfg(windows)]
+use crate::install::hide_console;
 
 /// npm 上的 dsh 包名。
 pub const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
@@ -322,6 +325,9 @@ async fn run_pnpm(
             cmd.env("PATH", joined);
         }
     }
+    // Windows 隐藏控制台窗口防止弹黑框
+    #[cfg(windows)]
+    hide_console(&mut cmd);
 
     let child = cmd.spawn().map_err(|e| format!("pnpm spawn: {e}"))?;
     let pid = child.id();

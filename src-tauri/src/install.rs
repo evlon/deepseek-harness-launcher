@@ -2,9 +2,22 @@
 //! 随后预置 web profile 插件与 matrix profile（数字分身），
 //! 并为 matrix profile 写入自定义品牌名称 patch（pnpm shim + `dsh plugin add`）。
 
+// Windows 上隐藏子进程控制台窗口（CREATE_NO_WINDOW），防「安装时弹黑框」。
+#[cfg(windows)]
+pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    cmd
+}
+
+#[cfg(not(windows))]
+pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::config::*;
 use crate::download::Component;
@@ -40,8 +53,23 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         "安装服务器推荐插件",
     ];
     crate::ops::start_op(app, "install", "安装 / 修复", &steps);
-    if let Err(e) = crate::console::open_console(app) {
-        log::warn!("进度窗口打开失败（降级为托盘状态 + 通知）：{e}");
+    // ⚠️ 单窗口一贯流程（2026 审计收敛）：进度容器按「当前是否需要激活」二选一，
+    // **同一时刻只出现一个窗口、绝不双窗叠加**：
+    // - 尚未激活（首次引导态 / 数字分身未配置）→ 打开/聚焦「配置数字分身」向导，
+    //   进度内嵌该窗口（向导 HTML 内嵌进度区轮询 /op-state），不弹独立进度窗；
+    // - 已激活（Configured，用户纯粹点「安装 / 修复」补装/修复依赖）→ 无向导需求，
+    //   用独立「操作进度」窗展示（与插件更新等菜单类操作共用同一个 op-console）。
+    // 旧实现这里无条件 open_console，配合 main.rs 预热会「双窗交替闪烁」——已收敛。
+    let need_activation = crate::first_run::needs_onboarding(app);
+    if app.get_webview_window("matrix-setup").is_none() {
+        if need_activation {
+            // 未激活：向导即唯一进度容器（它是指引主流程入口）
+            if let Err(e) = crate::matrix_setup::open_window(app) {
+                log::warn!("打开进度容器（配置向导）失败（降级为托盘状态 + 通知）：{e}");
+            }
+        } else if let Err(e) = crate::console::open_console(app) {
+            log::warn!("进度窗口打开失败（降级为托盘状态 + 通知）：{e}");
+        }
     }
 
     // ① 安全证书（内网 HTTPS 根 CA + 代码签名根 CA）：最先做。失败不阻断后续依赖安装
@@ -52,7 +80,10 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     crate::ops::append_log(app, "开始导入内网根证书 + 代码签名根证书…");
 
     let mut cert_ok = true;
-    match install_root_ca(app, &cfg) {
+    // 合并确认：两枚证书一口气导入，只弹一次说明框（减少「确认框 + 确认框」两连弹）。
+    // 用户取消则跳过证书导入（依赖安装仍继续），不视为致命错误。
+    let cert_confirmed = crate::install::confirm_root_ca_import_both();
+    match install_root_ca(app, &cfg, cert_confirmed) {
         Ok(()) => crate::ops::append_log(app, "✓ 内网根证书已导入系统信任库"),
         Err(e) => {
             cert_ok = false;
@@ -60,7 +91,7 @@ pub async fn install_all<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             crate::ops::append_log(app, &format!("✗ 内网根证书导入未完成：{e}"));
         }
     }
-    match install_code_signing_ca(app, &cfg) {
+    match install_code_signing_ca(app, &cfg, cert_confirmed) {
         Ok(()) => crate::ops::append_log(app, "✓ 代码签名根证书已导入系统信任库"),
         Err(e) => {
             cert_ok = false;
@@ -604,6 +635,10 @@ const CODE_SIGNING_CA_CN: &str = "ICT Internal AI Code Signing Root CA";
 /// 参数化：证书内容 / 落盘文件名 / 信任库匹配 CN / 说明框标题与正文 / 取消提示，
 /// 供 HTTPS 内网根 CA（`install_root_ca`）与代码签名根 CA（`install_code_signing_ca`）共用，
 /// 保证两处「先查后装 → 去静默化确认 → UAC 提权 → 回读验证」行为完全一致。
+///
+/// `confirm_already_done = true` 时跳过本轮说明确认框（由调用方预先用
+/// `confirm_root_ca_import_both` 合并确认过）：避免「内网根 CA + 代码签名根 CA」
+/// 连续导入时弹两次说明框——只剩必需的 UAC 提权弹窗。
 #[cfg(windows)]
 fn import_root_ca_to_store<R: Runtime>(
     app: &AppHandle<R>,
@@ -614,6 +649,7 @@ fn import_root_ca_to_store<R: Runtime>(
     dialog_title: &str,
     dialog_body: &str,
     cancelled_hint: &str,
+    confirm_already_done: bool,
 ) -> Result<(), String> {
     // 1. 落到磁盘（certutil 需要一个文件路径）
     let cert_path = dsh_home(app, cfg).join(file_name);
@@ -650,7 +686,8 @@ fn import_root_ca_to_store<R: Runtime>(
     //     讲清楚接下来会发生什么（提权导入该根证书）、为什么需要、
     //     以及选择「否」的后果。避免用户只看到一闪的 UAC、不明所以，
     //     也降低「静默提权」被安全软件误判为可疑程序的可能。
-    if !confirm_root_ca_import(dialog_title, dialog_body) {
+    //     （confirm_already_done=true 时跳过：调用方已用合并确认框说明过两枚证书）
+    if !confirm_already_done && !confirm_root_ca_import(dialog_title, dialog_body) {
         return Err(cancelled_hint.to_string());
     }
 
@@ -672,7 +709,16 @@ fn import_root_ca_to_store<R: Runtime>(
     }
 }
 
-pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+/// 导入内网 HTTPS 根 CA（解决浏览器访问 *.ai.ict.cmcc 红锁/不安全提示）。
+///
+/// `confirm_already_done`：true 时跳过本枚证书的说明确认框（调用方已预先
+/// 用 `confirm_root_ca_import_both` 合并确认过两枚证书），默认 false（保持
+/// 单函数独立调用时的说明确认行为）。
+pub fn install_root_ca<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &LauncherConfig,
+    confirm_already_done: bool,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
         import_root_ca_to_store(
@@ -688,11 +734,12 @@ pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> 
              · 点击「确定」= 继续，随后在 UAC 弹窗中选择「是」\n\
              · 点击「取消」= 跳过，不导入（可稍后在托盘“重装内网证书”重试）",
             "已取消：你选择不导入内网根证书。可随时在托盘「重装内网证书」重试",
+            confirm_already_done,
         )
     }
     #[cfg(not(windows))]
     {
-        let _ = (app, cfg);
+        let _ = (app, cfg, confirm_already_done);
         log::info!("非 Windows 平台，跳过内网根 CA 导入");
         Ok(())
     }
@@ -703,9 +750,13 @@ pub fn install_root_ca<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> 
 /// 与 `install_root_ca`（导入 HTTPS 内网根 CA）是**两条独立的腿**：
 /// 前者解决浏览器红锁，本函数解决 exe「未知发布者 / 无法验证签名」。二者共用
 /// 同一套「先查后装 + 确认 + UAC 提权 + 回读验证」底层逻辑（`import_root_ca_to_store`）。
+///
+/// `confirm_already_done`：true 时跳过本枚证书的说明确认框（调用方已预先
+/// 用 `confirm_root_ca_import_both` 合并确认过两枚证书），默认 false。
 pub fn install_code_signing_ca<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &LauncherConfig,
+    confirm_already_done: bool,
 ) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -722,11 +773,12 @@ pub fn install_code_signing_ca<R: Runtime>(
              · 点击「确定」= 继续，随后在 UAC 弹窗中选择「是」\n\
              · 点击「取消」= 跳过，不导入（可稍后在托盘“重装内网证书”重试）",
             "已取消：你选择不导入代码签名根证书。可随时在托盘「重装内网证书」重试",
+            confirm_already_done,
         )
     }
     #[cfg(not(windows))]
     {
-        let _ = (app, cfg);
+        let _ = (app, cfg, confirm_already_done);
         log::info!("非 Windows 平台，跳过代码签名根 CA 导入");
         Ok(())
     }
@@ -738,6 +790,10 @@ pub fn install_code_signing_ca<R: Runtime>(
 /// 程序要把内网根证书加入系统「受信任的根证书颁发机构」，需要管理员权限。
 /// 讲清「为什么需要」和「点否的后果」，避免只看到一闪的 UAC、不明所以，
 /// 也降低「静默提权」这一动作被安全软件（Windows Defender 等）误判为可疑行为的可能。
+///
+/// 「重装内网证书」与 install_all 会在**同一轮**里连续导入两枚证书
+/// （内网 HTTPS 根 CA + 代码签名根 CA）。为避免弹两次说明确认框，
+/// 调用方可用 `confirm_root_ca_import_both` 先合并确认一次，再分别导入。
 #[cfg(windows)]
 fn confirm_root_ca_import(title: &str, body: &str) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OKCANCEL, IDOK};
@@ -752,6 +808,20 @@ fn confirm_root_ca_import(title: &str, body: &str) -> bool {
         )
     };
     ret == IDOK
+}
+
+/// 合并确认：一次说明两枚证书都要导入（避免「确认框 + 确认框」两连弹）。
+/// 返回 true = 用户确认继续导入两枚证书。
+#[cfg(windows)]
+pub fn confirm_root_ca_import_both() -> bool {
+    let title = "安装安全证书".to_string();
+    let body = "需要把两枚证书加入系统信任库，以便：\n\n\
+        · 浏览器正常访问公司内网站点（*.ai.ict.cmcc 等，不再提示“不安全/红锁”）\n\
+        · Windows 能验证 launcher 程序签名（不再提示“未知发布者”）\n\n\
+        下一步 Windows 会弹出两次“用户账户控制(UAC)”授权框，点击“是”即完成安装。\n\n\
+        · 点击「确定」= 继续导入两枚证书\n\
+        · 点击「取消」= 跳过（可稍后在托盘「重装内网证书」重试）";
+    confirm_root_ca_import(&title, &body)
 }
 
 /// 非 Windows 平台：无确认框，直接视为继续（桌面端仅面向 Windows）。
@@ -908,6 +978,9 @@ pub async fn preset_profile<R: Runtime>(
         cmd.env(k, v);
     }
     // 插件安装要能看到输出，失败时日志可查
+    // Windows 隐藏控制台窗口防止弹黑框（hide_console 定义于本模块顶部）
+    #[cfg(windows)]
+    hide_console(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     log::info!("预置 {profile} profile 插件：{}", packages.join(", "));
@@ -1046,6 +1119,9 @@ fn install_matrix_web_app<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) 
     for (k, v) in &env {
         cmd.env(k, v);
     }
+    // Windows 隐藏控制台窗口防止弹黑框（hide_console 定义于本模块顶部）
+    #[cfg(windows)]
+    hide_console(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     log::info!("安装 matrix profile web-app bundle：{MATRIX_WEB_APP}");

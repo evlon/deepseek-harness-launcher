@@ -19,6 +19,56 @@ pub fn is_quit_requested() -> bool {
     QUIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 「两步确认」待确认态：菜单里点一次卸载/清理 = 进入待确认（文案变
+/// 「确认卸载：xxx（再点一次）」），再点一次才真正执行——替代原来的
+/// 原生 MessageBox，避免「系统确认框 + 进度窗」两连弹的割裂感。
+///
+/// 带 10 秒自动过期：超时未再点，自动放弃（防误触后一直处于待确认态）。
+struct PendingUninstall {
+    name: String,
+    at: std::time::Instant,
+}
+static PENDING_UNINSTALL: std::sync::OnceLock<std::sync::Mutex<Option<PendingUninstall>>> =
+    std::sync::OnceLock::new();
+fn pending_uninstall() -> &'static std::sync::Mutex<Option<PendingUninstall>> {
+    PENDING_UNINSTALL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 把「待确认卸载」写进静态态（点击后进入待确认）。
+fn arm_pending_uninstall(name: &str) {
+    if let Ok(mut g) = pending_uninstall().lock() {
+        *g = Some(PendingUninstall {
+            name: name.to_string(),
+            at: std::time::Instant::now(),
+        });
+    }
+}
+
+/// 判断「该插件当前是否处于待确认态」（菜单文案据此变成「确认卸载」）。
+fn is_pending_uninstall(name: &str) -> bool {
+    let mut hit = false;
+    if let Ok(mut g) = pending_uninstall().lock() {
+        if let Some(p) = g.as_ref() {
+            if p.name == name && p.at.elapsed() < std::time::Duration::from_secs(10) {
+                hit = true;
+            } else {
+                // 过期或已确认 → 清掉（避免残留待确认态）
+                *g = None;
+            }
+        }
+    }
+    hit
+}
+
+/// 完成一次卸载/清理：清除该插件的待确认态。
+fn clear_pending_uninstall(name: &str) {
+    if let Ok(mut g) = pending_uninstall().lock() {
+        if g.as_ref().map(|p| p.name == name).unwrap_or(false) {
+            *g = None;
+        }
+    }
+}
+
 /// 构建托盘图标与菜单并挂载事件。
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // 直接内嵌 PNG（无窗口应用没有默认窗口图标，避免 unwrap 恐慌）。
@@ -90,6 +140,8 @@ pub fn update_tray_tooltip<R: Runtime>(app: &AppHandle<R>) {
         crate::matrix_setup::MatrixStatus::Configured => parts.push("账号：已配置".to_string()),
         crate::matrix_setup::MatrixStatus::NotInstalled => parts.push("账号：未安装".to_string()),
         crate::matrix_setup::MatrixStatus::Unconfigured { .. } => parts.push("账号：未配置".to_string()),
+        // 阶段一完成、待领号（阶段二）
+        crate::matrix_setup::MatrixStatus::ReadyToActivate => parts.push("账号：待激活".to_string()),
     }
 
     // 管理能力（bridge）运行态
@@ -235,7 +287,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let cfg0 = load_cached();
     if crate::matrix_setup::matrix_agent_installed(app, &cfg0) {
         match crate::matrix_setup::status(app, &cfg0) {
-            crate::matrix_setup::MatrixStatus::Unconfigured { .. } => {
+            crate::matrix_setup::MatrixStatus::Unconfigured { .. }
+            | crate::matrix_setup::MatrixStatus::ReadyToActivate => {
                 owned.push(MenuItem::with_id(app, "ms-warn", "⚠️ 数字分身待配置（点击下方「配置数字分身」）", false, None::<&str>)?);
                 owned.push(MenuItem::with_id(app, "ms-open", "🛠 配置数字分身", true, None::<&str>)?);
             }
@@ -563,10 +616,15 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     // 让用户决定是否一键清理（场景②）。判定数据源 = disabled:true（DSH 客观判定）。
     let broken_plugins = crate::sync::startup_broken_plugins(app, &cfg);
     for (i, b) in broken_plugins.iter().enumerate() {
+        let label = if is_pending_uninstall(b) {
+            format!("⚠️ 确认清理 {b}（再点一次执行）")
+        } else {
+            format!("⚠️ {b} 影响启动（已被禁用，可清理）")
+        };
         broken_items.push(MenuItem::with_id(
             app,
             format!("sync-broken-{i}"),
-            format!("⚠️ {b} 影响启动（已被禁用，可清理）"),
+            label,
             true,
             None::<&str>,
         )?);
@@ -576,10 +634,15 @@ fn build_sync_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R
     // 只针对曾出现在服务端推荐清单里的插件，同事自己装的绝不进入此列表。
     let removed_plugins = state.last_removed.clone();
     for (i, r) in removed_plugins.iter().enumerate() {
+        let label = if is_pending_uninstall(r) {
+            format!("🗑 确认卸载 {r}（再点一次执行）")
+        } else {
+            format!("🗑 {r}（管理员已下架，建议卸载）")
+        };
         remove_items.push(MenuItem::with_id(
             app,
             format!("sync-remove-{i}"),
-            format!("🗑 {r}（管理员已下架，建议卸载）"),
+            label,
             true,
             None::<&str>,
         )?);
@@ -671,7 +734,10 @@ fn build_plugins_submenu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submen
         let mut sorted: Vec<(&String, &String)> = installed.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (i, (name, version)) in sorted.iter().enumerate() {
-            let label = if version.is_empty() {
+            let pending = is_pending_uninstall(name);
+            let label = if pending {
+                format!("⚠️ 确认卸载 {name}（再点一次执行）")
+            } else if version.is_empty() {
                 format!("🗑 {name}")
             } else {
                 format!("🗑 {name}  v{version}")
@@ -743,41 +809,12 @@ fn broken_plugin_at<R: Runtime>(app: &AppHandle<R>, index: usize) -> Option<Stri
     crate::sync::startup_broken_plugins(app, &cfg).get(index).cloned()
 }
 
-/// 卸载前的二次确认框（原生 MessageBox，`确定`/`取消`）。
+/// 批量向导的步骤列表（纯函数，便于测试）。
 ///
-/// 返回 true = 用户确认卸载。Windows 用 `MessageBoxW`（windows-sys 已有依赖，
-/// 无需新增 crate）；非 Windows 平台无确认框，直接放行（桌面端仅面向 Windows）。
-fn confirm_uninstall(name: &str, reason: &str) -> bool {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            MessageBoxW, MB_ICONWARNING, MB_OKCANCEL, IDOK,
-        };
-        let title: Vec<u16> = "确认卸载插件".encode_utf16().chain(std::iter::once(0)).collect();
-        let body: Vec<u16> = format!(
-            "{reason}\n\n确定要卸载插件「{name}」吗？\n\n卸载后可随时重新安装。"
-        )
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-        let ret = unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                body.as_ptr(),
-                title.as_ptr(),
-                MB_OKCANCEL | MB_ICONWARNING,
-            )
-        };
-        ret == IDOK
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (name, reason);
-        true
-    }
-}
-
-/// 插件安装/更新后自动重启 Harness，使新版本生效（Q3：用户不必再手点「停止+启动」）。
+/// 长度 = 插件数（+1：仅当 Harness 原本在运行时才追加「重启」一步）。
+/// ⚠️ 这个「+1」是 `auto_restart_harness` 的 step_index 依据（重启步下标 = 插件数），
+/// 少算一步会把重启标到错误的行上，用户看到的进度就与事实不符。
+/// 插件安装/更新后自动重启 Harness，使新版本生效（用户不必再手点「停止+启动」）。
 ///
 /// 语义与用户诉求一致：
 /// - Harness **本来就在运行** → 停止并重启（新插件版本需重载才生效）；
@@ -881,11 +918,14 @@ fn batch_summary(total: usize, ok: usize, failed: &[(String, String)], restarted
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
         "fr-open" => {
+            // 🚀 激活数字分身：直接打开「配置数字分身」激活向导（单窗口一贯流程），
+            // 不再走 first-run 首屏（旧实现：first-run → 点激活 → 关首屏 → 开向导，
+            // 一关一开两次弹窗；向导内已内置首屏同款引导文案 + 内嵌进度）。
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
-                match crate::first_run::open_window(&h) {
+                match crate::matrix_setup::open_window(&h) {
                     Ok(()) => {}
-                    Err(e) => notify(&h, "无法打开首次使用向导", &e),
+                    Err(e) => notify(&h, "无法打开配置向导", &e),
                 }
             });
         }
@@ -1455,16 +1495,23 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             }
         }
         id if id.starts_with("sync-remove-") => {
-            // 🗑 建议卸载（场景①：管理员已下架）——二次确认后卸载
+            // 🗑 建议卸载（场景①：管理员已下架）——两步确认后卸载
+            // （第一步：记入待确认态 + 菜单文案变「确认卸载」；第二步：真正执行。
+            //  不再弹原生 MessageBox，避免「确认框 + 进度窗」两连弹。）
             let idx = id
                 .strip_prefix("sync-remove-")
                 .and_then(|s| s.parse::<usize>().ok());
             if let Some(idx) = idx {
                 if let Some(name) = removable_plugin_at(app, idx) {
-                    if !confirm_uninstall(&name, "管理员已从服务端下架此插件") {
-                        notify(app, "已取消", &format!("未卸载 {name}"));
+                    if !is_pending_uninstall(&name) {
+                        // 第一步：进入待确认态（再点一次 = 确认执行）
+                        arm_pending_uninstall(&name);
+                        notify(app, "再次点击确认", &format!("再次点击「{name}」即执行卸载"));
+                        refresh_sync_menu(app);
                         return;
                     }
+                    // 第二步：确认执行
+                    clear_pending_uninstall(&name);
                     let h = app.clone();
                     let name_clone = name.clone();
                     tauri::async_runtime::spawn(async move {
@@ -1490,16 +1537,20 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             }
         }
         id if id.starts_with("sync-broken-") => {
-            // ⚠️ 影响启动（场景②：被 DSH 兜底禁用）——二次确认后清理
+            // ⚠️ 影响启动（场景②：被 DSH 兜底禁用）——两步确认后清理
+            // （与 sync-remove 同款两步确认，不弹原生确认框）
             let idx = id
                 .strip_prefix("sync-broken-")
                 .and_then(|s| s.parse::<usize>().ok());
             if let Some(idx) = idx {
                 if let Some(name) = broken_plugin_at(app, idx) {
-                    if !confirm_uninstall(&name, "此插件已被 DSH 禁用（影响启动）") {
-                        notify(app, "已取消", &format!("未清理 {name}"));
+                    if !is_pending_uninstall(&name) {
+                        arm_pending_uninstall(&name);
+                        notify(app, "再次点击确认", &format!("再次点击「{name}」即执行清理"));
+                        refresh_sync_menu(app);
                         return;
                     }
+                    clear_pending_uninstall(&name);
                     let h = app.clone();
                     let name_clone = name.clone();
                     tauri::async_runtime::spawn(async move {
@@ -1523,16 +1574,21 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             }
         }
         id if id.starts_with("plugin-uninstall-") => {
-            // 已装插件一键卸载（用户自主操作）：二次确认后卸载
+            // 已装插件一键卸载（用户自主操作）：两步确认后卸载
+            // （第一步：记入待确认态 + 菜单文案变「确认卸载」；第二步：真正执行。
+            //  不再弹原生 MessageBox，避免「确认框 + 进度窗」两连弹。）
             let idx = id
                 .strip_prefix("plugin-uninstall-")
                 .and_then(|s| s.parse::<usize>().ok());
             if let Some(idx) = idx {
                 if let Some(name) = installed_plugin_at(app, idx) {
-                    if !confirm_uninstall(&name, "卸载后该插件将从当前 profile 移除") {
-                        notify(app, "已取消", &format!("未卸载 {name}"));
+                    if !is_pending_uninstall(&name) {
+                        arm_pending_uninstall(&name);
+                        notify(app, "再次点击确认", &format!("再次点击「{name}」即执行卸载"));
+                        refresh_sync_menu(app);
                         return;
                     }
+                    clear_pending_uninstall(&name);
                     let h = app.clone();
                     let name_clone = name.clone();
                     tauri::async_runtime::spawn(async move {
@@ -1644,21 +1700,23 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             // 重装安全证书：独立重试入口（此前「同步」菜单并不触发证书安装，
             // 证书导入失败后用户无路可走；此菜单项补上真实闭环）。
             // 一次重装两个：内网 HTTPS 根 CA（红锁）+ 代码签名根 CA（未知发布者）。
+            // 合并确认一次（说明两枚证书），随后各走一次 UAC——不再弹两次说明框。
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
                 crate::ops::start_op(&h, "cert-reinstall", "重装内网证书", &["导入安全证书"]);
                 crate::ops::mark_step_running(&h, 0);
                 crate::ops::update_step(&h, "正在导入安全证书…");
                 let cfg = load_cached();
+                let confirmed = crate::install::confirm_root_ca_import_both();
                 let mut errors: Vec<String> = Vec::new();
-                match crate::install::install_root_ca(&h, &cfg) {
+                match crate::install::install_root_ca(&h, &cfg, confirmed) {
                     Ok(()) => crate::ops::append_log(&h, "✓ 内网根证书已导入系统信任库"),
                     Err(e) => {
                         crate::ops::append_log(&h, &format!("✗ 内网根证书导入未完成：{e}"));
                         errors.push(e);
                     }
                 }
-                match crate::install::install_code_signing_ca(&h, &cfg) {
+                match crate::install::install_code_signing_ca(&h, &cfg, confirmed) {
                     Ok(()) => crate::ops::append_log(&h, "✓ 代码签名根证书已导入系统信任库"),
                     Err(e) => {
                         crate::ops::append_log(&h, &format!("✗ 代码签名根证书导入未完成：{e}"));
