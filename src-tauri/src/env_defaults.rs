@@ -405,6 +405,64 @@ pub fn apply_default_job_to_file(path: &Path, default_job: &str) -> Result<usize
     }
 }
 
+/// 把「默认岗位」同步写入 settings.yaml 的 `agent-presets.default`（单个岗位 id 字符串）。
+///
+/// 为什么需要这个（与 himarket.defaultJob 并列）：dsh-bridge 的 worker 会话挂岗位时，
+/// `agentSetup()` 读的是 agent-presets 服务的 `defaultId`（→ settings `agent-presets.default`），
+/// 而不是 himarket.defaultJob。若只写 himarket.defaultJob、不写 agent-presets.default，
+/// 则「激活时选的默认岗位」不会生效，dsh 会回退到 cordis.patch.yml 写死的 agentPreset
+/// （历史教训：写死 pm 导致全新安装 fatal load failure）。
+/// 故本函数在「选岗位」提交时与 himarket.defaultJob 一并落盘，打通「选岗位 → 挂岗位」。
+/// 空串 = 清除该键（用户选了「不指定默认岗位」，回退 cordis.patch.yml 的 agentPreset）。
+pub fn apply_agent_presets_default_to_file(path: &Path, default_preset: &str) -> Result<usize, String> {
+    use serde_yaml::{Mapping, Value};
+
+    let mut root: Mapping = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let v: Value = serde_yaml::from_str(&text)
+                .map_err(|e| format!("SETTINGS_PARSE_FAILED: {e}"))?;
+            v.as_mapping().cloned().unwrap_or_default()
+        }
+        Err(_) => Mapping::new(),
+    };
+
+    let section = root
+        .entry(Value::String("agent-presets".to_string()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let map = section
+        .as_mapping_mut()
+        .ok_or("SETTINGS_NS_NOT_MAP: agent-presets 不是 map")?;
+
+    let key = Value::String("default".to_string());
+    let value = default_preset.trim();
+
+    if value.is_empty() {
+        match map.remove(&key) {
+            Some(_) => {
+                let out = serde_yaml::to_string(&Value::Mapping(root))
+                    .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+                crate::matrix_setup::atomic_write_public(path, out.as_bytes())?;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    } else {
+        let changed = match map.get(&key) {
+            Some(Value::String(s)) => s.as_str() != value,
+            _ => true,
+        };
+        if changed {
+            map.insert(key, Value::String(value.to_string()));
+            let out = serde_yaml::to_string(&Value::Mapping(root))
+                .map_err(|e| format!("SETTINGS_SERIALIZE_FAILED: {e}"))?;
+            crate::matrix_setup::atomic_write_public(path, out.as_bytes())?;
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
 /// 把「花名册开关」写入 settings.yaml 的 `roster.rosterEnabled`（bool）。
 ///
 /// 语义：花名册（dsh-roster-consumer）是**独立能力**，不挂在某个岗位下。勾选=开启
@@ -726,6 +784,35 @@ mod tests {
         let txt = std::fs::read_to_string(&p).unwrap();
         assert!(!txt.contains("defaultJob"), "defaultJob 应被移除：{txt}");
         assert!(txt.contains("baseUrl: keep"), "其它键应保留");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn agent_presets_default_writes_and_preserves_others() {
+        let p = tmp_path("ap-default");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, "himarket:\n  defaultJob: leader\n").unwrap();
+        let written = apply_agent_presets_default_to_file(&p, "leader").unwrap();
+        assert_eq!(written, 1);
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("agent-presets:"), "应写入 agent-presets section：{txt}");
+        assert!(txt.contains("default: leader"), "应写入 agent-presets.default: leader：{txt}");
+        assert!(txt.contains("defaultJob: leader"), "不能破坏 himarket.defaultJob");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn agent_presets_default_idempotent_and_clear() {
+        let p = tmp_path("ap-default-idem");
+        std::fs::write(&p, "agent-presets:\n  default: leader\n").unwrap();
+        // 值相同 → 不重复写
+        let w1 = apply_agent_presets_default_to_file(&p, "leader").unwrap();
+        assert_eq!(w1, 0, "值相同不该重复写");
+        // 空串 → 清除 default 键
+        let w2 = apply_agent_presets_default_to_file(&p, "").unwrap();
+        assert_eq!(w2, 1, "空串应清除 default 键");
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(!txt.contains("default:"), "default 键应被移除：{txt}");
         let _ = std::fs::remove_file(&p);
     }
 

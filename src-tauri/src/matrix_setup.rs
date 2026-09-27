@@ -966,12 +966,19 @@ pub fn handle_scheme_request<R: TauriRuntime>(
         // 落盘预装岗位清单（用户勾选的）+ 默认岗位 + 花名册开关
         let jobs_result = crate::env_defaults::apply_job_presets_to_file(&path, &jobs);
         let dj_result = crate::env_defaults::apply_default_job_to_file(&path, &default_job);
+        // ⭐ 打通「选岗位 → 挂岗位」：默认岗位同时写入 agent-presets.default，
+        // 使 dsh-bridge 的 worker 会话 agentSetup() 能读到用户选的默认岗位
+        // （否则会回退 cordis.patch.yml 写死的 agentPreset，历史教训：写死 pm 导致崩溃）。
+        let apd_result = crate::env_defaults::apply_agent_presets_default_to_file(&path, &default_job);
         let roster_result = crate::env_defaults::apply_roster_enabled_to_file(&path, roster_enabled);
         if let Err(e) = jobs_result {
             log::warn!("[jobs] 落盘预装岗位清单失败：{e}");
         }
         if let Err(e) = dj_result {
             log::warn!("[jobs] 落盘默认岗位失败：{e}");
+        }
+        if let Err(e) = apd_result {
+            log::warn!("[jobs] 落盘 agent-presets.default 失败：{e}");
         }
         if let Err(e) = roster_result {
             log::warn!("[jobs] 落盘花名册开关失败：{e}");
