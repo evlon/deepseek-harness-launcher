@@ -87,8 +87,10 @@ impl Component {
             Component::Dsh => {
                 // npm 方式：pnpm 安装 @deepseek-ai/dsh@<version>（走 npm registry / npmmirror）。
                 // 相比 GitHub release zip：npm 镜像在国内更稳定，版本精确可控（dist-tags）。
-                let version = crate::dsh_npm::latest_version().await.unwrap_or_default();
-                log::info!("最新 Harness 版本：{}", version);
+                // 版本优先取服务端下发的固定版本（config.dshVersion），否则 npm latest——
+                // 解决「不同同事在不同时间装到不同 latest 导致版本不一致」。
+                let version = crate::dsh_npm::target_version().await.unwrap_or_default();
+                log::info!("目标 Harness 版本：{}", version);
                 let dest = self.install_dest(app);
                 crate::dsh_npm::install_to(app, &dest, &version, on_progress).await?;
             }

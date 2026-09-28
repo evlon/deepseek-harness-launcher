@@ -108,6 +108,22 @@ pub async fn latest_version() -> Result<String, String> {
         .ok_or_else(|| "DSH_NPM_NO_LATEST: dist-tags.latest 缺失".to_string())
 }
 
+/// 目标安装版本：服务端下发的固定版本（`config.dshVersion`）优先，否则 npm latest。
+///
+/// 用于「首次安装 dsh」与「检查更新」——让全员装同一版，避免不同同事
+/// 在不同时间装到不同时点的 `latest` 造成版本不一致。
+pub async fn target_version() -> Result<String, String> {
+    let cfg = load_cached();
+    if let Some(fixed) = cfg.dsh_version.as_deref() {
+        let fixed = fixed.trim();
+        if !fixed.is_empty() {
+            log::info!("使用服务端下发的固定 dsh 版本：{fixed}");
+            return Ok(fixed.to_string());
+        }
+    }
+    latest_version().await
+}
+
 /// 远程版本列表（用于「检查更新 / 安装指定版本」）。
 /// 返回每项 { version, prerelease, distTag }；按版本号倒序（最新在前）。
 ///

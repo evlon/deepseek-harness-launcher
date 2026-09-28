@@ -105,6 +105,13 @@ pub struct LauncherConfig {
     /// 本字段决定候选集：`rc` 排除 alpha/beta/dev；`alpha` 用全量。
     /// 缺省 `rc`（安全默认）；可由服务端 `clientDefaults.dshChannel` 统一下发。
     pub dsh_channel: Option<String>,
+    /// 全员固定 dsh 核心版本（如 `0.1.2-rc.1`）。由服务端 `clientDefaults.dshVersion`
+    /// 统一下发；设置后同事 launcher 首次安装 / 检查更新时优先用它，而非
+    /// npm `dist-tags.latest`。空/未设置 = 不固定（回落 latest）。
+    ///
+    /// 背景：dsh 发版快，不同同事在不同时间安装会拉到不同时点的 `latest`，
+    /// 造成「同事间 dsh 版本不一致、互相不兼容」。固定版本让全员装同一版。
+    pub dsh_version: Option<String>,
     /// 是否允许公网 registry 回退（缺省 true 保持旧行为）。
     ///
     /// 背景：查 dsh 版本时 registry 候选是「内网 registry → npmmirror → npmjs」。
@@ -164,6 +171,13 @@ pub fn is_alpha_like(version: &str) -> bool {
     };
     let tag = pre.split('.').next().unwrap_or("").to_ascii_lowercase();
     tag.starts_with("alpha") || tag.starts_with("beta") || tag.starts_with("dev")
+}
+
+/// 是否为合法 semver 版本号（`x.y.z` 或 `x.y.z-预发布`，如 `0.1.2-rc.1`）。
+/// 用于校验服务端下发的 `dshVersion`（固定 dsh 版本）。
+pub fn is_semver_like(version: &str) -> bool {
+    let v = version.trim().trim_start_matches('v');
+    semver::Version::parse(v).is_ok()
 }
 
 /// 镜像上传设置。
@@ -1068,6 +1082,20 @@ pub fn apply_server_overrides(
     if let Some(v) = server.get("allowUpstreamRegistry").and_then(|v| v.as_bool()) {
         local.allow_upstream_registry = Some(v);
     }
+    // dshVersion：全员固定 dsh 核心版本（如 0.1.2-rc.1）。
+    // 企业统一管理项——管理员决定全员装哪版，解决「不同同事装不同版本」。
+    // 不遵循「用户显式设置不覆盖」（同 dshChannel）。空串 = 清除固定（回落 latest）。
+    if server.get("dshVersion").is_some() {
+        let v = server.get("dshVersion").and_then(|x| x.as_str()).unwrap_or("");
+        let t = v.trim();
+        if t.is_empty() {
+            local.dsh_version = None;
+        } else if is_semver_like(t) {
+            local.dsh_version = Some(t.to_string());
+        } else {
+            log::warn!("服务端 dshVersion 值非法（{v}），忽略（应为 semver 版本号或空串）");
+        }
+    }
     // dshRegistry：内网 dsh 安装源（装/更新 dsh 时走内网 npm registry）。
     // 服务端下发的值强制写入 mirror_settings.registry（dsh_npm::npm_registry_for_install
     // 读到非空即用内网）。属企业统一管理项（同 dshMirrorUrl 语义，不遵循「用户显式
@@ -1659,5 +1687,58 @@ mod tests {
         };
         merge_user_into_builtin(&mut builtin, user);
         assert!(manual_config_enabled(&builtin));
+    }
+
+    #[test]
+    fn server_dsh_version_written() {
+        // 服务端下发 dshVersion → 写入 local.dsh_version（固定版本）
+        let mut local = builtin_default_config();
+        let server = serde_json::json!({ "dshVersion": "0.1.2-rc.1" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert_eq!(local.dsh_version.as_deref(), Some("0.1.2-rc.1"));
+    }
+
+    #[test]
+    fn server_dsh_version_invalid_ignored() {
+        // 非法版本号（非 semver）→ 忽略，保持 None
+        let mut local = builtin_default_config();
+        let server = serde_json::json!({ "dshVersion": "not-a-version" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert!(local.dsh_version.is_none(), "非法 dshVersion 被忽略");
+    }
+
+    #[test]
+    fn server_dsh_version_empty_clears() {
+        // 服务端 dshVersion 空串 → 清除固定版本（回落 latest）
+        let mut local = builtin_default_config();
+        local.dsh_version = Some("0.1.2-rc.1".to_string());
+        let server = serde_json::json!({ "dshVersion": "" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert!(local.dsh_version.is_none(), "空串清除固定版本");
+    }
+
+    #[test]
+    fn server_without_dsh_version_keeps_local() {
+        // 服务端未下发 dshVersion → 本地值保持不变
+        let mut local = builtin_default_config();
+        local.dsh_version = Some("0.1.2-rc.1".to_string());
+        let server = serde_json::json!({ "npmRegistry": "https://registry.npmmirror.com/" });
+        apply_server_overrides(&mut local, &server, &[]);
+        assert_eq!(local.dsh_version.as_deref(), Some("0.1.2-rc.1"));
+    }
+
+    #[test]
+    fn is_semver_like_accepts_valid_versions() {
+        assert!(is_semver_like("0.1.2-rc.1"));
+        assert!(is_semver_like("0.1.2"));
+        assert!(is_semver_like("1.0.0"));
+        assert!(is_semver_like("0.1.5-rc.3"));
+        // 带 v 前缀也接受（内部会 trim v）
+        assert!(is_semver_like("v0.1.2-rc.1"));
+        // 非法输入
+        assert!(!is_semver_like("not-a-version"));
+        assert!(!is_semver_like("0.1"));
+        assert!(!is_semver_like("latest"));
+        assert!(!is_semver_like(""));
     }
 }

@@ -397,17 +397,32 @@ pub fn installable_remote_releases<R: Runtime>(app: &AppHandle<R>) -> Vec<serde_
 
 /// 检查更新：当前激活版本 vs 远程最新 release。
 /// 返回 (当前版本, 最新版本, 是否有更新)。
+///
+/// 若服务端下发了固定版本（`config.dshVersion`），远程「目标」就是该固定版本，
+/// 而非 npm 最新——让检查更新/自动升级也收敛到同一版，避免版本漂移。
 pub async fn check_update<R: Runtime>(app: &AppHandle<R>) -> (String, Option<String>, bool) {
     let current = active_version(app);
-    let remote = match fetch_remote_releases().await {
-        Ok(list) => {
-            // 缓存整个列表（托盘菜单显示可安装的远程版本）
-            cache_remote_releases(list.clone());
-            list.first().and_then(|r| r["tag"].as_str().map(|s| s.to_string()))
-        }
-        Err(e) => {
-            log::warn!("检查 dsh 更新失败：{e}");
-            None
+    let cfg = load_cached();
+    let fixed = cfg
+        .dsh_version
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let remote = if let Some(fixed_ver) = fixed {
+        // 固定版本模式：远程目标 = 固定版本号（不用拉 npm 列表）
+        log::info!("dsh 固定版本模式：目标 {fixed_ver}（当前 {current}）");
+        Some(fixed_ver)
+    } else {
+        match fetch_remote_releases().await {
+            Ok(list) => {
+                // 缓存整个列表（托盘菜单显示可安装的远程版本）
+                cache_remote_releases(list.clone());
+                list.first().and_then(|r| r["tag"].as_str().map(|s| s.to_string()))
+            }
+            Err(e) => {
+                log::warn!("检查 dsh 更新失败：{e}");
+                None
+            }
         }
     };
     let has_update = match (&remote, current.is_empty()) {
