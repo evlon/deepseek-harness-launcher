@@ -269,6 +269,13 @@ pub async fn install_to<R: Runtime>(
     std::fs::write(dest.join("pnpm-workspace.yaml"), workspace_yaml)
         .map_err(|e| e.to_string())?;
 
+    // 写项目级 .npmrc：强制指定 registry，确保 pnpm 无论用户 ~/.npmrc 怎么配
+    // 都走正确源（项目级 .npmrc 优先级高于用户级 ~/.npmrc，也高于 npm_config_registry
+    // 环境变量——后者会被用户 ~/.npmrc 的 registry=… 覆盖，导致连错源超时）。
+    // run_pnpm 里的 npm_config_registry 环境变量保留作双保险，无害。
+    let npmrc = format!("registry={}\n", npm_registry_for_install());
+    std::fs::write(dest.join(".npmrc"), npmrc).map_err(|e| e.to_string())?;
+
     log::info!("pnpm 安装 {}@{} 到 {}…", DSH_NPM_PACKAGE, version, dest.display());
     let result = match run_pnpm(&node, &pnpm, dest, &["install"], on_progress).await {
         Ok(r) => r,
