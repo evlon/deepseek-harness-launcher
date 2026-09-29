@@ -121,6 +121,12 @@ pub fn load_account<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> (Ma
 /// - [`MatrixStatus::NotInstalled`]：阶段一未完成（环境缺东西，需先安装）；
 /// - [`MatrixStatus::Unconfigured`]：阶段一完成、阶段二未做（已就绪，等待领号）；
 /// - [`MatrixStatus::Configured`]：两阶段全部完成，分身可用。
+///
+/// 关于「已激活未重启」中间态：账号三要素齐全（settings.yaml 已写）但 matrix
+/// profile 进程尚未运行，属于「激活成功、等待用户确认重启」的中间态。该态在
+/// `status()` 里仍归入 [`MatrixStatus::Configured`]（配置层面已完整），但在
+/// [`collect_state`] 里通过 `activated_not_launched` 字段单独暴露给前端，避免
+/// 前端把「已激活未重启」误判成「还没激活」或「已全部完成」。
 pub fn status<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> MatrixStatus {
     // ① 阶段一：运行环境未装（dsh 二进制不在）→ 需先安装
     if !dsh_binary_path(app).exists() {
@@ -143,6 +149,19 @@ pub fn status<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> MatrixSta
         // 自动化模式：环境已就绪，等待领号（阶段二）
         MatrixStatus::ReadyToActivate
     }
+}
+
+/// 「已激活但未重启」中间态判定：账号三要素齐全（settings.yaml 已写、分身已认领），
+/// 但 matrix profile 进程尚未运行。用于让向导前端感知「激活完成、该展示账号并让
+/// 用户确认重启」——区别于「还没激活」（三要素不齐）和「已全部完成」（进程在跑）。
+pub fn activated_not_launched<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> bool {
+    let (acc, _) = load_account(app, cfg);
+    if !acc.complete() {
+        return false;
+    }
+    let running = crate::workflow::is_running()
+        && crate::workflow::current_profile().as_deref() == Some(MATRIX_PROFILE);
+    !running
 }
 
 /// dsh-matrix-agent 是否已装进 matrix profile（node_modules 存在 bundle patch）。
@@ -694,7 +713,7 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                 crate::ops::append_log(&h, "[开始] 检测到运行环境未安装，先安装依赖…");
                 let _ = tauri::async_runtime::block_on(crate::install::install_all(&h));
             }
-            crate::ops::start_op(&h, "matrix-activate", "自动激活数字分身", &["浏览器授权", "认领身份", "写入配置", "重启数字分身", "等待连接"]);
+            crate::ops::start_op(&h, "matrix-activate", "自动激活数字分身", &["浏览器授权", "认领身份", "写入配置", "等待确认"]);
             crate::ops::mark_step_running(&h, 0);
             crate::ops::update_step(&h, "等待浏览器授权…");
             crate::ops::append_log(&h, "已打开浏览器，请在浏览器中完成公司 SSO 登录…");
@@ -703,49 +722,22 @@ pub fn handle_scheme_request<R: TauriRuntime>(
                     crate::ops::mark_step_running(&h, 2);
                     crate::ops::update_step(&h, "已认领分身，写入配置…");
                     crate::ops::append_log(&h, &format!("✓ 已认领分身账号 {}", r.user_id));
-                    // 配置已由 run_activation 写入 settings.yaml，这里需确保 profile 骨架存在
-                    // 后再重启（dsh 启动 --profile matrix 要求 manifest 已建，否则报
-                    // "profile does not exist" → HARNESS_NOT_READY）。
+                    // ⭐ 拆分重启：run_activation 只做「授权 → 认领 → 写 settings.yaml」，
+                    // 这里**不再自动重启数字分身**。仅确保 profile 骨架存在（为后续用户
+                    // 确认后调 /launch 启动铺路），然后把「激活成功但未重启」的状态交给
+                    // 前端——前端展示分身账号、等用户核对确认，确认后才调 /launch 真正重启。
                     let cfg_now = load_cached();
                     if let Err(e) = crate::install::ensure_matrix_profile(&h, &cfg_now) {
                         crate::ops::append_log(&h, &format!("⚠️ 确保数字分身运行环境失败：{e}"));
                     }
-                    let running = crate::workflow::is_running();
-                    let cur_profile = crate::workflow::current_profile();
+                    // 激活成功但尚未重启：清空「最近激活失败」标记（前端轮询感知到
+                    // activated_not_launched=true 即收尾到「确认重启」区）。
+                    *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     crate::ops::mark_step_running(&h, 3);
-                    crate::ops::update_step(&h, "重启数字分身…");
-                    if running && cur_profile.as_deref() == Some(MATRIX_PROFILE) {
-                        crate::workflow::stop();
-                        crate::ops::append_log(&h, "已停止旧数字分身进程（连接参数需重启生效）");
-                        std::thread::sleep(std::time::Duration::from_millis(800));
-                    }
-                    match crate::workflow::launch_with_profile(&h, MATRIX_PROFILE) {
-                        Ok(port) => {
-                            // 启动成功：清空「最近激活失败」标记（前端轮询感知到 configured 即收尾）
-                            *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                            crate::ops::append_log(&h, &format!("✓ 数字分身已启动：{}", crate::workflow::access_url(port)));
-                            crate::ops::mark_step_running(&h, 4);
-                            crate::ops::update_step(&h, "等待 Matrix 连接…");
-                            match wait_matrix_ready(&h, &cfg_now, std::time::Duration::from_secs(45)) {
-                                Ok(()) => {
-                                    crate::ops::finish_op(&h, &format!("数字分身已激活并可用：{}", r.user_id));
-                                    crate::notify::notify(&h, "数字分身已激活", &format!("{} 已就绪，可在 Matrix 客户端 @ 它试试", r.user_id));
-                                    crate::tray::refresh_sync_menu(&h);
-                                }
-                                Err(e) => {
-                                    crate::ops::finish_op(&h, &format!("数字分身已激活（{}），但连接等待超时：{}", r.user_id, e));
-                                    crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置。连接验证超时（不影响使用），可稍后在托盘查看。", r.user_id));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            crate::ops::fail_op(&h, &format!("分身已激活但启动失败：{e}"));
-                            crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置，但启动失败：{}。可在托盘「启动」重试。", r.user_id, e));
-                            // 记录失败文案，供向导前端轮询感知 + 恢复按钮（避免「失败后按钮锁死」）
-                            *LAST_ACTIVATION_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(format!("分身已激活但启动失败：{e}"));
-                        }
-                    }
+                    crate::ops::update_step(&h, "已写入配置，等待确认重启…");
+                    crate::ops::finish_op(&h, &format!("分身已激活（{}），已写入配置，等待你确认后重启", r.user_id));
+                    crate::notify::notify(&h, "数字分身已激活", &format!("{} 已写入配置。请在向导中核对账号并确认重启。", r.user_id));
+                    crate::tray::refresh_sync_menu(&h);
                 }
                 r => {
                     crate::ops::fail_op(&h, &r.message);
@@ -768,6 +760,9 @@ pub fn handle_scheme_request<R: TauriRuntime>(
         return json_resp(StatusCode::OK, serde_json::json!({"ok": true, "message": "已开始自动激活"}));
     }
     if method == tauri::http::Method::POST && path == "/resume-auto-activation" {
+        // ⚠️ 已废弃（2026-09）：first_run 安装完成后的「自动衔接」已去掉，本端点已无调用方。
+        // 保留仅为向后兼容 + 历史语义记录，勿在此继续维护重启逻辑。当前激活主流程走
+        // /activate（激活后停在「确认重启」，由前端确认后调 /launch 才真正重启）。
         // first_run 安装完成自动流转入口：不弹通知，直接衔接「激活」流程
         // 复用与 /activate 相同的后台线程逻辑，仅不对前端再弹「已开始」
         let h = app.clone();
@@ -1125,6 +1120,13 @@ pub struct WizardState {
     pub last_activation_error: String,
     /// 数字分身（matrix profile）当前是否已在运行（前端据此渲染「启动 / 运行中」）。
     pub launcher_running: bool,
+    /// 账号三要素已写（分身已激活）但 matrix profile 进程尚未运行——「激活完成、
+    /// 等待用户确认重启」的中间态。前端据此展示分身账号并停在重启确认区，而不是
+    /// 误判成「还没激活」或「已全部完成」。增量字段，不影响既有前端。
+    pub activated_not_launched: bool,
+    /// 当前生效 profile 已装插件（name → version），供「安装完成」成果清单展示。
+    /// 空 map = 尚未安装任何插件。仅增量字段，不影响既有前端（旧版忽略它）。
+    pub installed_plugins: std::collections::HashMap<String, String>,
 }
 
 /// 计算订阅/安装清单差异：服务端推荐清单 vs 本地已装清单。
@@ -1240,6 +1242,10 @@ pub fn collect_state<R: TauriRuntime>(app: &TauriAppHandle<R>, cfg: &LauncherCon
         // 「数字分身已就绪」区块判断：matrix profile 是否正在运行
         launcher_running: crate::workflow::is_running()
             && crate::workflow::current_profile().as_deref() == Some(MATRIX_PROFILE),
+        // 「已激活未重启」中间态：账号已写但进程未跑（等待用户确认重启）
+        activated_not_launched: activated_not_launched(app, cfg),
+        // 「安装完成」成果清单：当前生效 profile 已装插件（name → version）。
+        installed_plugins: crate::sync::installed_plugins_current_profile_with_versions(app, cfg),
     }
 }
 

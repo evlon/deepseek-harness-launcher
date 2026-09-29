@@ -97,39 +97,29 @@ pub fn handle_scheme_request<R: Runtime>(
     }
     if method == tauri::http::Method::POST && path == "/activate" {
         // 「激活数字分身」主流程：dsh 未装 → 先 install_all（含进度窗），
-        // 装完自动衔接激活向导；dsh 已装 → 直接打开激活向导。
-        // 激活向导（matrix-setup）内已有「自动激活 + 选岗位」完整步骤。
+        // 装完停在「安装完成 + 下一步领号」；dsh 已装 → 直接打开激活向导。
+        // 激活向导（matrix-setup）内是「分步走 + 每步确认」的完整步骤。
         let h = app.clone();
         let dsh_installed = dsh_binary_path(app).exists();
         if !dsh_installed {
             // 后台跑安装（复用 install_all，进度内嵌于向导窗口；install_all 已做
             // 「向导存在则不弹独立进度窗」）。先开向导再装——用户立刻看到单窗口，
-            // 安装进度直接滚动，装完自动衔接激活，全程一个窗口。
+            // 安装进度直接滚动，装完停在「安装完成」等用户确认，全程一个窗口。
             tauri::async_runtime::spawn(async move {
                 // 先关首屏窗（避免 first-run + matrix-setup 双窗并存），单窗口收口到向导
                 close_window(&h);
-                // 先打开向导（用户立即看到界面 + 内嵌进度），再装再激活，全程单窗口
+                // 先打开向导（用户立即看到界面 + 内嵌进度），再装，全程单窗口
                 let _ = crate::matrix_setup::open_window(&h);
                 // 等安装完成
                 let _ = crate::install::install_all(&h).await;
-                // 安装已完成：立即触发向导内的自动激活（POST /resume-auto-activation），
-                // 保证「装完即用」不需再点按钮选「开始激活」
-                let _h2 = h.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    // 给向导一点热身时间打开
-                    std::thread::sleep(std::time::Duration::from_millis(600));
-                    // 通过本地 HTTP 协议调向导端点（不关心返回，纯触发）
-                    let _ = reqwest::blocking::Client::new()
-                        .post("http://matrix-setup.localhost/resume-auto-activation")
-                        .send()
-                        .ok();
-                    let _ = _h2;
-                });
-                log::info!("首次安装完成，已在向导窗口内自动衔接激活流程");
+                // ⭐ 分步走（去掉自动衔接）：安装完成后**不再自动触发 /resume-auto-activation**。
+                // 向导会在①区块展示「安装完成 + 成果清单 + 下一步领号」，等用户手动点
+                // 「下一步」→ 再点「立即领号」才真正开浏览器 SSO，避免「刚进来就让登录」。
+                log::info!("首次安装完成，向导停在「安装完成」步骤，等用户手动领号");
             });
             return json_resp(
                 StatusCode::OK,
-                serde_json::json!({"ok": true, "message": "正在安装依赖，完成后将自动激活数字分身"}),
+                serde_json::json!({"ok": true, "message": "正在安装依赖，完成后请在向导中手动领号"}),
             );
         }
         // dsh 已装 → 先确保 matrix profile 骨架 + 推荐插件就绪，再打开激活向导。
@@ -152,15 +142,8 @@ pub fn handle_scheme_request<R: Runtime>(
             // ⚠️ 不再 open_console 预热独立进度窗——进度统一内嵌在向导窗口内（见 wizard_html 的
             //    进度区 + /op-state 轮询），避免「配置数字分身 + 操作进度」双窗交替闪烁。
             let _ = crate::matrix_setup::open_window(&h);
-            // 已装未激活：同样直接触发自动激活，免去用户再点按钮
-            let _h2 = h.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = reqwest::blocking::Client::new()
-                    .post("http://matrix-setup.localhost/resume-auto-activation")
-                    .send()
-                    .ok();
-            });
+            // ⭐ 分步走（去掉自动衔接）：已装未激活时**不再自动触发 /resume-auto-activation**，
+            // 向导停在「下一步 → 领数字人」，等用户手动点「立即领号」再开浏览器 SSO。
         });
         return json_resp(
             StatusCode::OK,

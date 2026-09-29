@@ -56,7 +56,7 @@
 </head>
 <body>
   <h1>🤖 配置数字分身</h1>
-  <div class="sub">分两步完成：<b>① 安装运行环境</b> → <b>② 领数字人并启动</b>。安装可以慢慢来，领号很快。</div>
+  <div class="sub">分两步完成：<b>① 安装运行环境</b> → <b>② 领数字人并启动</b>。一步一步来，每一步都由你确认。</div>
 
   <!-- 已激活成功态：configured 分支（账号已激活，不再引导安装/领号） -->
   <div class="section" id="readySection" style="border-color:var(--green);display:none">
@@ -102,6 +102,13 @@
         <div id="installOpLog" style="margin-top:6px;font-size:11px;color:var(--muted);max-height:96px;overflow-y:auto;line-height:1.6;font-family:ui-monospace,Consolas,monospace"></div>
       </div>
     </div>
+    <!-- 安装完成成果区（装完后停一下：列出成果 + 「下一步领号」，等用户点） -->
+    <div id="installDone" style="display:none;margin-top:12px;border:1px solid var(--green);border-radius:8px;padding:12px;background:#1c2a24">
+      <div style="font-size:14px;font-weight:600;color:var(--green);margin-bottom:8px">✅ 安装完成</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:10px">运行环境已就绪，以下是本次安装的成果：</div>
+      <div id="installResultList" style="font-size:12px;line-height:1.8;margin-bottom:10px"></div>
+      <button class="btn btn-primary" id="nextToActivateBtn" style="width:100%;background:var(--green)">下一步 → 领数字人</button>
+    </div>
   </div>
 
   <!-- 阶段二：领号启动（默认隐藏，环境就绪后显示） -->
@@ -110,6 +117,27 @@
     <div class="hint" style="margin-bottom:10px">用公司 SSO（Keycloak）登录，自动认领你的 @ai-你的邮箱前缀 数字分身。无需密码、无需 token。</div>
     <button class="btn btn-primary" id="activateBtn" style="width:100%;background:var(--green)">🚀 立即领号并启动数字分身</button>
     <div class="status" id="activateStatus"></div>
+    <!-- 激活结果确认区：激活完成后展示分身账号，等用户确认激活成功，再确认重启 -->
+    <div id="activateDone" style="display:none;margin-top:12px;border:1px solid var(--green);border-radius:8px;padding:12px;background:#1c2a24">
+      <div style="font-size:14px;font-weight:600;color:var(--green);margin-bottom:8px">✅ 已认领数字分身</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">请核对以下分身账号，确认激活是否成功：</div>
+      <table class="cfg-table" style="margin-bottom:10px">
+        <tr><td class="cfg-key">分身账号</td><td class="cfg-val" id="activateUid">—</td></tr>
+        <tr><td class="cfg-key">主人账号</td><td class="cfg-val" id="activateOwner">—</td></tr>
+      </table>
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn btn-primary" id="confirmActivateOkBtn" style="flex:1;background:var(--green)">✓ 激活成功，继续</button>
+        <button class="btn btn-ghost" id="confirmActivateRetryBtn" style="flex:1">✗ 没成功，重试</button>
+      </div>
+      <!-- 重启确认：激活成功确认后再提示重启（重启前需再次确认，不自动重启） -->
+      <div id="restartConfirm" style="display:none;margin-top:6px">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:8px">分身账号已写入，需要重启数字分身才能生效。是否现在重启？</div>
+        <div class="row">
+          <button class="btn btn-primary" id="confirmRestartBtn" style="flex:1;background:var(--green)">🔄 立即重启</button>
+          <button class="btn btn-ghost" id="confirmRestartLaterBtn" style="flex:1">稍后手动重启</button>
+        </div>
+      </div>
+    </div>
     <!-- 内嵌进度区（单窗口一贯流程）：激活/安装进度直接显示在向导窗口内，
          不再弹独立「操作进度」窗。由 activateBtn 触发后显示，轮询 /op-state 刷新。 -->
     <div id="opProgress" style="display:none;margin-top:12px">
@@ -206,44 +234,50 @@
   // 取消后分身不完整、无法正常工作，故锁定为始终勾选（UI 置灰 + 提交时强制保证）。
   const MANDATORY_JOBS = new Set(["secretary","reception"]);
 
-  // ⭐ 阶段二「自动衔接领号」：环境就绪（phase=ready）时自动开浏览器 SSO，无需再点。
-  // 幂等：只触发一次（标志位），避免多次 /state 轮询重复打开浏览器。
-  let autoActivated = false;
-  function autoActivateOnce(){
-    if(autoActivated) return;
-    autoActivated = true;
-    const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
-    startOpPolling();
-    fetch("http://matrix-setup.localhost/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})
-      .then(r=>r.json()).then(j=>{
-        if(j.ok){
-          st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。</span>';
-          // 轮询 /state 等激活完成（configured）→ 渲染岗位区；失败感知 last_activation_error
-          let tries=0;
-          const poll=setInterval(async()=>{
-            tries++;
-            if(tries>90){ clearInterval(poll); $("activateBtn").disabled=false; st.className="status err"; st.textContent="✗ 激活超时未完成，请点下方按钮重试。"; return; }
-            try{
-              const s=await (await fetch("http://matrix-setup.localhost/state")).json();
-              if(s.last_activation_error){
-                clearInterval(poll);
-                st.className="status err";
-                st.textContent="✗ "+(s.last_activation_error||"激活失败，请重试");
-                $("activateBtn").disabled=false;
-                return;
-              }
-              if(s.status==="configured"){
-                clearInterval(poll);
-                st.className="status ok";
-                st.textContent="✓ 已激活！";
-                $("activateSection").style.display="none";
-                if(s.job_presets && s.job_presets.length){ renderJobSection(s); }
-              }
-            }catch(e){}
-          },1500);
-        } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
-      })
-      .catch(()=>{ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; });
+  // ⭐ 阶段二「手动领号」：**不再自动开浏览器 SSO**（去掉原 autoActivateOnce 的自动衔接）。
+  // 环境装完后，①区块显示「安装完成 + 成果清单 + 下一步领号」按钮，等用户手动点。
+  // 点「下一步 → 领数字人」切到阶段二；真正领号仍由用户点 activateBtn 触发 /activate。
+  let nextToActivateDone = false; // 幂等：切换阶段二只做一次
+  function goToActivate(){
+    if(nextToActivateDone) return;
+    nextToActivateDone = true;
+    $("installSection").style.display="none";
+    $("activateSection").style.display="block";
+    $("status").innerHTML='<span class="info">运行环境已就绪，请点击「立即领号」领取数字分身。</span>';
+  }
+  $("nextToActivateBtn").onclick=goToActivate;
+
+  // ⭐ 安装成果展示：装完后在①区块列出成果清单（运行环境 + 已装插件数量/名称 + 岗位），
+  // 出现「下一步 → 领数字人」按钮，等用户手动点（不再自动衔接）。
+  // 数据来源：collect_state 新增的 installed_plugins（name → version）+ 既有 job_presets。
+  function showInstallDone(s){
+    $("installBtn").disabled=false;
+    $("retryInstallBtn").style.display="none";
+    $("installStatus").className="status ok";
+    $("installStatus").textContent="✓ 运行环境已就绪！";
+    // 成果清单：运行环境 + 已装插件（数量 + 名称）+ 岗位
+    const items=[];
+    items.push('<div style="color:var(--green)">✓ 运行环境（Node.js / pnpm / Harness 核心）</div>');
+    const plugins = s.installed_plugins || {};
+    const pnames = Object.keys(plugins);
+    if(pnames.length){
+      const pn = pnames.map(n=>{
+        const v=plugins[n];
+        const short = n.replace(/^@[^/]+\//,""); // @scope/name → name（可读）
+        return '<span style="color:var(--text)">'+esc(short)+(v?' <span style="color:var(--muted)">v'+esc(v)+'</span>':'')+'</span>';
+      }).join('、');
+      items.push('<div style="color:var(--green)">✓ 已装插件 '+pnames.length+' 个</div>'
+        +'<div style="color:var(--muted);margin-left:14px">'+pn+'</div>');
+    } else {
+      items.push('<div style="color:var(--muted)">已装插件：暂无（可稍后在托盘「安装 / 修复」补装）</div>');
+    }
+    const jobs = s.job_presets || [];
+    if(jobs.length){
+      items.push('<div style="color:var(--green)">✓ 已就绪岗位 '+jobs.length+' 个</div>'
+        +'<div style="color:var(--muted);margin-left:14px">'+jobs.map(j=>esc(jobLabel(j))).join('、')+'</div>');
+    }
+    $("installResultList").innerHTML = items.join("");
+    $("installDone").style.display="block";
   }
 
   // ⭐ 阶段一「开始 / 重试安装」：触发 install_all（幂等），轮询 install 进度。
@@ -288,17 +322,17 @@
       }
       $("readySection").style.display="block";
     }
-    else if(s.status==="ready-activate"){ $("status").innerHTML='<span class="info">运行环境已就绪，正在自动领号…</span>'; }
+    else if(s.status==="ready-activate"){ $("status").innerHTML='<span class="info">运行环境已就绪，请点击「下一步 → 领数字人」。</span>'; }
     else if(s.status==="not-installed"){ $("status").innerHTML='<span class="info">请先完成第一步「安装运行环境」。</span>'; }
     else if(s.status==="unconfigured"){ $("status").innerHTML='<span class="info">尚未完成激活。请点上方「领号」。</span>'; }
     if(phase==="not-installed"){
       $("installSection").style.display="block";
       $("activateSection").style.display="none";
     } else if(phase==="ready"){
-      $("installSection").style.display="none";
-      $("activateSection").style.display="block";
-      // ⭐ 装完自动衔接领号（你选择的体验）：环境就绪后无需再点，自动开浏览器 SSO
-      autoActivateOnce();
+      // ⭐ 分步走：环境已就绪时，①区块展示「安装完成 + 成果 + 下一步领号」，
+      // **不自动开浏览器 SSO**，等用户点「下一步」再进阶段二。
+      showInstallDone(s);
+      $("activateSection").style.display="none";
     } else {
       // configured 或其它：两阶段都完成
       $("installSection").style.display="none";
@@ -450,17 +484,9 @@
     } else if(op.state==="done"){
       $("activateStatus").className="status ok";
       $("activateStatus").textContent="✓ "+(op.result||"完成");
-      // 激活类操作完成且无岗位候选 → 单窗口收口：稍候自动关窗（有候选则留给选岗位区块）。
-      // 安装类操作（install）完成不该关窗——那是激活前的准备阶段，向导还要继续。
-      if(op.id==="matrix-activate"||op.id==="auto-resume-activate"){
-        fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
-          const hasJobs = s.job_presets && s.job_presets.length;
-          if(!hasJobs){
-            st.innerHTML='<span class="ok">✓ 完成！窗口即将自动关闭，数字分身已在托盘运行。</span>';
-            setTimeout(()=>{ try{ window.close(); }catch(e){} }, 2000);
-          }
-        }).catch(()=>{});
-      }
+      // ⭐ 分步走：激活 op done 后**不再自动关窗/自动进岗位**——
+      // 由 /state 轮询（activateBtn.onclick 的 poll）感知 configured 后展示「分身账号确认区」，
+      // 等用户确认激活成功 → 确认重启 → 才进入选岗位/收口。这里只收进度，不抢节奏。
     }
   }
   function startOpPolling(){
@@ -532,8 +558,8 @@
   }
 
   // ⭐ 阶段一「安装进度」轮询：渲染到 install 那组元素。
-  // 安装 op（id="install"）done → 自动切到阶段二领号（重新拉 /state，phase 应变 ready，
-  // 由状态渲染逻辑触发 autoActivateOnce）；失败 → 显示「重试安装」按钮。
+  // 安装 op（id="install"）done → 展示「安装完成 + 成果 + 下一步领号」（不自动领号）；
+  // 失败 → 显示「重试安装」按钮。
   let installPollTimer = null;
   function startInstallOpPolling(){
     $("installProgress").style.display="block";
@@ -572,13 +598,12 @@
         st.textContent="✓ 运行环境已就绪！";
         $("installBtn").disabled=false;
         $("retryInstallBtn").style.display="none";
-        // 安装完成 → 重新拉 /state，phase 应变 ready → 状态渲染逻辑自动切换领号并激活
+        // 安装完成 → 重新拉 /state，phase 应变 ready → 展示「安装完成 + 成果 + 下一步领号」，
+        // **不自动开浏览器 SSO**，等用户点「下一步」。
         fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
           if(s.phase==="ready"){
-            $("installSection").style.display="none";
-            $("activateSection").style.display="block";
-            $("status").innerHTML='<span class="info">运行环境已就绪，正在自动领号…</span>';
-            autoActivateOnce();
+            showInstallDone(s);
+            $("status").innerHTML='<span class="info">运行环境已就绪，请点击「下一步 → 领数字人」。</span>';
           }
         }).catch(()=>{});
       }
@@ -623,18 +648,19 @@
     }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("launchReadyBtn").disabled=false; }
   };
 
-  // 自动激活：调本机服务，打开浏览器授权。激活成功后，若有岗位候选则轮询 /state
-  // 等 status=configured 后展示「选岗位」步骤；无岗位候选则由后端关窗。
+  // ⭐ 领号激活：调本机服务打开浏览器授权。激活完成后**不自动进入下一步**——
+  // 先在②区块展示「已认领分身账号」，让用户核对确认激活成功，再提示重启（重启前确认）。
   $("activateBtn").onclick=async()=>{
     const st=$("activateStatus"); st.className="status info"; st.textContent="正在打开浏览器授权…";
     $("activateBtn").disabled=true;
+    $("activateDone").style.display="none";
     startOpPolling();  // 单窗口一贯流程：进度内嵌于向导窗口
     try{
       const r=await fetch("http://matrix-setup.localhost/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
       const j=await r.json();
       if(j.ok){
-        st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。完成后本窗口会引导你选择岗位。</span>';
-        // 轮询 /state，等激活完成（configured）后渲染岗位区块；
+        st.innerHTML='<span class="ok">✓ 已启动！浏览器即将打开，请完成公司 SSO 登录。完成后本窗口会展示你的分身账号供你核对。</span>';
+        // 轮询 /state，等激活完成（configured）→ 展示分身账号 + 确认区；
         // 检测 last_activation_error 感知失败（恢复按钮 + 提示，避免「失败后按钮锁死」）
         let tries=0;
         const poll=setInterval(async()=>{
@@ -649,19 +675,63 @@
               $("activateBtn").disabled=false;
               return;
             }
-            if(s.status==="configured"){
+            if(s.status==="configured" && s.activated_not_launched){
               clearInterval(poll);
               st.className="status ok";
-              st.textContent="✓ 已激活！";
-              if(s.job_presets && s.job_presets.length){
-                renderJobSection(s);
-              }
+              st.textContent="✓ 已激活！请核对下方分身账号，确认后重启。";
+              showActivateDone(s);
             }
           }catch(e){}
         },1500);
       } else { st.className="status err"; st.textContent="✗ "+(j.error||"激活启动失败"); $("activateBtn").disabled=false; }
     }catch(e){ st.className="status err"; st.textContent="✗ 无法连接本机服务"; $("activateBtn").disabled=false; }
   };
+
+  // ⭐ 激活成功展示：显示实际认领的分身账号（userId）+ 主人账号，让用户核对确认。
+  // 数据来源：/state 的 user_id（分身 @ai-xxx）、owner（主人账号）。
+  function showActivateDone(s){
+    $("activateUid").textContent = s.user_id || "（未显示）";
+    $("activateOwner").textContent = s.owner || "（未设置）";
+    $("activateDone").style.display="block";
+    $("restartConfirm").style.display="none"; // 先只显示「确认激活成功」，确认后再出重启确认
+  }
+
+  // 确认激活成功 → 出现「重启确认」（重启前有确认动作，不自动重启）。
+  $("confirmActivateOkBtn").onclick=()=>{
+    $("restartConfirm").style.display="block";
+  };
+  // 用户认为没成功 → 恢复「立即领号」按钮，允许重新触发 /activate。
+  $("confirmActivateRetryBtn").onclick=()=>{
+    $("activateDone").style.display="none";
+    $("activateBtn").disabled=false;
+    $("activateStatus").className="status info";
+    $("activateStatus").textContent="请点击「立即领号并启动数字分身」重新激活。";
+  };
+  // 重启确认：立即重启 → 调 /launch（幂等，已运行则直接返回运行态）；稍后 → 直接进入选岗位。
+  $("confirmRestartBtn").onclick=async()=>{
+    $("activateStatus").className="status info";
+    $("activateStatus").textContent="正在重启数字分身…";
+    startOpPolling(); // 重启进度内嵌于②区块的进度区
+    try{
+      await fetch("http://matrix-setup.localhost/launch",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    }catch(e){}
+    goAfterActivateRestart();
+  };
+  $("confirmRestartLaterBtn").onclick=()=>{ goAfterActivateRestart(); };
+
+  // 激活确认/重启确认后收口：进入「选岗位」（若有候选）；无候选则提示完成。
+  function goAfterActivateRestart(){
+    fetch("http://matrix-setup.localhost/state").then(r=>r.json()).then(s=>{
+      if(s.job_presets && s.job_presets.length){
+        $("activateSection").style.display="none";
+        renderJobSection(s);
+      } else {
+        $("status").innerHTML='<span class="ok">✓ 数字分身已激活并配置完成。</span>';
+        // 无岗位候选：单窗口收口，稍候关窗（数字分身已在托盘运行）
+        setTimeout(()=>{ try{ window.close(); }catch(e){} }, 2000);
+      }
+    }).catch(()=>{});
+  }
 
   // 开发者手动配置：显示令牌切换 + 提交
   $("toggleToken").onclick=()=>{ const el=$("mToken"); el.type = el.type==="password" ? "text" : "password"; };
