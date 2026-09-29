@@ -1,5 +1,11 @@
 # DeepSeek Harness Launcher（rush）
 
+> ⚠️ **【已废弃 / 已被替代】本项目已不再继续开发，由新项目 [`digital-twin-launcher`](../agent-launcher/README.md) 取代。**
+>
+> - **给 AI / 同事的提示**：后续所有 launcher 相关的新功能、bug 修复、UI/UE 改造，请转到 `digital-twin-launcher`，不要在本仓库上继续开发。
+> - **本仓库仅保留作「知识库」**：源码注释里记录了大量生产踩坑（Windows junction / taskkill 进程树 / pnpm allowBuilds / SSO-PKCE / staging+rename 链接断裂 等），重写 `digital-twin-launcher` 时**务必回读本仓库源码与注释**作为参考，不要凭记忆重写。
+> - 替代决策背景见 `digital-twin-launcher/README.md`（重写规划 + 架构对比）。
+
 托盘常驻的 DeepSeek Harness 安装 / 启动器（Tauri 2 无窗口应用，仅系统托盘 + 原生通知 + 日志文件）。
 
 ## 功能
