@@ -1154,7 +1154,7 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     .unwrap_or_default();
                 let msg = match (&latest, has_update) {
                     (Some(_), true) => format!(
-                        "当前 {current}，发现新版本 {latest_display}\n已在本子菜单出现「📥 安装」项，点击即可下载"
+                        "当前 {current}，发现新版本 {latest_display}\n请在「dsh 版本」子菜单点「📥 安装 {latest_display}」升级"
                     ),
                     (Some(_), false) => format!("当前 {current}，已是最新（{latest_display}）"),
                     (None, _) => format!("当前 {current}，远程版本查询失败（网络受限？）"),

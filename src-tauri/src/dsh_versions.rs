@@ -411,6 +411,18 @@ pub async fn check_update<R: Runtime>(app: &AppHandle<R>) -> (String, Option<Str
     let remote = if let Some(fixed_ver) = fixed {
         // 固定版本模式：远程目标 = 固定版本号（不用拉 npm 列表）
         log::info!("dsh 固定版本模式：目标 {fixed_ver}（当前 {current}）");
+        // 关键：固定版本也要「缓存」成一份只含该版本的远程列表，
+        // 让 installable_remote_releases 能把它作为「📥 安装 <固定版本>」项返回，
+        // 否则托盘菜单找不到升级入口（这正是固定版本模式下无法升级的根因）。
+        // tag 用裸版本号（install_version 内部 trim_start_matches('v') 会正确解析）；
+        // installable_remote_releases 的过滤用 `t.contains(version)` 判重，
+        // 已装版本（tag=v<version>）会被正确过滤掉，避免重复显示。
+        let fixed_ver = normalize_tag_version(&fixed_ver);
+        cache_remote_releases(vec![serde_json::json!({
+            "version": fixed_ver,
+            "tag": fixed_ver,
+            "prerelease": fixed_ver.contains('-'),
+        })]);
         Some(fixed_ver)
     } else {
         match fetch_remote_releases().await {
