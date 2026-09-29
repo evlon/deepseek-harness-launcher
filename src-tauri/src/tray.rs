@@ -19,6 +19,44 @@ pub fn is_quit_requested() -> bool {
     QUIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 「检查 dsh 更新」发现新版本后的原生确认框：返回 true = 确认升级，false = 取消。
+///
+/// 升级是重操作（会 stop + 重启数字分身），必须显式确认，不能静默升级。
+/// 与 reset.rs / install.rs 一致，用 Windows MessageBoxW（托盘菜单点击触发的原生场景，
+/// 非浏览器 opencli 场景，不需要非阻塞 toast）。
+#[cfg(windows)]
+fn confirm_dsh_update(current: &str, latest: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONQUESTION, MB_OKCANCEL, IDOK};
+    let title: Vec<u16> = "升级 dsh 核心版本"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let body: Vec<u16> = format!(
+        "发现新版本 dsh {latest}，当前 {current}。\n\n\
+         升级会停止并重启数字分身，期间无法使用。\n\n\
+         · 点击「确定」= 下载并升级到 {latest}\n\
+         · 点击「取消」= 放弃升级"
+    )
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+    let ret = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OKCANCEL | MB_ICONQUESTION,
+        )
+    };
+    ret == IDOK
+}
+
+/// 非 Windows 平台：无确认框，默认确认升级（桌面端仅面向 Windows）。
+#[cfg(not(windows))]
+fn confirm_dsh_update(_current: &str, _latest: &str) -> bool {
+    true
+}
+
 /// 「两步确认」待确认态：菜单里点一次卸载/清理 = 进入待确认（文案变
 /// 「确认卸载：xxx（再点一次）」），再点一次才真正执行——替代原来的
 /// 原生 MessageBox，避免「系统确认框 + 进度窗」两连弹的割裂感。
@@ -1143,7 +1181,7 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
         "dsh-check-update" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
-                crate::ops::start_op(&h, "dsh-update", "检查 dsh 更新", &["检查更新"]);
+                crate::ops::start_op(&h, "dsh-update", "检查 dsh 更新", &["检查更新", "下载", "切换并重启"]);
                 crate::ops::mark_step_running(&h, 0);
                 crate::ops::update_step(&h, "查询远程版本…");
                 let (current, latest, has_update) = crate::dsh_versions::check_update(&h).await;
@@ -1152,16 +1190,71 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
                     .as_deref()
                     .map(crate::dsh_versions::normalize_tag_version)
                     .unwrap_or_default();
-                let msg = match (&latest, has_update) {
-                    (Some(_), true) => format!(
-                        "当前 {current}，发现新版本 {latest_display}\n请在「dsh 版本」子菜单点「📥 安装 {latest_display}」升级"
-                    ),
-                    (Some(_), false) => format!("当前 {current}，已是最新（{latest_display}）"),
-                    (None, _) => format!("当前 {current}，远程版本查询失败（网络受限？）"),
-                };
-                crate::ops::finish_op(&h, &msg);
-                notify(&h, "dsh 版本检查", &msg);
-                refresh_sync_menu(&h);
+
+                // 无更新 / 查询失败 → 保持现状，直接提示
+                if !has_update || latest.is_none() {
+                    let msg = match (&latest, has_update) {
+                        (Some(_), false) => format!("当前 {current}，已是最新（{latest_display}）"),
+                        _ => format!("当前 {current}，远程版本查询失败（网络受限？）"),
+                    };
+                    crate::ops::finish_op(&h, &msg);
+                    notify(&h, "dsh 版本检查", &msg);
+                    refresh_sync_menu(&h);
+                    return;
+                }
+
+                // 发现新版本：弹原生确认框（升级会 stop + 重启数字分身，必须显式确认）
+                let tag = latest.as_deref().unwrap_or_default().to_string();
+                if !confirm_dsh_update(&current, &latest_display) {
+                    let msg = format!("已取消，未升级（当前 {current}）");
+                    crate::ops::finish_op(&h, &msg);
+                    notify(&h, "dsh 升级已取消", &msg);
+                    refresh_sync_menu(&h);
+                    return;
+                }
+
+                // 用户确认 → 在同一个进度操作里依次「下载 + 切换激活」
+                // 1) 下载 {latest}
+                crate::ops::mark_step_running(&h, 1);
+                crate::ops::update_step(&h, &format!("下载 {latest_display}…"));
+                let h2 = h.clone();
+                let version_cb = latest_display.clone();
+                if let Err(e) = crate::dsh_versions::install_version(
+                    &h,
+                    &tag,
+                    Some(&move |downloaded, total| {
+                        let pct = if total > 0 {
+                            (downloaded as f64 / total as f64 * 100.0).round() as u32
+                        } else {
+                            0
+                        };
+                        crate::ops::update_step(&h2, &format!("下载 {version_cb} {pct}%"));
+                    }),
+                )
+                .await
+                {
+                    crate::ops::fail_op(&h, &e);
+                    notify(&h, "dsh 升级失败", &e);
+                    refresh_sync_menu(&h);
+                    return;
+                }
+
+                // 2) 切换激活（内部会停 Harness → 替换目录 → 重启）
+                crate::ops::mark_step_running(&h, 2);
+                crate::ops::update_step(&h, &format!("切换到 {latest_display} 并重启…"));
+                match crate::dsh_versions::switch_version(&h, &tag).await {
+                    Ok((old, new)) => {
+                        let msg = format!("dsh 已升级：{old} -> {new}");
+                        crate::ops::finish_op(&h, &msg);
+                        notify(&h, "dsh 升级完成", &msg);
+                        refresh_sync_menu(&h);
+                    }
+                    Err(e) => {
+                        crate::ops::fail_op(&h, &e);
+                        notify(&h, "dsh 升级失败", &e);
+                        refresh_sync_menu(&h);
+                    }
+                }
             });
         }
         id if id.starts_with("dsh-switch-") => {
