@@ -90,6 +90,16 @@ pub fn cmd_mirror<R: Runtime>(
     }
 }
 
+/// 取消进行中的镜像同步（供 UI/测试脚本通过 invoke 调用）。
+#[tauri::command]
+pub fn cmd_mirror_cancel<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
+    let cfg = crate::config::load_cached();
+    match crate::mirror::cancel_mirror_upload(&app, &cfg) {
+        Ok(()) => Ok(ok(json!({"message": "已请求取消同步"}))),
+        Err(e) => Err(e),
+    }
+}
+
 /// 查询状态（运行/端口/profile/上次操作/测速结果）。
 #[tauri::command]
 pub fn cmd_status<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {

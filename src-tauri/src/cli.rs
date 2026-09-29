@@ -492,6 +492,10 @@ fn wait_mirror_done<R: Runtime>(app: &AppHandle<R>) -> i32 {
                 println!("[mirror] ❌ 失败：{}", crate::config::truncate_utf8(&msg, 800));
                 return 1;
             }
+            "cancelled" => {
+                println!("[mirror] ⚠️ 已取消：{}/{} 个包已同步", p.done_pkgs, p.total_pkgs);
+                return 130;
+            }
             _ => {} // running：继续轮询
         }
         if wall_started.elapsed().as_secs() > WAIT_MAX_SECS {

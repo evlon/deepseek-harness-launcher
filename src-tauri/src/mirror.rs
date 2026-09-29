@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Runtime};
@@ -24,7 +25,7 @@ use crate::config::*;
 /// 上传进度（进程内 + 落盘）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UploadProgress {
-    /// idle / running / done / error
+    /// idle / running / done / error / cancelled
     pub state: String,
     /// 应装插件数
     pub total_plugins: usize,
@@ -59,6 +60,10 @@ fn progress_path<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> PathBu
 
 /// 进度进程内缓存（load/save 共享同一个）。
 static PROGRESS: Mutex<Option<UploadProgress>> = Mutex::new(None);
+
+/// 取消同步标志：`start_mirror_upload` 开始时复位，同步循环每轮检查，
+/// `cancel_mirror_upload` 置位后循环在下一轮检查点跳出。
+static CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// 加锁（容忍 poison：panic 后锁被污染不阻断后续）。
 fn lock_progress() -> std::sync::MutexGuard<'static, Option<UploadProgress>> {
@@ -418,6 +423,10 @@ pub fn start_mirror_upload<R: Runtime>(
     }
     log::info!("mirror:: 通过 running 检查，继续");
 
+    // 复位取消标志：确认本次上传真的会启动后，才清除上次残留的取消请求。
+    // （放在 running 检查之后：避免「正在取消中的同步」被误触发 start 时吞掉取消标志。）
+    CANCEL.store(false, Ordering::SeqCst);
+
     let h = app.clone();
     let cfg = cfg.clone();
     let registry = registry.to_string();
@@ -562,6 +571,12 @@ async fn run_mirror<R: Runtime>(
 
     let mut errors: Vec<String> = Vec::new();
     for (i, (name, version)) in all_pkgs.iter().enumerate() {
+        // 取消检查点：每轮开头先看是否被请求取消，命中立即跳出
+        if CANCEL.load(Ordering::SeqCst) {
+            log::info!("mirror:: 收到取消请求，在第 {}/{} 个包前停止", i + 1, all_pkgs.len());
+            break;
+        }
+
         let mut cur = load_progress(app, cfg);
         cur.current_pkg = format!("{name}@{version}");
         save_progress(app, cfg, &cur);
@@ -569,14 +584,23 @@ async fn run_mirror<R: Runtime>(
         crate::ops::update_step(app, &format!("上传 [{}/{}] {}@{}…", i + 1, all_pkgs.len(), name, version));
         crate::ops::append_log(app, &format!("上传 {name}@{version}…"));
 
-        match upload_one_pkg(name, version, registry, token) {
-            Ok(()) => {
-                log::info!("上传成功 [{}/{}] {}@{}", i + 1, all_pkgs.len(), name, version);
+        // 断点续同步：先查内网 registry 是否已有该包该版本，有则跳过（不 pack 不 publish）。
+        match target_has_version(name, version, registry) {
+            Some(true) => {
+                log::info!("已同步，跳过 {name}@{version}");
+                crate::ops::append_log(app, &format!("已同步，跳过 {name}@{version}"));
             }
-            Err(e) => {
-                log::warn!("上传失败 [{}/{}] {}@{}: {}", i + 1, all_pkgs.len(), name, version, e);
-                errors.push(format!("{}@{}: {e}", name, version));
-            }
+            // Some(false)=查到了但内网没有该版本 / None=查询本身异常（registry 抖动/超时），
+            // 两者都降级为「继续 pack+publish」（publish 阶段仍有幂等兜底，不会误判漏传）。
+            _ => match upload_one_pkg(name, version, registry, token) {
+                Ok(()) => {
+                    log::info!("上传成功 [{}/{}] {}@{}", i + 1, all_pkgs.len(), name, version);
+                }
+                Err(e) => {
+                    log::warn!("上传失败 [{}/{}] {}@{}: {}", i + 1, all_pkgs.len(), name, version, e);
+                    errors.push(format!("{}@{}: {e}", name, version));
+                }
+            },
         }
 
         let mut cur = load_progress(app, cfg);
@@ -584,12 +608,94 @@ async fn run_mirror<R: Runtime>(
         save_progress(app, cfg, &cur);
     }
 
+    // 收尾：区分正常结束 / 被取消
+    let cancelled = CANCEL.load(Ordering::SeqCst);
     let mut final_p = load_progress(app, cfg);
+    if cancelled {
+        final_p.state = "cancelled".to_string();
+        final_p.finished_at = now_iso();
+        save_progress(app, cfg, &final_p);
+        log::info!("镜像上传已取消：{}/{} 个包完成", final_p.done_pkgs, all_pkgs.len());
+        crate::ops::finish_op(app, "同步已取消");
+        return Ok(());
+    }
     final_p.state = if errors.is_empty() { "done".to_string() } else { "error".to_string() };
     final_p.error = errors.join("; ");
     final_p.finished_at = now_iso();
     save_progress(app, cfg, &final_p);
     log::info!("镜像上传结束：{}/{} 成功", all_pkgs.len() - errors.len(), all_pkgs.len());
+    Ok(())
+}
+
+/// 查询内网 registry 是否已存在该包该版本（断点续同步的「先查后跳」）。
+///
+/// 返回 `Option<bool>`：
+/// - `Some(true)`  → 内网已有该版本，可跳过（不 pack 不 publish）
+/// - `Some(false)` → 内网无该版本（查到了但 versions 里没有），需上传
+/// - `None`        → 查询本身异常（registry 抖动 / 超时 / 解析失败），**降级**为继续上传
+///
+/// 关键语义：只有「明确查到该版本存在」才跳过；查不到（404）或查询异常都走
+/// 正常 pack+publish 流程——publish 阶段仍有幂等兜底（EPUBLISHCONFLICT/E409 视为已同步），
+/// 不会因查询失败而漏传。
+fn target_has_version(name: &str, version: &str, registry: &str) -> Option<bool> {
+    // 用 `npm view <name>@<version> version --registry <registry>` 精确查单版本。
+    // 退出码语义：
+    //   - 0（stdout 含该版本号）→ 内网有，Some(true)
+    //   - 非 0 且 stderr 命中 404 / E404 / "not found" → 内网没有该包/该版本，Some(false)
+    //   - 其余非 0 → 查询异常（网络/超时/registry 报错），None（降级上传）
+    let tmp = std::env::temp_dir().join(format!("dsh-mirror-view-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let args = [
+        "view".to_string(),
+        format!("{name}@{version}"),
+        "version".to_string(),
+        "--registry".to_string(),
+        registry.to_string(),
+    ];
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match run_npm(&tmp, &arg_refs, &[]) {
+        Ok(stdout) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            // 命中：stdout 第一行应是该版本号（npm view <pkg>@<ver> version 精确输出）
+            let v = stdout.lines().next().unwrap_or("").trim();
+            let hit = !v.is_empty() && (v == version || v.trim_start_matches('v') == version);
+            Some(hit)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            // 区分「404=内网没有（要上传）」vs「查询异常（降级上传）」：
+            // 两者都返回非 Some(true)，但对日志/语义分开记录。此处统一返回 None/Some(false)。
+            // 关键：404 说明内网确无该包 → Some(false)（走上传）；其他错误 → None（也走上传，
+            // 但语义上表示「不确定」，publish 兜底）。这里无法拿到退出码，只能靠 stderr 文案。
+            let is_404 = e.contains("E404")
+                || e.contains("code E404")
+                || e.contains("No match found")
+                || e.contains("is not in the npm registry")
+                || e.contains("404");
+            if is_404 {
+                log::debug!("target_has_version {name}@{version}: 内网无此包/版本（404），需上传");
+                Some(false)
+            } else {
+                log::debug!("target_has_version {name}@{version}: 查询异常（降级上传）：{e}");
+                None
+            }
+        }
+    }
+}
+
+/// 取消进行中的镜像同步。
+///
+/// 置位 `CANCEL` 标志，同步循环在下一轮开头检查点跳出并把进度置为 `cancelled`。
+/// 立即返回（真正的状态流转由同步线程在检查点完成），供取消路由/Tauri command 调用。
+pub fn cancel_mirror_upload<R: Runtime>(app: &AppHandle<R>, cfg: &LauncherConfig) -> Result<(), String> {
+    let p = load_progress(app, cfg);
+    if p.state != "running" {
+        return Err(format!("MIRROR_NOT_RUNNING: 当前无进行中的同步（state={}）", if p.state.is_empty() { "idle" } else { &p.state }));
+    }
+    CANCEL.store(true, Ordering::SeqCst);
+    log::info!("mirror::cancel_mirror_upload：已请求取消（当前 {}/{} 包）", p.done_pkgs, p.total_pkgs);
+    // 进度 state 保持 running，由同步线程在检查点改写成 cancelled（避免这里和
+    // 同步线程并发写 finished_at 造成竞态）；仅记录一条提示日志。
     Ok(())
 }
 

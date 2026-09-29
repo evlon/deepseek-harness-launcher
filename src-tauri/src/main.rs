@@ -78,6 +78,7 @@ fn main() {
             commands::cmd_sync,
             commands::cmd_speedtest,
             commands::cmd_mirror,
+            commands::cmd_mirror_cancel,
             commands::cmd_status,
             commands::cmd_open_console,
             commands::cmd_dsh_versions,

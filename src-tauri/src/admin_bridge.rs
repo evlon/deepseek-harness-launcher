@@ -334,11 +334,12 @@ fn handle_request_inner<R: Runtime>(
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
             }
         }
-        ("GET", "/api/registry/mirror/cancel") => {
-            // 本期不做真正的取消（任务较短）；返回当前状态
+        ("POST", "/api/registry/mirror/cancel") => {
             let cfg = load_cached();
-            let p = crate::mirror::load_progress(app, &cfg);
-            serde_json::json!({ "ok": true, "progress": p, "note": "cancel not implemented" })
+            match crate::mirror::cancel_mirror_upload(app, &cfg) {
+                Ok(()) => serde_json::json!({ "ok": true, "message": "已请求取消同步" }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e }),
+            }
         }
         _ => {
             respond_json(request, 404, serde_json::json!({ "error": "not found" }), &origin);
